@@ -1,0 +1,298 @@
+# Project Memory File
+
+**Read this file first before doing any work.**
+
+---
+
+## 1. PROJECT OVERVIEW
+
+**Project**: Polymetallic Nodule Segmentation Pipeline  
+**Owner**: Brian Hwang (GitHub: WGoogle/BOEM_CV)  
+**Affiliation**: BOEM (Bureau of Ocean Energy Management) research project  
+**Date started with Claude**: March 24, 2026
+
+### What it does
+Ingests massive `.tif` seafloor mosaic strips captured by AUVs (Autonomous
+Underwater Vehicles), segments polymetallic nodules from the sediment
+background, and calculates nodule density (nodules/m²) and coverage (%).
+
+### The core challenge
+- Mosaics are enormous continuous strips (tens of thousands of pixels long)
+- Lighting, sediment type, depth, and camera altitude vary along the AUV track
+- Nodules are small, dark, roughly circular blobs on a gray sediment background
+- Sediment texture (grain noise) is easily confused with nodules
+- A single set of preprocessing parameters cannot work for the entire mosaic
+
+---
+
+## 2. WHAT THE IMAGERY LOOKS LIKE
+
+Studied from two reference images the user provided:
+
+1. **Raw seafloor mosaic**: Very low contrast (grayscale std ≈ 5), gray
+   sediment with scattered dark specks (nodules ~3-10cm diameter in real
+   world, appear as dark irregular blobs ~20-3000 pixels in area).  Also has
+   bright white specks (likely marine snow or sensor artifacts).  Sediment has
+   visible grain texture at fine scale.
+
+2. **CVAT ground truth**: Same mosaic with polygon annotations in CVAT
+   (app.cvat.ai).  Labels are "POLYMETALLIC NODULE" with semi-auto
+   annotation.  Nodules appear as dark, compact, roughly circular shapes
+   outlined with white polygons.
+
+**Key visual characteristics**:
+- Nodules are **darker** than surrounding sediment
+- Nodules have **smooth surfaces** (low local texture) vs. grainy sediment
+- Nodules are **compact/circular** (eccentricity < 0.8, circularity > 0.45)
+- Background sediment has **high fine-scale texture** (useful for rejection)
+- Illumination is **uneven** (AUV light cone creates falloff at edges)
+
+---
+
+## 3. PREDECESSOR CODEBASE (BOEM_CV)
+
+The original repo at `github.com/WGoogle/BOEM_CV` had:
+- A monolithic `1_preprocess_and_label.py` (472 lines) that mixed runner
+  logic with CV code
+- `preprocessing/preprocessing/preprocess.py` — MosaicPreprocessor class
+- `preprocessing/preprocessing/proxy_labels.py` — ProxyLabelGenerator class
+- `config.py` with static parameters (no auto-tuning)
+- CoralNet-inspired manifest/idempotency pattern (JSON state tracking)
+- Double-nested module paths: `preprocessing.preprocessing.preprocess`
+
+### Techniques from BOEM_CV that we ported and kept:
+1. Gray-world white balance
+2. CLAHE in LAB color space (L channel only)
+3. Bilateral filtering (edge-preserving denoise)
+4. **Nodule boost** via morphological bottom-hat transform + texture gate
+5. **Sediment fade** — blends bright regions toward smooth background
+6. Unsharp mask on L channel
+7. Multi-scale black top-hat for proxy label generation
+8. Percentile-based thresholding with hard floor
+9. Absolute intensity gate (only darkest pixels can be nodules)
+10. Contour shape filtering (area, eccentricity, solidity, circularity)
+
+### What we changed / improved:
+- **Eliminated double-nested module paths** (`preprocessing.preprocessing.x`
+  → `preprocessing.x`)
+- **Added intelligent patching** — mosaic is split into overlapping 1024px
+  patches before any processing
+- **Added per-patch auto-tuning** — histogram analysis dynamically computes
+  CLAHE clip limit, bilateral sigmas, threshold parameters per patch
+- **Added step-by-step intermediate logging** — every filter step saves a
+  numbered image + composite grid for visual debugging
+- **Strict separation**: runner script contains zero CV logic; all feature
+  code lives in `preprocessing/` module
+- **Quality gate** on patches rejects black borders and featureless tiles
+
+---
+
+## 4. CURRENT REPOSITORY STRUCTURE
+
+```
+nodule_segmentation/
+├── context.md             ← THIS FILE (read first)
+├── config.py                     ← All parameters, paths, feature flags
+├── 1_preprocess_and_label.py     ← Step 1 runner (thin — no CV logic)
+├── 2_train.py                    ← Step 2 placeholder (U-Net training)
+├── 3_inference.py                ← Step 3 placeholder (sliding window)
+├── preprocessing/
+│   ├── __init__.py               ← Public API exports
+│   ├── patcher.py                ← MosaicPatcher: split/reassemble large TIFs
+│   ├── auto_tuner.py             ← PatchAutoTuner: per-patch parameter calc
+│   └── filters.py                ← FilterPipeline + all CV filters + proxy labels
+├── data/
+│   └── raw_mosaics/              ← Input .TIF/.PNG mosaics go here
+└── outputs/
+    ├── preprocessed/             ← Per-mosaic subdirs with preprocessed patches
+    ├── proxy_labels/             ← Full-mosaic proxy masks + overlays
+    ├── patches/                  ← Per-mosaic subdirs: images/ + masks/ + manifest
+    ├── step_by_step_logs/        ← Per-patch intermediate image sequences
+    ├── checkpoints/              ← Model checkpoints (Step 2)
+    ├── results/                  ← Inference outputs (Step 3)
+    └── logs/                     ← Pipeline log files
+```
+
+---
+
+## 5. HOW THE PIPELINE WORKS (Step 1)
+
+When `python 1_preprocess_and_label.py` runs:
+
+```
+For each mosaic in data/raw_mosaics/:
+  1. LOAD mosaic via OpenCV (fallback: tifffile for >2GB TIFs)
+  2. PATCH into overlapping 1024px tiles (stride = 1024 - 128 = 896px)
+     - Quality gate rejects: black borders, featureless tiles (std < 3.0)
+  3. For each valid patch:
+     a. AUTO-TUNE: Analyze L-channel histogram → compute:
+        - CLAHE clip limit (inverse of contrast IQR)
+        - Bilateral sigmas (proportional to noise MAD)
+        - Threshold block size + C-offset (from brightness skewness)
+        - Morph kernel sizes (from illumination uniformity)
+     b. FILTER CHAIN (configurable order in config.py):
+        00_original → 01_gray_world → 02_clahe_lab → 03_bilateral →
+        04_nodule_boost → 05_sediment_fade → 06_unsharp_mask
+     c. PROXY LABEL generation:
+        01_grayscale → 02_gaussian_blur → 03_tophat_response →
+        04_thresholded → 05_intensity_gated → 06_morph_cleaned →
+        07_proxy_mask → 08_overlay
+     d. SAVE: preprocessed patch, proxy mask, step-by-step images
+  4. REASSEMBLE full-mosaic proxy mask (average overlapping regions)
+  5. SAVE overlay visualization + patch manifest JSON
+  6. UPDATE pipeline manifest (CoralNet-style audit trail)
+```
+
+---
+
+## 6. KEY DESIGN DECISIONS & RATIONALE
+
+### Why patch-level processing?
+Different regions of the mosaic have different lighting, sediment, and depth.
+A CLAHE clip of 1.5 might be perfect for a well-lit center patch but terrible
+for a dark edge patch.  Auto-tuning per patch solves this.
+
+### Why the quality gate threshold is low (min_std=3.0)?
+Deep-sea imagery is inherently low-contrast.  The test image had grayscale
+std ≈ 5.0 across the whole image, and individual patches had std ≈ 4.8-5.0.
+A threshold of 5.0 rejected all valid patches.  3.0 is safe for real seafloor
+data while still rejecting truly featureless tiles.
+
+### Why bottom-hat instead of Gaussian background subtraction?
+The original BOEM_CV code found that Gaussian background subtraction creates
+halo artifacts around nodules.  Bottom-hat (morphological close − original)
+responds only to dark compact blobs smaller than the structuring element,
+with no halo.
+
+### Why texture gate?
+Sediment grain texture can trigger the top-hat response at fine scales.
+Computing local standard deviation at σ=2px and ramping the response to zero
+where texture is high effectively suppresses sediment false positives while
+preserving smooth-surfaced nodules.
+
+### Why pre-CLAHE L channel for nodule boost?
+CLAHE creates bright halos around dark nodule edges.  The bottom-hat
+transform reads these halos as part of the "bright background", reducing
+the response.  Using the L channel captured before CLAHE avoids this.
+
+### Why 232 nodules in the test image?
+The test image (raw seafloor screenshot, 1040×2000px) contains many small
+dark specks.  232 is the count after all filtering (area 50-3000px,
+circularity > 0.45, solidity > 0.6, eccentricity < 0.8).  This number will
+change dramatically with real full-resolution TIF mosaics.  The contour
+shape filters in config.py are the main tuning knobs for false positive rate.
+
+---
+
+## 7. MODULE API REFERENCE
+
+### `preprocessing.patcher.MosaicPatcher`
+```python
+patcher = MosaicPatcher(patch_size=1024, overlap=128, min_std=3.0, ...)
+mosaic = patcher.load_mosaic(Path("image.tif"))
+patches, infos = patcher.extract_patches(mosaic)  # List[ndarray], List[PatchInfo]
+full_map = patcher.reassemble(outputs, infos, (H, W))  # for inference
+```
+
+### `preprocessing.auto_tuner.PatchAutoTuner`
+```python
+tuner = PatchAutoTuner(config.AUTO_TUNER)
+params = tuner.analyse(patch_bgr)  # returns TunedParams dataclass
+# params.clahe_clip_limit, params.bilateral_sigma_color, etc.
+```
+
+### `preprocessing.filters.FilterPipeline`
+```python
+pipeline = FilterPipeline(config.PREPROCESSING)
+preprocessed, steps = pipeline.run(patch_bgr, params)
+# steps = [("00_original", img), ("01_gray_world_white_balance", img), ...]
+FilterPipeline.save_step_images(steps, output_dir, prefix="patch_0001")
+```
+
+### `preprocessing.filters.generate_proxy_label`
+```python
+mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LABEL)
+# mask: (H,W) uint8 binary, steps: intermediate images, stats: dict
+```
+
+---
+
+## 8. CONFIG.PY SECTIONS
+
+| Section | Used by | Key parameters |
+|---------|---------|----------------|
+| `PATCHING` | `patcher.py` | `patch_size`, `overlap`, `min_std`, `max_black_fraction` |
+| `AUTO_TUNER` | `auto_tuner.py` | `clahe_clip_range`, `bilateral_sigma_*_range`, `block_size_range`, `tophat_radii`, contour filters |
+| `PREPROCESSING` | `filters.py` | `filter_chain` (ordered list), `sediment_fade_*`, `unsharp_*` |
+| `PROXY_LABEL` | `filters.py` | `gaussian_*`, `adaptive_abs_*` |
+| `LOGGING` | `1_preprocess_and_label.py` | `save_intermediate_steps`, `log_every_n_patches` |
+| `MODEL` | `2_train.py` (future) | U-Net architecture params |
+| `TRAINING` | `2_train.py` (future) | batch_size, lr, epochs, splits |
+| `INFERENCE` | `3_inference.py` (future) | threshold, blend_mode |
+| `METRICS` | `3_inference.py` (future) | `meters_per_pixel` (critical — must be set per dataset) |
+
+---
+
+## 9. WHAT'S NOT BUILT YET
+
+### Step 2: Training (`2_train.py`)
+- U-Net with ResNet34 encoder (pretrained ImageNet)
+- Hybrid BCE + Dice loss
+- Augmentation: brightness/contrast, blur, rotation, flips, elastic
+- Early stopping + LR scheduling
+- Train/val/test split from patch manifest
+- Manual label override: if `data/manual_labels/{patch_id}.png` exists,
+  it replaces the proxy label (CoralNet pattern: explicit > inferred)
+
+### Step 3: Inference (`3_inference.py`)
+- Sliding window over full mosaic using `MosaicPatcher.reassemble()`
+- Probability map blending (average overlap regions)
+- Binary mask at configurable threshold
+- Metrics: nodule count, density (nodules/m²), coverage (%), size distribution
+- Per-mosaic JSON + aggregated dataset summary
+- Overlay visualizations
+
+### Other future work
+- Integration with CVAT for annotation import/export
+- Support for GeoTIFF metadata (lat/lon per patch)
+- Multi-GPU batch processing
+- Confidence calibration on proxy labels vs. manual labels
+
+---
+
+## 10. KNOWN ISSUES & TUNING NOTES
+
+1. **232 detections on test image seems high** — the test image was a
+   low-res screenshot, not a real full-res mosaic.  With real data, adjust:
+   - `min_contour_area` (raise to 100+ to reject tiny noise)
+   - `tophat_percentile` (raise to 97-98 for stricter thresholding)
+   - `min_circularity` (raise to 0.50+ to reject elongated artifacts)
+
+2. **Patch size tradeoff**: 1024px gives good local context but may be too
+   large for very non-uniform lighting.  Try 512px for problem areas.
+
+3. **`meters_per_pixel`** in `config.METRICS` defaults to 0.005 (5mm/px).
+   **This must be set correctly for your AUV/camera specs** or all density
+   calculations will be wrong.
+
+4. **tifffile fallback**: For TIFs > 2GB that OpenCV can't load, install
+   `pip install tifffile`.  The patcher auto-detects and falls back.
+
+5. **The filter chain is configurable**: Remove steps from
+   `config.PREPROCESSING["filter_chain"]` to disable them.  Order matters.
+
+---
+
+## 11. EXTERNAL REFERENCES
+
+- **Original repo**: https://github.com/WGoogle/BOEM_CV
+- **Architecture inspiration**: https://github.com/coralnet/coralnet
+  (CoralNet's idempotent manifest pattern, modular separation)
+- **CoMoNoD algorithm** (traditional nodule delineation):
+  https://www.nature.com/articles/s41598-017-13335-x
+- **BOEM Symposium poster** by Brian Hwang, Kailash Ramesh, Thang Nguyen (2026)
+- **Annotation tool**: CVAT (app.cvat.ai), task ID 2051496
+
+---
+
+*Last updated: March 24, 2026 — initial pipeline build (Step 1 complete)*
