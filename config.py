@@ -177,6 +177,10 @@ INFERENCE = {
 }
 
 METRICS = {
+    # Fallback value — used only when the mosaic file lacks GeoTIFF metadata.
+    # The pipeline auto-extracts meters_per_pixel from GeoTIFF tags (33550 or
+    # 34264) at load time.  This default (5 mm/px) matches the BOEM D1 Node3
+    # survey data.
     "meters_per_pixel":         0.005,
     "connectivity":             8,
     "min_nodule_size":          20,

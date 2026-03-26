@@ -100,7 +100,8 @@ nodule_segmentation/
 │   ├── __init__.py               ← Public API exports
 │   ├── patcher.py                ← MosaicPatcher: split/reassemble large TIFs
 │   ├── auto_tuner.py             ← PatchAutoTuner: per-patch parameter calc
-│   └── filters.py                ← FilterPipeline + all CV filters + proxy labels
+│   ├── filters.py                ← FilterPipeline + all CV filters + proxy labels
+│   └── geo_resolution.py         ← extract_meters_per_pixel from GeoTIFF metadata
 ├── data/
 │   └── raw_mosaics/              ← Input .TIF/.PNG mosaics go here
 └── outputs/
@@ -122,6 +123,10 @@ When `python 1_preprocess_and_label.py` runs:
 ```
 For each mosaic in data/raw_mosaics/:
   1. LOAD mosaic via OpenCV (fallback: tifffile for >2GB TIFs)
+  1b. EXTRACT meters_per_pixel from GeoTIFF metadata (tags 34264 or 33550)
+      - Handles geographic CRS (degree→metre conversion at local latitude)
+      - Handles projected CRS (already in metres)
+      - Falls back to config.METRICS["meters_per_pixel"] for non-GeoTIFF files
   2. PATCH into overlapping 1024px tiles (stride = 1024 - 128 = 896px)
      - Quality gate rejects: black borders, featureless tiles (std < 3.0)
   3. For each valid patch:
@@ -170,6 +175,17 @@ Computing local standard deviation at σ=2px and ramping the response to zero
 where texture is high effectively suppresses sediment false positives while
 preserving smooth-surfaced nodules.
 
+### Why auto-extract meters_per_pixel from GeoTIFF?
+A hardcoded `meters_per_pixel` is fragile — different surveys, cameras, or
+altitudes produce different ground-sample distances.  GeoTIFF files from AUV
+mosaic software (e.g. Hypack, QGIS) embed the spatial resolution in tags
+33550 (ModelPixelScaleTag) or 34264 (ModelTransformationTag).  Reading it
+directly from the file eliminates a manual configuration step and ensures
+density calculations (nodules/m²) are always correct.  For geographic CRS
+files (EPSG:4326, units in degrees), the code converts to metres using the
+local latitude from the same metadata.  The config value serves as a
+fallback for plain PNG/TIFF files that lack geo metadata.
+
 ### Why pre-CLAHE L channel for nodule boost?
 CLAHE creates bright halos around dark nodule edges.  The bottom-hat
 transform reads these halos as part of the "bright background", reducing
@@ -201,6 +217,15 @@ params = tuner.analyse(patch_bgr)  # returns TunedParams dataclass
 # params.clahe_clip_limit, params.bilateral_sigma_color, etc.
 ```
 
+### `preprocessing.geo_resolution.extract_meters_per_pixel`
+```python
+from preprocessing import extract_meters_per_pixel
+
+mpp = extract_meters_per_pixel(Path("image.tif"), fallback=0.005)
+# Returns float (e.g. 0.005015) from GeoTIFF, or fallback for PNG/non-geo TIF
+# Logged automatically: "GeoTIFF resolution = 0.005015 m/px (5.02 mm/px) at lat -15.657°"
+```
+
 ### `preprocessing.filters.FilterPipeline`
 ```python
 pipeline = FilterPipeline(config.PREPROCESSING)
@@ -229,7 +254,7 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 | `MODEL` | `2_train.py` (future) | U-Net architecture params |
 | `TRAINING` | `2_train.py` (future) | batch_size, lr, epochs, splits |
 | `INFERENCE` | `3_inference.py` (future) | threshold, blend_mode |
-| `METRICS` | `3_inference.py` (future) | `meters_per_pixel` (critical — must be set per dataset) |
+| `METRICS` | `3_inference.py` (future) | `meters_per_pixel` (auto-extracted from GeoTIFF; config value used as fallback for non-geo files) |
 
 ---
 
@@ -271,9 +296,12 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 2. **Patch size tradeoff**: 1024px gives good local context but may be too
    large for very non-uniform lighting.  Try 512px for problem areas.
 
-3. **`meters_per_pixel`** in `config.METRICS` defaults to 0.005 (5mm/px).
-   **This must be set correctly for your AUV/camera specs** or all density
-   calculations will be wrong.
+3. **`meters_per_pixel`** is now auto-extracted from GeoTIFF metadata at
+   load time (via `preprocessing/geo_resolution.py`).  The config default
+   of 0.005 (5 mm/px) is used only as a fallback for non-GeoTIFF files.
+   Verified against `CameraMosaic_D1_Node3_L8.tif`: extracted 0.005015 m/px,
+   consistent with the config default.  The extracted value and coverage
+   dimensions are logged and saved in the pipeline manifest.
 
 4. **tifffile fallback**: For TIFs > 2GB that OpenCV can't load, install
    `pip install tifffile`.  The patcher auto-detects and falls back.
@@ -295,4 +323,4 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 
 ---
 
-*Last updated: March 24, 2026 — initial pipeline build (Step 1 complete)*
+*Last updated: March 26, 2026 — added GeoTIFF auto-resolution extraction (geo_resolution.py)*

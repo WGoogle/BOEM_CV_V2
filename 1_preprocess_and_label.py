@@ -37,6 +37,7 @@ import config
 from preprocessing.patcher import MosaicPatcher, PatchInfo
 from preprocessing.auto_tuner import PatchAutoTuner
 from preprocessing.filters import FilterPipeline, generate_proxy_label
+from preprocessing.geo_resolution import extract_meters_per_pixel
 
 # ── logging ──────────────────────────────────────────────────────────────────
 
@@ -148,6 +149,16 @@ def process_mosaic(
     # ── 1. Load ──────────────────────────────────────────────────────────
     mosaic = patcher.load_mosaic(mosaic_path)
     mosaic_h, mosaic_w = mosaic.shape[:2]
+
+    # ── 1b. Extract spatial resolution from GeoTIFF metadata ─────────
+    mpp = extract_meters_per_pixel(
+        mosaic_path, fallback=config.METRICS["meters_per_pixel"],
+    )
+    if mpp is not None:
+        logger.info(
+            f"  Spatial resolution: {mpp:.6f} m/px ({mpp * 1000:.2f} mm/px)  "
+            f"— image covers {mosaic_w * mpp:.1f} m × {mosaic_h * mpp:.1f} m"
+        )
 
     # ── 2. Patch ─────────────────────────────────────────────────────────
     patches, infos = patcher.extract_patches(mosaic)
@@ -278,6 +289,8 @@ def process_mosaic(
     entry.update({
         "source":           str(mosaic_path),
         "shape":            [mosaic_h, mosaic_w, mosaic.shape[2]],
+        "meters_per_pixel": mpp,
+        "coverage_meters":  [round(mosaic_w * mpp, 2), round(mosaic_h * mpp, 2)] if mpp else None,
         "total_patches":    len(infos),
         "valid_patches":    n_valid,
         "total_nodules":    total_nodules,
