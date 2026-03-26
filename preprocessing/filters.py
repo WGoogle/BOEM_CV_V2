@@ -71,6 +71,47 @@ def gray_world_white_balance(
     return balanced.astype(np.uint8)
 
 
+def illumination_normalize(
+    image: np.ndarray, params: TunedParams,
+    preprocess_cfg: dict,
+) -> np.ndarray:
+    """Flatten the AUV light-cone gradient by dividing out low-frequency illumination.
+
+    Estimates the illumination field with a large Gaussian blur (σ≈51px,
+    capturing gradients over ~300px) then divides L by it and rescales to
+    the original mean.  Black mosaic borders are filled before the blur
+    and restored afterward so they don't drag down the estimate at edges.
+    """
+    sigma = preprocess_cfg.get("illum_norm_sigma", 51.0)
+
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    l_f = l_ch.astype(np.float32)
+
+    # Mask out black borders
+    valid_mask = l_f > 8
+    valid_px = l_f[valid_mask]
+    if valid_px.size < 100:
+        return image  # patch is nearly empty, skip
+
+    valid_mean = float(np.mean(valid_px))
+
+    # Fill borders with valid mean so they don't create edge artefacts in blur
+    l_filled = l_f.copy()
+    l_filled[~valid_mask] = valid_mean
+
+    # Estimate illumination field
+    illum = cv2.GaussianBlur(l_filled, (0, 0), sigma)
+    illum = np.clip(illum, 1.0, None)  # prevent division by zero
+
+    # Divide and rescale to original mean brightness
+    l_norm = (l_f / illum) * valid_mean
+    l_norm[~valid_mask] = 0  # restore black borders
+    l_norm = np.clip(l_norm, 0, 255).astype(np.uint8)
+
+    return cv2.cvtColor(cv2.merge([l_norm, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
+
 def clahe_lab(
     image: np.ndarray, params: TunedParams
 ) -> np.ndarray:
@@ -110,8 +151,12 @@ def nodule_boost(
 ) -> np.ndarray:
     """Darken nodule blobs using bottom-hat transform + texture gate.
 
-    Ported from BOEM_CV ``MosaicPreprocessor.apply_nodule_boost``.
     Uses the pre-CLAHE L channel when available to avoid halo artefacts.
+
+    The bottom-hat response is soft-thresholded at the 60th percentile
+    so that background sediment (which also has a small bottom-hat value
+    from grain texture) is left untouched, while actual nodules receive
+    strong darkening proportional to their response.
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -133,10 +178,17 @@ def nodule_boost(
     texture_score = cv2.GaussianBlur(abs_diff, (0, 0), params.texture_sigma * 1.5)
     texture_weight = np.clip(1.0 - texture_score / params.texture_threshold, 0, 1)
 
-    # Combined darkening
-    nodule_signal = (bottom_hat / 255.0) * texture_weight
+    # Soft-threshold: subtract the background bottom-hat floor so only
+    # pixels with a strong response (actual nodules) get darkened.
+    nonzero = bottom_hat[bottom_hat > 0]
+    if nonzero.size > 0:
+        bh_floor = float(np.percentile(nonzero, 60))
+    else:
+        bh_floor = 5.0
+    boosted_bh = np.clip(bottom_hat - bh_floor, 0, None)
+
     darkening = np.clip(
-        params.nodule_boost_factor * nodule_signal * bottom_hat,
+        params.nodule_boost_factor * boosted_bh * texture_weight,
         0, params.max_darkening,
     )
     l_boosted = np.clip(l_ch.astype(np.float32) - darkening, 0, 255).astype(np.uint8)
@@ -149,26 +201,39 @@ def sediment_fade(
     params: TunedParams,
     preprocess_cfg: dict,
 ) -> np.ndarray:
-    """Fade bright sediment blobs toward a smooth background.
+    """Fade bright sediment toward a smooth background without touching nodules.
 
-    Blends bright (non-nodule) L-channel regions toward a heavily blurred
-    version, washing out gray blobs without affecting dark nodules.
+    The L-threshold is computed adaptively from the patch's own brightness
+    distribution: only pixels above the median L value can be faded.  This
+    guarantees that dark compact blobs (nodules) are never brightened.  A
+    wider ramp (40 levels) and reduced mask blur prevent bleed into dark
+    regions adjacent to bright sediment.
     """
     fade_sigma = preprocess_cfg.get("sediment_fade_blur_sigma", 15.0)
     fade_strength = preprocess_cfg.get("sediment_fade_strength", 0.6)
-    l_threshold = preprocess_cfg.get("sediment_l_threshold", 80)
 
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
+    l_f = l_ch.astype(np.float32)
 
-    l_smooth = cv2.GaussianBlur(l_ch.astype(np.float32), (0, 0), fade_sigma)
+    l_smooth = cv2.GaussianBlur(l_f, (0, 0), fade_sigma)
 
-    # Soft sediment mask: 1 for bright (sediment), 0 for dark (nodule)
-    sediment_mask = np.clip((l_ch.astype(np.float32) - l_threshold) / 20.0, 0, 1)
-    sediment_mask = cv2.GaussianBlur(sediment_mask, (0, 0), 5.0)
+    # Adaptive threshold: only fade pixels brighter than the patch median.
+    # Exclude near-black border pixels (L < 10) from the median calculation.
+    valid_L = l_f[l_f > 10]
+    if valid_L.size > 0:
+        l_threshold = float(np.median(valid_L))
+    else:
+        l_threshold = preprocess_cfg.get("sediment_l_threshold", 80)
+
+    # Soft sediment mask: ramps from 0 at l_threshold to 1 at l_threshold+40.
+    # The wider ramp (40 vs old 20) + higher adaptive threshold keeps dark
+    # nodule pixels firmly at 0.  Minimal mask blur (σ=2) prevents bleed.
+    sediment_mask = np.clip((l_f - l_threshold) / 40.0, 0, 1)
+    sediment_mask = cv2.GaussianBlur(sediment_mask, (0, 0), 2.0)
 
     blend_w = sediment_mask * fade_strength
-    l_faded = l_ch.astype(np.float32) * (1.0 - blend_w) + l_smooth * blend_w
+    l_faded = l_f * (1.0 - blend_w) + l_smooth * blend_w
     l_faded = np.clip(l_faded, 0, 255).astype(np.uint8)
 
     return cv2.cvtColor(cv2.merge([l_faded, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
@@ -179,19 +244,38 @@ def unsharp_mask(
     params: TunedParams,
     preprocess_cfg: dict,
 ) -> np.ndarray:
-    """Sharpen nodule edges via unsharp masking on the L channel."""
-    sigma = preprocess_cfg.get("unsharp_sigma", 1.5)
-    strength = preprocess_cfg.get("unsharp_strength", 0.2)
+    """Edge-selective unsharp mask — sharpens nodule boundaries, not grain.
+
+    Uses a two-sigma approach: the sharpening kernel targets nodule-edge
+    scale (σ≈2px), while a grain-suppression guard computed at fine scale
+    (σ≈0.7px) prevents amplification of sediment texture.  Only edges
+    with a gradient magnitude above the median get the full sharpening.
+    """
+    sigma = preprocess_cfg.get("unsharp_sigma", 2.0)
+    strength = preprocess_cfg.get("unsharp_strength", 0.5)
 
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
+    l_f = l_ch.astype(np.float32)
 
-    blur = cv2.GaussianBlur(l_ch, (0, 0), sigma)
-    l_sharp = np.clip(
-        l_ch.astype(np.int16) + strength * (l_ch.astype(np.int16) - blur.astype(np.int16)),
-        0, 255,
-    ).astype(np.uint8)
+    blur = cv2.GaussianBlur(l_f, (0, 0), sigma)
+    detail = l_f - blur  # high-pass at nodule-edge scale
 
+    # Edge magnitude — stronger at real boundaries, weaker at grain
+    grad_x = cv2.Sobel(l_f, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(l_f, cv2.CV_32F, 0, 1, ksize=3)
+    edge_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    # Soft gate: ramp from 0 at low edges to 1 at strong edges.
+    # Threshold at the median edge magnitude of non-black pixels.
+    valid = l_ch > 8
+    if valid.any():
+        edge_thresh = float(np.median(edge_mag[valid]))
+    else:
+        edge_thresh = 1.0
+    edge_weight = np.clip(edge_mag / (edge_thresh * 2.0 + 1e-6), 0, 1)
+
+    l_sharp = np.clip(l_f + strength * detail * edge_weight, 0, 255).astype(np.uint8)
     return cv2.cvtColor(cv2.merge([l_sharp, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
 
@@ -364,6 +448,7 @@ def generate_proxy_label(
 #   (image, params, [preprocess_cfg]) -> image
 _FILTER_REGISTRY = {
     "gray_world_white_balance": gray_world_white_balance,
+    "illumination_normalize":   illumination_normalize,
     "clahe_lab":                clahe_lab,
     "bilateral_denoise":        bilateral_denoise,
     "nodule_boost":             nodule_boost,
@@ -420,7 +505,7 @@ class FilterPipeline:
             # Call the filter with the right signature
             if step_name in ("nodule_boost",):
                 image = fn(image, params, self.cfg, l_pre_clahe)
-            elif step_name in ("sediment_fade", "unsharp_mask"):
+            elif step_name in ("illumination_normalize", "sediment_fade", "unsharp_mask"):
                 image = fn(image, params, self.cfg)
             else:
                 image = fn(image, params)

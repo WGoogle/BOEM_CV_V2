@@ -108,24 +108,32 @@ class PatchAutoTuner:
 
     # ── public API ───────────────────────────────────────────────────────────
 
+    # Pixels below this threshold are treated as black border / no-data
+    # and excluded from all diagnostic calculations.
+    _BORDER_THRESHOLD = 10
+
     def analyse(self, patch_bgr: np.ndarray) -> TunedParams:
         """Analyse *patch_bgr* and return tuned parameters.
 
         This is the single entry point.  Internally it:
         1. Extracts the L channel (perceptual lightness).
-        2. Computes four diagnostic signals.
-        3. Maps each signal to parameter ranges defined in config.
+        2. Builds a valid-pixel mask (excluding black mosaic borders).
+        3. Computes four diagnostic signals on valid pixels only.
+        4. Maps each signal to parameter ranges defined in config.
         """
         # Extract L channel from LAB
         lab = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB)
         L = lab[:, :, 0].astype(np.float32)
         gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
 
-        # ── Diagnostic signals ───────────────────────────────────────────
-        contrast   = self._contrast_ratio(L)
-        noise      = self._noise_estimate(gray)
-        skew       = self._brightness_skew(L)
-        uniformity = self._illumination_uniformity(L)
+        # Build valid-pixel mask — exclude black borders from AUV mosaic
+        valid_mask = gray > self._BORDER_THRESHOLD
+
+        # ── Diagnostic signals (computed on valid pixels only) ────────
+        contrast   = self._contrast_ratio(L, valid_mask)
+        noise      = self._noise_estimate(gray, valid_mask)
+        skew       = self._brightness_skew(L, valid_mask)
+        uniformity = self._illumination_uniformity(L, valid_mask)
 
         # ── Map signals → parameters ─────────────────────────────────────
         params = TunedParams()
@@ -196,50 +204,65 @@ class PatchAutoTuner:
         return params
 
     # ── diagnostic signal extractors ─────────────────────────────────────────
+    # All methods accept a valid_mask to exclude black mosaic borders.
 
     @staticmethod
-    def _contrast_ratio(L: np.ndarray) -> float:
-        """Inter-quartile range of the L channel.
+    def _contrast_ratio(L: np.ndarray, valid_mask: np.ndarray) -> float:
+        """Inter-quartile range of L-channel valid pixels.
 
         A high IQR means the patch already has good contrast between
         nodules and sediment; a low IQR means everything looks flat.
         """
-        q75, q25 = np.percentile(L, [75, 25])
+        valid_px = L[valid_mask]
+        if valid_px.size < 100:
+            return 0.0
+        q75, q25 = np.percentile(valid_px, [75, 25])
         return float(q75 - q25)
 
     @staticmethod
-    def _noise_estimate(gray: np.ndarray) -> float:
+    def _noise_estimate(gray: np.ndarray, valid_mask: np.ndarray) -> float:
         """Estimate sensor noise using the Median Absolute Deviation of
-        the Laplacian (robust to image content).
+        the Laplacian on valid pixels only.
 
         Ref: Immerkaer, "Fast noise variance estimation", CVIU 1996.
         """
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        # MAD is more robust than std for non-Gaussian noise
-        med = np.median(np.abs(laplacian))
-        # Scale factor for Gaussian noise: σ ≈ 1.4826 * MAD
+        valid_lap = np.abs(laplacian[valid_mask])
+        if valid_lap.size < 100:
+            return 0.0
+        med = np.median(valid_lap)
         return float(med * 1.4826)
 
     @staticmethod
-    def _brightness_skew(L: np.ndarray) -> float:
-        """Skewness of the L-channel histogram.
+    def _brightness_skew(L: np.ndarray, valid_mask: np.ndarray) -> float:
+        """Skewness of the L-channel histogram (valid pixels only).
 
         Negative skew → dark patch (many dark pixels, few bright).
         Positive skew → bright patch.
         Near zero → balanced.
         """
-        mean = np.mean(L)
-        std = np.std(L)
+        valid_px = L[valid_mask]
+        if valid_px.size < 100:
+            return 0.0
+        mean = np.mean(valid_px)
+        std = np.std(valid_px)
         if std < 1e-6:
             return 0.0
-        return float(np.mean(((L - mean) / std) ** 3))
+        return float(np.mean(((valid_px - mean) / std) ** 3))
 
     @staticmethod
-    def _illumination_uniformity(L: np.ndarray) -> float:
-        """Std-dev of a heavily blurred version of L.
+    def _illumination_uniformity(L: np.ndarray, valid_mask: np.ndarray) -> float:
+        """Std-dev of a heavily blurred version of L (valid pixels only).
 
         High value → strong illumination gradient across the patch
         (e.g. AUV light cone falloff).  Low value → uniform lighting.
         """
-        blurred = cv2.GaussianBlur(L, (0, 0), sigmaX=30.0)
-        return float(np.std(blurred))
+        # Fill black border regions with the valid-pixel mean so they
+        # don't create artificial gradients in the blur.
+        L_filled = L.copy()
+        valid_px = L[valid_mask]
+        if valid_px.size < 100:
+            return 0.0
+        L_filled[~valid_mask] = np.mean(valid_px)
+        blurred = cv2.GaussianBlur(L_filled, (0, 0), sigmaX=30.0)
+        return float(np.std(blurred[valid_mask]))

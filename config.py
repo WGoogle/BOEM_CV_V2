@@ -84,7 +84,7 @@ AUTO_TUNER = {
     "nodule_boost_factor":  2.0,
     "morph_radius":         20,              # SE radius for bottom-hat
     "texture_sigma":        2.0,
-    "texture_threshold":    12.0,
+    "texture_threshold":    18.0,
     "max_darkening":        70,
 
     # ── Top-hat proxy labelling ──────────────────────────────────────────────
@@ -109,6 +109,7 @@ PREPROCESSING = {
     # Toggle any step off by removing it from the list.
     "filter_chain": [
         "gray_world_white_balance",
+        "illumination_normalize",
         "clahe_lab",
         "bilateral_denoise",
         "nodule_boost",
@@ -116,14 +117,16 @@ PREPROCESSING = {
         "unsharp_mask",
     ],
 
+    # ── Illumination normalization ────────────────────────────────────────────
+    "illum_norm_sigma":          51.0,       # large blur to capture AUV light gradient
+
     # ── Sediment fade ────────────────────────────────────────────────────────
     "sediment_fade_blur_sigma":  15.0,
     "sediment_fade_strength":    0.6,
-    "sediment_l_threshold":      80,
 
-    # ── Unsharp mask ─────────────────────────────────────────────────────────
-    "unsharp_sigma":    1.5,
-    "unsharp_strength": 0.2,
+    # ── Unsharp mask (edge-selective) ────────────────────────────────────────
+    "unsharp_sigma":    2.0,
+    "unsharp_strength": 0.5,
 }
 
 

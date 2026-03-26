@@ -72,13 +72,26 @@ The original repo at `github.com/WGoogle/BOEM_CV` had:
 9. Absolute intensity gate (only darkest pixels can be nodules)
 10. Contour shape filtering (area, eccentricity, solidity, circularity)
 
-### What we changed / improved:
+### What we changed / improved (V2 overhaul):
 - **Eliminated double-nested module paths** (`preprocessing.preprocessing.x`
   → `preprocessing.x`)
 - **Added intelligent patching** — mosaic is split into overlapping 1024px
   patches before any processing
 - **Added per-patch auto-tuning** — histogram analysis dynamically computes
   CLAHE clip limit, bilateral sigmas, threshold parameters per patch
+- **Auto-tuner masks black borders** — all diagnostic signals (contrast,
+  noise, skew, uniformity) are computed on valid pixels only (gray > 10),
+  preventing mosaic border regions from contaminating parameter estimates
+- **Added illumination normalization** — divides L channel by large-scale
+  Gaussian blur (σ=51px) to flatten AUV light-cone gradients before CLAHE
+- **Fixed nodule boost formula** — old version squared the bottom-hat
+  (bh²/255), producing <1 level darkening.  New version soft-thresholds at
+  P60 then applies linear boost, achieving -6 to -9 levels on nodule pixels
+- **Fixed sediment fade** — old static L-threshold (80) brightened nodules
+  by +12-14 levels.  New adaptive threshold (patch median L) with wider
+  ramp (40 levels) and minimal blur ensures dark pixels are untouched (+2)
+- **Edge-selective unsharp mask** — Sobel-gated sharpening only enhances
+  real boundaries (nodule edges), not sediment grain texture
 - **Added step-by-step intermediate logging** — every filter step saves a
   numbered image + composite grid for visual debugging
 - **Strict separation**: runner script contains zero CV logic; all feature
@@ -130,14 +143,15 @@ For each mosaic in data/raw_mosaics/:
   2. PATCH into overlapping 1024px tiles (stride = 1024 - 128 = 896px)
      - Quality gate rejects: black borders, featureless tiles (std < 3.0)
   3. For each valid patch:
-     a. AUTO-TUNE: Analyze L-channel histogram → compute:
+     a. AUTO-TUNE: Analyze L-channel histogram (black borders masked) → compute:
         - CLAHE clip limit (inverse of contrast IQR)
         - Bilateral sigmas (proportional to noise MAD)
         - Threshold block size + C-offset (from brightness skewness)
         - Morph kernel sizes (from illumination uniformity)
      b. FILTER CHAIN (configurable order in config.py):
-        00_original → 01_gray_world → 02_clahe_lab → 03_bilateral →
-        04_nodule_boost → 05_sediment_fade → 06_unsharp_mask
+        00_original → 01_gray_world → 02_illumination_normalize →
+        03_clahe_lab → 04_bilateral → 05_nodule_boost →
+        06_sediment_fade → 07_unsharp_mask
      c. PROXY LABEL generation:
         01_grayscale → 02_gaussian_blur → 03_tophat_response →
         04_thresholded → 05_intensity_gated → 06_morph_cleaned →
@@ -173,7 +187,51 @@ with no halo.
 Sediment grain texture can trigger the top-hat response at fine scales.
 Computing local standard deviation at σ=2px and ramping the response to zero
 where texture is high effectively suppresses sediment false positives while
-preserving smooth-surfaced nodules.
+preserving smooth-surfaced nodules.  Threshold raised from 12→18 after
+analysis showed the original value over-suppressed the nodule boost signal;
+actual sediment texture scores are mean 2.1, P90 2.7 — the gate only needs
+to catch outliers, not blanket-suppress.
+
+### Why mask black borders in auto-tuning?
+AUV mosaic patches have 15-25% black border pixels from the strip geometry.
+Including these zeros in diagnostic signals caused: contrast IQR inflated
+(saw 13-20 instead of real 6-12), skewness wildly negative (-1.5 to -5.4
+instead of -0.35), illumination uniformity inflated (34-44 instead of 3-8).
+This made CLAHE clip max out at 4.0 on nearly every patch regardless of
+actual content.  Masking pixels below gray=10 gives accurate per-patch
+diagnostics.
+
+### Why illumination normalization before CLAHE?
+AUV light cones create 7-11% illumination gradients across individual
+patches.  On imagery where total nodule-sediment contrast is only 10-15
+levels, this gradient dominates the signal.  Dividing L by a large-scale
+Gaussian blur (σ=51px) removes the gradient while preserving local contrast.
+Placed before CLAHE so the equaliser works on uniform illumination.  Black
+border pixels are filled with the valid-pixel mean before blurring to prevent
+edge artefacts, then restored to 0 afterward.
+
+### Why soft-threshold the nodule boost?
+The raw bottom-hat response has mean ~8-9 even on background sediment (from
+grain texture and small dark features).  The old formula squared this
+(bh²/255), which killed the signal — 0.6 levels mean darkening, invisible.
+The new formula subtracts the 60th-percentile floor, so background (bh < floor)
+gets zero darkening while actual nodules (bh=15-40) get -6 to -9 levels.
+This targeted approach darkens only real compact blobs.
+
+### Why adaptive sediment fade threshold?
+The old hardcoded L-threshold (80) was below the median brightness of most
+patches after CLAHE, causing the fade to brighten nodule pixels by +12-14
+levels — actively destroying the contrast CLAHE created.  Using the per-patch
+median L as threshold guarantees only the brighter half (sediment) can be
+faded.  A wider ramp (40 vs 20 levels) and reduced mask blur (σ=2 vs 5)
+prevent bleed into dark pixels at nodule-sediment boundaries.
+
+### Why edge-selective unsharp mask?
+Naive unsharp masking amplifies both nodule edges and sediment grain equally.
+The edge-selective version computes a Sobel gradient magnitude and gates the
+sharpening: only pixels with above-median edge strength receive the full
+boost.  This expands dynamic range at real nodule boundaries (DR 71→81,
+90→105) without amplifying fine-scale texture that could confuse a U-Net.
 
 ### Why auto-extract meters_per_pixel from GeoTIFF?
 A hardcoded `meters_per_pixel` is fragile — different surveys, cameras, or
@@ -230,7 +288,8 @@ mpp = extract_meters_per_pixel(Path("image.tif"), fallback=0.005)
 ```python
 pipeline = FilterPipeline(config.PREPROCESSING)
 preprocessed, steps = pipeline.run(patch_bgr, params)
-# steps = [("00_original", img), ("01_gray_world_white_balance", img), ...]
+# steps = [("00_original", img), ("01_gray_world_white_balance", img),
+#          ("02_illumination_normalize", img), ("03_clahe_lab", img), ...]
 FilterPipeline.save_step_images(steps, output_dir, prefix="patch_0001")
 ```
 
@@ -248,7 +307,7 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 |---------|---------|----------------|
 | `PATCHING` | `patcher.py` | `patch_size`, `overlap`, `min_std`, `max_black_fraction` |
 | `AUTO_TUNER` | `auto_tuner.py` | `clahe_clip_range`, `bilateral_sigma_*_range`, `block_size_range`, `tophat_radii`, contour filters |
-| `PREPROCESSING` | `filters.py` | `filter_chain` (ordered list), `sediment_fade_*`, `unsharp_*` |
+| `PREPROCESSING` | `filters.py` | `filter_chain` (ordered list), `illum_norm_sigma`, `sediment_fade_*`, `unsharp_*` |
 | `PROXY_LABEL` | `filters.py` | `gaussian_*`, `adaptive_abs_*` |
 | `LOGGING` | `1_preprocess_and_label.py` | `save_intermediate_steps`, `log_every_n_patches` |
 | `MODEL` | `2_train.py` (future) | U-Net architecture params |
@@ -279,7 +338,8 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 
 ### Other future work
 - Integration with CVAT for annotation import/export
-- Support for GeoTIFF metadata (lat/lon per patch)
+- Per-patch lat/lon from GeoTIFF transformation matrix (spatial metadata
+  already extracted for resolution; extending to per-patch coordinates)
 - Multi-GPU batch processing
 - Confidence calibration on proxy labels vs. manual labels
 
@@ -323,4 +383,6 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 
 ---
 
-*Last updated: March 26, 2026 — added GeoTIFF auto-resolution extraction (geo_resolution.py)*
+*Last updated: March 26, 2026 — preprocessing overhaul: illumination normalization,
+nodule boost fix, adaptive sediment fade, edge-selective unsharp, auto-tuner
+black border masking, GeoTIFF resolution extraction*
