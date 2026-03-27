@@ -9,5 +9,6 @@ Public API re-exported here so callers can do::
 from .patcher import MosaicPatcher
 from .auto_tuner import PatchAutoTuner
 from .filters import FilterPipeline
- 
-__all__ = ["MosaicPatcher", "PatchAutoTuner", "FilterPipeline"]
+from .geo_resolution import extract_meters_per_pixel
+
+__all__ = ["MosaicPatcher", "PatchAutoTuner", "FilterPipeline", "extract_meters_per_pixel"]

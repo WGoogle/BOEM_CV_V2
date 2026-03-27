@@ -65,6 +65,7 @@ The original repo at `github.com/WGoogle/BOEM_CV` had:
 2. CLAHE in LAB color space (L channel only)
 3. Bilateral filtering (edge-preserving denoise)
 4. **Nodule boost** via morphological bottom-hat transform + texture gate
+   *(kept in code but removed from default filter chain — see V2 overhaul)*
 5. **Sediment fade** — blends bright regions toward smooth background
 6. Unsharp mask on L channel
 7. Multi-scale black top-hat for proxy label generation
@@ -82,11 +83,23 @@ The original repo at `github.com/WGoogle/BOEM_CV` had:
 - **Auto-tuner masks black borders** — all diagnostic signals (contrast,
   noise, skew, uniformity) are computed on valid pixels only (gray > 10),
   preventing mosaic border regions from contaminating parameter estimates
-- **Added illumination normalization** — divides L channel by large-scale
-  Gaussian blur (σ=51px) to flatten AUV light-cone gradients before CLAHE
-- **Fixed nodule boost formula** — old version squared the bottom-hat
-  (bh²/255), producing <1 level darkening.  New version soft-thresholds at
-  P60 then applies linear boost, achieving -6 to -9 levels on nodule pixels
+- **Replaced illumination_normalize + nodule_boost with Multi-Scale Retinex
+  (MSR)** — the old approach (divide-by-blur illumination normalization →
+  aggressive CLAHE → bottom-hat nodule boost) falsely darkened gray sediment
+  divots and bumps into dark blobs resembling nodules.  MSR separates
+  reflectance from illumination in log domain (`log(R) = log(I) - log(blur(I))`)
+  at multiple Gaussian scales, intrinsically removing both large-scale AUV
+  light-cone gradients and medium-scale shading from 3D surface relief
+  (divots/bumps) while preserving true reflectance differences (dark nodule
+  material vs. bright sediment).  Followed by gentle CLAHE (clip max 1.5)
+  to recover local contrast for downstream detection.
+- **Nodule boost removed from filter chain** — bottom-hat transform cannot
+  distinguish reflectance darkness (real nodules) from shading darkness
+  (divot shadows).  MSR handles the illumination separation that nodule_boost
+  was attempting.  The function remains in code for optional re-enablement.
+- **CLAHE clip range reduced from (1.0, 4.0) to (1.0, 1.5)** — MSR handles
+  illumination normalization; CLAHE now only needs to provide gentle local
+  contrast enhancement, not compensate for lighting gradients.
 - **Fixed sediment fade** — old static L-threshold (80) brightened nodules
   by +12-14 levels.  New adaptive threshold (patch median L) with wider
   ramp (40 levels) and minimal blur ensures dark pixels are untouched (+2)
@@ -149,9 +162,9 @@ For each mosaic in data/raw_mosaics/:
         - Threshold block size + C-offset (from brightness skewness)
         - Morph kernel sizes (from illumination uniformity)
      b. FILTER CHAIN (configurable order in config.py):
-        00_original → 01_gray_world → 02_illumination_normalize →
-        03_clahe_lab → 04_bilateral → 05_nodule_boost →
-        06_sediment_fade → 07_unsharp_mask
+        00_original → 01_gray_world_white_balance →
+        02_multi_scale_retinex → 03_clahe_lab → 04_bilateral_denoise →
+        05_sediment_fade → 06_unsharp_mask
      c. PROXY LABEL generation:
         01_grayscale → 02_gaussian_blur → 03_tophat_response →
         04_thresholded → 05_intensity_gated → 06_morph_cleaned →
@@ -177,13 +190,47 @@ std ≈ 5.0 across the whole image, and individual patches had std ≈ 4.8-5.0.
 A threshold of 5.0 rejected all valid patches.  3.0 is safe for real seafloor
 data while still rejecting truly featureless tiles.
 
-### Why bottom-hat instead of Gaussian background subtraction?
-The original BOEM_CV code found that Gaussian background subtraction creates
-halo artifacts around nodules.  Bottom-hat (morphological close − original)
-responds only to dark compact blobs smaller than the structuring element,
-with no halo.
+### Why Multi-Scale Retinex (MSR) instead of illumination_normalize + nodule_boost?
+The original V2 pipeline used: illumination_normalize (divide by blur) →
+CLAHE (aggressive, clip up to 4.0) → nodule_boost (bottom-hat + texture gate).
+This chain falsely darkened gray sediment divots and 3D bumps into dark blobs
+that looked like nodules in the final output.  The root cause:
 
-### Why texture gate?
+- **illumination_normalize** (divide-by-blur) only removes large-scale
+  gradients, not medium-scale shading from 3D surface relief
+- **CLAHE at high clip** amplifies all local contrast equally — real nodule
+  darkness AND shading from divots/bumps
+- **Bottom-hat (nodule_boost)** responds to any dark compact feature smaller
+  than its structuring element — cannot distinguish reflectance darkness
+  (nodules) from shading darkness (divot shadows)
+- **Texture gate** fails for divots because their shadows are smooth
+  (low texture), just like real nodules
+
+MSR solves this at the root: in log domain, `log(R) = log(I) - log(blur(I))`
+intrinsically separates reflectance (material property) from illumination
+(lighting + 3D shading).  Averaging across scales [5, 20, 80] removes both
+fine-scale shading and large-scale gradients.  After MSR, CLAHE only needs
+gentle local contrast enhancement (clip max 1.5), and nodule_boost is
+unnecessary because MSR already preserves true reflectance differences.
+
+**MSR implementation details**:
+- Operates on L channel in LAB colour space
+- Black borders (L < 8) filled with valid-pixel mean before blurring
+- Output normalized to [0, 255] using P1-P99 percentile stretch
+- Stats-matching: output mean/std are matched to original valid-pixel
+  statistics so downstream filters (sediment fade, proxy labels) remain
+  calibrated
+- Optional gain parameter (default 1.0) for contrast scaling
+
+### Why bottom-hat is kept in code but removed from the chain?
+The bottom-hat transform + texture gate (`nodule_boost`) remains in
+`filters.py` and `_FILTER_REGISTRY` for optional re-enablement via
+`config.PREPROCESSING["filter_chain"]`.  It is not in the default chain
+because MSR handles illumination/reflectance separation more cleanly.
+The bottom-hat approach may still be useful for specific scenarios with
+extremely low-contrast nodules where extra darkening is needed.
+
+### Why texture gate in proxy label generation?
 Sediment grain texture can trigger the top-hat response at fine scales.
 Computing local standard deviation at σ=2px and ramping the response to zero
 where texture is high effectively suppresses sediment false positives while
@@ -201,22 +248,12 @@ This made CLAHE clip max out at 4.0 on nearly every patch regardless of
 actual content.  Masking pixels below gray=10 gives accurate per-patch
 diagnostics.
 
-### Why illumination normalization before CLAHE?
-AUV light cones create 7-11% illumination gradients across individual
-patches.  On imagery where total nodule-sediment contrast is only 10-15
-levels, this gradient dominates the signal.  Dividing L by a large-scale
-Gaussian blur (σ=51px) removes the gradient while preserving local contrast.
-Placed before CLAHE so the equaliser works on uniform illumination.  Black
-border pixels are filled with the valid-pixel mean before blurring to prevent
-edge artefacts, then restored to 0 afterward.
-
-### Why soft-threshold the nodule boost?
-The raw bottom-hat response has mean ~8-9 even on background sediment (from
-grain texture and small dark features).  The old formula squared this
-(bh²/255), which killed the signal — 0.6 levels mean darkening, invisible.
-The new formula subtracts the 60th-percentile floor, so background (bh < floor)
-gets zero darkening while actual nodules (bh=15-40) get -6 to -9 levels.
-This targeted approach darkens only real compact blobs.
+### Why conservative CLAHE (clip max 1.5) after MSR?
+MSR removes illumination/shading but its stats-matching step compresses
+the output to the original brightness distribution, which is inherently
+low-contrast.  Gentle CLAHE (clip 1.0–1.5) recovers local contrast for
+nodule detection without re-introducing the shading amplification that
+aggressive CLAHE (clip up to 4.0) caused in the old pipeline.
 
 ### Why adaptive sediment fade threshold?
 The old hardcoded L-threshold (80) was below the median brightness of most
@@ -245,16 +282,10 @@ local latitude from the same metadata.  The config value serves as a
 fallback for plain PNG/TIFF files that lack geo metadata.
 
 ### Why pre-CLAHE L channel for nodule boost?
+*(Relevant only when nodule_boost is re-enabled in the filter chain.)*
 CLAHE creates bright halos around dark nodule edges.  The bottom-hat
 transform reads these halos as part of the "bright background", reducing
 the response.  Using the L channel captured before CLAHE avoids this.
-
-### Why 232 nodules in the test image?
-The test image (raw seafloor screenshot, 1040×2000px) contains many small
-dark specks.  232 is the count after all filtering (area 50-3000px,
-circularity > 0.45, solidity > 0.6, eccentricity < 0.8).  This number will
-change dramatically with real full-resolution TIF mosaics.  The contour
-shape filters in config.py are the main tuning knobs for false positive rate.
 
 ---
 
@@ -289,7 +320,9 @@ mpp = extract_meters_per_pixel(Path("image.tif"), fallback=0.005)
 pipeline = FilterPipeline(config.PREPROCESSING)
 preprocessed, steps = pipeline.run(patch_bgr, params)
 # steps = [("00_original", img), ("01_gray_world_white_balance", img),
-#          ("02_illumination_normalize", img), ("03_clahe_lab", img), ...]
+#          ("02_multi_scale_retinex", img), ("03_clahe_lab", img),
+#          ("04_bilateral_denoise", img), ("05_sediment_fade", img),
+#          ("06_unsharp_mask", img)]
 FilterPipeline.save_step_images(steps, output_dir, prefix="patch_0001")
 ```
 
@@ -307,7 +340,7 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 |---------|---------|----------------|
 | `PATCHING` | `patcher.py` | `patch_size`, `overlap`, `min_std`, `max_black_fraction` |
 | `AUTO_TUNER` | `auto_tuner.py` | `clahe_clip_range`, `bilateral_sigma_*_range`, `block_size_range`, `tophat_radii`, contour filters |
-| `PREPROCESSING` | `filters.py` | `filter_chain` (ordered list), `illum_norm_sigma`, `sediment_fade_*`, `unsharp_*` |
+| `PREPROCESSING` | `filters.py` | `filter_chain` (ordered list), `msr_sigmas`, `msr_gain`, `sediment_fade_*`, `unsharp_*` |
 | `PROXY_LABEL` | `filters.py` | `gaussian_*`, `adaptive_abs_*` |
 | `LOGGING` | `1_preprocess_and_label.py` | `save_intermediate_steps`, `log_every_n_patches` |
 | `MODEL` | `2_train.py` (future) | U-Net architecture params |
@@ -369,6 +402,19 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 5. **The filter chain is configurable**: Remove steps from
    `config.PREPROCESSING["filter_chain"]` to disable them.  Order matters.
 
+6. **Divot/bump false darkening** — was the primary issue in the old pipeline.
+   The old chain (illumination_normalize → aggressive CLAHE → nodule_boost)
+   progressively darkened gray sediment divots into dark nodule-like blobs.
+   Solved by replacing with MSR + gentle CLAHE.  If divot false positives
+   reappear, check that CLAHE clip max hasn't been raised above ~1.5 and
+   that nodule_boost hasn't been re-added to the chain.
+
+7. **MSR grain amplification** — at very fine Gaussian scales (σ < 10), MSR's
+   log-domain division amplifies sediment grain texture.  The current sigmas
+   [5, 20, 80] include σ=5 which can produce some texture amplification, but
+   this is controlled by the stats-matching step and gentle CLAHE.  If grain
+   noise becomes problematic, try removing σ=5 or increasing to σ=15.
+
 ---
 
 ## 11. EXTERNAL REFERENCES
@@ -383,6 +429,6 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 
 ---
 
-*Last updated: March 26, 2026 — preprocessing overhaul: illumination normalization,
-nodule boost fix, adaptive sediment fade, edge-selective unsharp, auto-tuner
-black border masking, GeoTIFF resolution extraction*
+*Last updated: March 27, 2026 — replaced illumination_normalize + nodule_boost
+with Multi-Scale Retinex (MSR) + gentle CLAHE to fix divot false-darkening;
+CLAHE clip range reduced to (1.0, 1.5); nodule_boost removed from default chain*

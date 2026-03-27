@@ -64,7 +64,7 @@ AUTO_TUNER = {
     # ── CLAHE ────────────────────────────────────────────────────────────────
     # Clip limit is scaled by local contrast: low-contrast patches get a
     # stronger boost, high-contrast patches are left mostly alone.
-    "clahe_clip_range":     (1.0, 4.0),     # (min_clip, max_clip)
+    "clahe_clip_range":     (1.0, 1.5),     # conservative — MSR handles illumination, CLAHE just adds gentle local contrast
     "clahe_tile_grid":      (8, 8),         # tile grid for CLAHE
 
     # ── Bilateral filter ─────────────────────────────────────────────────────
@@ -109,16 +109,19 @@ PREPROCESSING = {
     # Toggle any step off by removing it from the list.
     "filter_chain": [
         "gray_world_white_balance",
-        "illumination_normalize",
-        "clahe_lab",
+        "multi_scale_retinex",         # illumination/shading removal (safe for divots)
+        "clahe_lab",                   # gentle local contrast enhancement
         "bilateral_denoise",
-        "nodule_boost",
         "sediment_fade",
         "unsharp_mask",
     ],
 
-    # ── Illumination normalization ────────────────────────────────────────────
-    "illum_norm_sigma":          51.0,       # large blur to capture AUV light gradient
+    # ── Multi-Scale Retinex ───────────────────────────────────────────────────
+    # Removes illumination gradients and shading from 3D surface relief,
+    # so divots/bumps are not falsely darkened.  CLAHE follows to gently
+    # recover local contrast for nodule detection.
+    "msr_sigmas":               [5, 20, 80],
+    "msr_gain":                 1.0,
 
     # ── Sediment fade ────────────────────────────────────────────────────────
     "sediment_fade_blur_sigma":  15.0,

@@ -143,6 +143,92 @@ def bilateral_denoise(
     )
 
 
+def multi_scale_retinex(
+    image: np.ndarray,
+    params: TunedParams,
+    preprocess_cfg: dict,
+) -> np.ndarray:
+    """Multi-Scale Retinex on the L channel — reflectance/illumination separation.
+
+    Replaces the illumination_normalize → CLAHE → nodule_boost chain.
+
+    Retinex theory: an image I = R * L, where R is reflectance (material
+    property) and L is illumination (lighting + shading from 3D relief).
+    In log domain: log(R) = log(I) - log(L).  We estimate L at multiple
+    Gaussian scales and average the resulting reflectance images.
+
+    This intrinsically suppresses:
+    - AUV light-cone gradients (large-scale illumination)
+    - Shadow artifacts from sediment bumps/divots (medium-scale shading)
+    while preserving:
+    - True reflectance differences (dark nodule material vs. bright sediment)
+
+    Black mosaic borders are filled before blurring and restored afterward.
+    The output is rescaled to match the original valid-pixel brightness
+    distribution to keep downstream steps (sediment fade, proxy labels) stable.
+    """
+    sigmas = preprocess_cfg.get("msr_sigmas", [5, 20, 80])
+    gain = preprocess_cfg.get("msr_gain", 1.0)
+
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    l_f = l_ch.astype(np.float32)
+
+    # Mask black borders
+    valid_mask = l_f > 8
+    valid_px = l_f[valid_mask]
+    if valid_px.size < 100:
+        return image
+
+    valid_mean = float(np.mean(valid_px))
+    valid_std = float(np.std(valid_px))
+
+    # Fill borders with valid mean to prevent edge artifacts in blurs
+    l_filled = l_f.copy()
+    l_filled[~valid_mask] = valid_mean
+
+    # Avoid log(0) — clamp to small positive value
+    l_log = np.log1p(l_filled)  # log(1 + L), so 0 maps to 0
+
+    # Multi-scale Retinex: average of (log(L) - log(blur(L))) across scales
+    retinex = np.zeros_like(l_log)
+    for sigma in sigmas:
+        l_blur = cv2.GaussianBlur(l_filled, (0, 0), sigma)
+        l_blur_log = np.log1p(l_blur)
+        retinex += (l_log - l_blur_log)
+    retinex /= len(sigmas)
+
+    # Normalize retinex to [0, 255] using only valid pixels
+    r_valid = retinex[valid_mask]
+    r_min = float(np.percentile(r_valid, 1))
+    r_max = float(np.percentile(r_valid, 99))
+    if r_max - r_min < 1e-6:
+        return image
+
+    # Linear stretch to 0-255, then match original brightness statistics
+    l_retinex = (retinex - r_min) / (r_max - r_min) * 255.0
+
+    # Apply gain
+    if gain != 1.0:
+        lr_valid = l_retinex[valid_mask]
+        lr_mean = float(np.mean(lr_valid))
+        l_retinex = (l_retinex - lr_mean) * gain + lr_mean
+
+    # Match the original valid-pixel mean and std so downstream filters
+    # (sediment fade, proxy label thresholds) remain calibrated.
+    lr_valid = l_retinex[valid_mask]
+    lr_mean = float(np.mean(lr_valid))
+    lr_std = float(np.std(lr_valid))
+    if lr_std > 1e-6:
+        l_retinex = (l_retinex - lr_mean) / lr_std * valid_std + valid_mean
+
+    # Restore black borders
+    l_retinex[~valid_mask] = 0
+    l_retinex = np.clip(l_retinex, 0, 255).astype(np.uint8)
+
+    return cv2.cvtColor(cv2.merge([l_retinex, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
+
 def nodule_boost(
     image: np.ndarray,
     params: TunedParams,
@@ -451,6 +537,7 @@ _FILTER_REGISTRY = {
     "illumination_normalize":   illumination_normalize,
     "clahe_lab":                clahe_lab,
     "bilateral_denoise":        bilateral_denoise,
+    "multi_scale_retinex":      multi_scale_retinex,
     "nodule_boost":             nodule_boost,
     "sediment_fade":            sediment_fade,
     "unsharp_mask":             unsharp_mask,
@@ -497,7 +584,7 @@ class FilterPipeline:
                 logger.warning(f"Unknown filter step '{step_name}' — skipping")
                 continue
 
-            # Capture pre-CLAHE L channel
+            # Capture pre-CLAHE L channel (used by nodule_boost if present)
             if step_name == "clahe_lab":
                 lab_tmp = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
                 l_pre_clahe = lab_tmp[:, :, 0].copy()
@@ -505,7 +592,10 @@ class FilterPipeline:
             # Call the filter with the right signature
             if step_name in ("nodule_boost",):
                 image = fn(image, params, self.cfg, l_pre_clahe)
-            elif step_name in ("illumination_normalize", "sediment_fade", "unsharp_mask"):
+            elif step_name in (
+                "illumination_normalize", "multi_scale_retinex",
+                "sediment_fade", "unsharp_mask",
+            ):
                 image = fn(image, params, self.cfg)
             else:
                 image = fn(image, params)
