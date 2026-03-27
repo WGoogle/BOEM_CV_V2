@@ -77,8 +77,9 @@ AUTO_TUNER = {
     "c_offset_range":       (2, 15),         # constant subtracted from mean
 
     # ── Morphology ───────────────────────────────────────────────────────────
-    "morph_open_range":     (3, 7),          # opening kernel diameter
-    "morph_close_range":    (5, 13),         # closing kernel diameter
+    "morph_open_range":     (1, 3),          # opening kernel — must be tiny for grain nodules
+    "morph_close_range":    (5, 11),         # closing kernel — solidify scattered detections
+                                            # into coherent nodule blobs (was 3-7, too small)
 
     # ── Nodule-boost (bottom-hat) ────────────────────────────────────────────
     "nodule_boost_factor":  2.0,
@@ -88,16 +89,24 @@ AUTO_TUNER = {
     "max_darkening":        70,
 
     # ── Top-hat proxy labelling ──────────────────────────────────────────────
-    "tophat_radii":         [12, 20, 30],
-    "tophat_percentile":    96,
-    "tophat_threshold_floor": 15.0,
+    # Radii must cover the full nodule size range at survey resolution:
+    #   At 5mm/px: grain (5-15mm) = 1-3px, medium (25-50mm) = 5-10px,
+    #   large (40-90mm) = 8-18px.  Need radii from 1 (grain) to 12 (large).
+    "tophat_radii":         [1, 2, 4, 8, 12],
+    "tophat_percentile":    88,       # was 96 — too aggressive, only captured peak pixels
+                                    # creating fragmented detections.  88 captures fuller
+                                    # nodule extent while still rejecting most background.
+    "tophat_threshold_floor": 8.0,    # lowered for grain nodules' weaker response
 
     # ── Contour shape filters ────────────────────────────────────────────────
-    "min_contour_area":     50,
-    "max_contour_area":     3000,
-    "max_eccentricity":     0.80,
-    "min_solidity":         0.60,
-    "min_circularity":      0.45,
+    # At 5mm/px, a 10mm grain nodule is ~2px diameter = ~3px² area.
+    # Shape filters relaxed for tiny contours (filters.py applies size-aware
+    # filtering: strict shape criteria only for contours > 20px²).
+    "min_contour_area":     3,        # catch grain nodules (was 50)
+    "max_contour_area":     5000,     # allow largest nodules + clusters
+    "max_eccentricity":     0.85,     # relaxed — small contours have noisy shape
+    "min_solidity":         0.50,     # relaxed for small/irregular shapes
+    "min_circularity":      0.30,     # relaxed — pixelated small blobs score low
 }
 
 
@@ -136,13 +145,36 @@ PREPROCESSING = {
 # ----------- PROXY LABEL GENERATION -----------
 
 PROXY_LABEL = {
-    "apply_gaussian_blur":      True,
-    "gaussian_kernel_size":     15,
-    "gaussian_sigma":           5.0,
+    # ── Dark-spot detection ──────────────────────────────────────────────
+    # The core signal: nodules are DARKER than surrounding sediment.
+    # We smooth to remove grain texture, estimate local background with
+    # a large blur, then threshold the darkness score (bg - smoothed).
 
-    "adaptive_abs_intensity":   True,
-    "adaptive_abs_percentile":  8,
-    "absolute_intensity_max":   85,
+    # Smoothing: removes sediment grain texture while preserving nodule-
+    # scale features.  σ=5 is ~2.5mm at 5mm/px resolution — smooths
+    # individual sand grains but preserves nodules ≥ 5mm.
+    "smooth_sigma":             5.0,
+
+    # Background estimation: large σ ensures the background doesn't
+    # track individual nodules.  At σ=60, the kernel covers ~300px,
+    # far larger than any single nodule, so it represents the average
+    # sediment brightness in the neighborhood.
+    "bg_sigma":                 60.0,
+
+    # Darkness threshold: keep the top N% of darkness scores.
+    # 93 = top 7% darkest regions relative to local background.
+    "darkness_percentile":      93,
+    "darkness_floor":           3.0,    # absolute minimum darkness score
+
+    # ── Watershed separation ─────────────────────────────────────────────
+    # Only applied to connected components large enough to contain
+    # multiple nodules.  Minimum distance between nodule centers.
+    "watershed_min_distance":   8,
+
+    # ── Contour filters ──────────────────────────────────────────────────
+    # Local contrast: contour interior must be this fraction darker than
+    # the local background (guards against noise detections).
+    "min_local_contrast":       0.02,
 }
 
 

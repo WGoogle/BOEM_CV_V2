@@ -107,6 +107,33 @@ The original repo at `github.com/WGoogle/BOEM_CV` had:
   real boundaries (nodule edges), not sediment grain texture
 - **Added step-by-step intermediate logging** — every filter step saves a
   numbered image + composite grid for visual debugging
+- **Multi-feature composite proxy labelling** (V2.1) — replaced single-channel
+  top-hat proxy labelling with multi-feature composite scoring:
+  1. Top-hat (primary signal): multi-scale black top-hat with texture gate
+  2. Local Contrast Ratio (LCR gate): darkness relative to local background,
+     adapts to illumination variations preprocessing didn't fully remove
+  3. Difference of Gaussians (DoG, supplementary): scale-normalized blob
+     detection that catches nodules at scales the top-hat misses
+  4. Smoothness (soft gate): fine vs. coarse local variance ratio;
+     suppresses sediment grain texture responses
+  Combined via multiplicative gating: tophat * (1 + lcr_gain*LCR) *
+  smoothness^power + dog_blend * DoG (same gates).  This ensures a pixel
+  must be BOTH morphologically blob-like AND locally dark AND smooth.
+- **Grain-size nodule support** — top-hat radii extended to [1,2,4,8,12]
+  (from [12,20,30]) to detect 5-15mm grain nodules that are only 1-3px
+  at 5mm/px resolution.  Pre-blur reduced to σ=1.5 (from σ=5), contour
+  min_area lowered to 3px² (from 50), morph kernels shrunk to 1-3px opening.
+- **Size-aware contour filtering** — grain-size contours (<20px²) skip
+  unreliable shape checks (eccentricity, circularity, solidity) since
+  pixelated blobs can't produce meaningful shape metrics.  Only area +
+  local contrast are checked.  Larger contours get full shape filtering.
+- **Watershed separation** for touching nodules — distance transform →
+  local maxima (nodule centers) → marker-controlled watershed to split
+  clusters into individual detections.
+- **Enhanced contour filtering** — two new checks beyond shape:
+  1. Local contrast: contour interior must be darker than local background
+  2. Boundary gradient: mean Sobel magnitude along contour boundary must
+     exceed threshold (real edges produce strong gradients; noise doesn't)
 - **Strict separation**: runner script contains zero CV logic; all feature
   code lives in `preprocessing/` module
 - **Quality gate** on patches rejects black borders and featureless tiles
@@ -165,10 +192,17 @@ For each mosaic in data/raw_mosaics/:
         00_original → 01_gray_world_white_balance →
         02_multi_scale_retinex → 03_clahe_lab → 04_bilateral_denoise →
         05_sediment_fade → 06_unsharp_mask
-     c. PROXY LABEL generation:
-        01_grayscale → 02_gaussian_blur → 03_tophat_response →
-        04_thresholded → 05_intensity_gated → 06_morph_cleaned →
-        07_proxy_mask → 08_overlay
+     c. PROXY LABEL generation (multi-feature composite scoring):
+        01_grayscale → 02_gaussian_blur →
+        03_tophat (multi-scale black top-hat + texture gate) →
+        04_local_contrast (LCR: darkness vs. local background) →
+        05_dog_blobs (Difference of Gaussians blob detection) →
+        06_smoothness (fine vs. coarse local variance) →
+        07_composite_score (multiplicative gating: tophat * LCR_boost * smooth_gate + DoG) →
+        08_thresholded (percentile-based) →
+        09_intensity_gated (adaptive dark-pixel gate) →
+        10_morph_cleaned → 11_watershed_split (separate touching nodules) →
+        12_proxy_mask (size-aware contour filtering) → 13_overlay
      d. SAVE: preprocessed patch, proxy mask, step-by-step images
   4. REASSEMBLE full-mosaic proxy mask (average overlapping regions)
   5. SAVE overlay visualization + patch manifest JSON
@@ -287,6 +321,48 @@ CLAHE creates bright halos around dark nodule edges.  The bottom-hat
 transform reads these halos as part of the "bright background", reducing
 the response.  Using the L channel captured before CLAHE avoids this.
 
+### Why multi-feature composite scoring instead of single top-hat?
+The original single-channel top-hat approach has blind spots:
+1. **Fixed scale** — top-hat at radii [12,20,30] misses grain nodules
+   (1-3px at 5mm/px resolution) and can't adapt to multi-scale input.
+2. **No local context** — the absolute intensity gate uses a global
+   percentile, missing nodules in locally bright regions.
+3. **No touching-nodule separation** — clusters merge into one contour
+   that gets rejected by shape filters.
+4. **Additive scoring doesn't work** — features like smoothness score
+   high everywhere (P50=0.70), drowning out selective features when
+   combined additively.
+
+Multiplicative gating solves this: tophat * LCR_boost * smooth_gate
+ensures a detection must score high on ALL features simultaneously.
+The DoG supplementary channel catches blobs at unexpected scales.
+
+### Why size-aware contour filtering?
+At 5mm/px, polymetallic nodules span a huge pixel-size range:
+- **Grain (5-15mm)**: 1-3px diameter, 3-7px² area
+- **Medium (25-50mm)**: 5-10px diameter, 20-78px² area
+- **Large (40-90mm)**: 8-18px diameter, 50-254px² area
+
+A 3px² contour has too few pixels for meaningful eccentricity,
+circularity, or solidity measurements — these metrics are dominated
+by pixelation artifacts at this scale.  The pipeline uses a 20px²
+threshold: below it, only area + local contrast are checked;
+above it, full shape filtering (eccentricity, circularity, solidity,
+boundary gradient) is applied.
+
+### Why multiplicative gating over additive weighting?
+Early testing showed that additive weighted combination
+(score = w1*f1 + w2*f2 + ...) fails because non-selective features
+(smoothness P50=0.70, normalized top-hat P50=0.25) elevate the
+composite baseline everywhere.  The 94th percentile of positive scores
+then cuts at ~0.53, fragmenting detections into tiny disconnected pixels.
+
+Multiplicative gating (tophat * LCR_boost * smooth_gate) naturally
+produces near-zero scores where ANY feature is low, concentrating
+high scores at true nodule locations.  The proven percentile threshold
+from V1 (96th percentile of positive values with hard floor) then
+works correctly.
+
 ---
 
 ## 7. MODULE API REFERENCE
@@ -329,7 +405,10 @@ FilterPipeline.save_step_images(steps, output_dir, prefix="patch_0001")
 ### `preprocessing.filters.generate_proxy_label`
 ```python
 mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LABEL)
-# mask: (H,W) uint8 binary, steps: intermediate images, stats: dict
+# mask: (H,W) uint8 binary [0, 255]
+# steps: 13 intermediate images (grayscale → blur → 4 features → composite →
+#         threshold → intensity gate → morph → watershed → mask → overlay)
+# stats: dict with candidates, nodules, coverage, rejections, feature params
 ```
 
 ---
@@ -380,40 +459,52 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 
 ## 10. KNOWN ISSUES & TUNING NOTES
 
-1. **232 detections on test image seems high** — the test image was a
-   low-res screenshot, not a real full-res mosaic.  With real data, adjust:
-   - `min_contour_area` (raise to 100+ to reject tiny noise)
-   - `tophat_percentile` (raise to 97-98 for stricter thresholding)
-   - `min_circularity` (raise to 0.50+ to reject elongated artifacts)
+1. **Nodule size ranges vs. resolution** — at 5mm/px (BOEM D1 survey):
+   - Grain (5-15mm) = 1-3px diameter, 3-7px² area — at resolution limit
+   - Medium (25-50mm) = 5-10px diameter, 20-78px² area — reliably detectable
+   - Large (40-90mm) = 8-18px diameter, 50-254px² area — easily detected
+   Single-pixel (5mm) grain nodules cannot be reliably distinguished from
+   sensor noise at this resolution.  `min_contour_area=3` catches 10mm+.
 
-2. **Patch size tradeoff**: 1024px gives good local context but may be too
+2. **205 detections on D1 Node3 L8** — multi-feature composite scoring
+   with grain-size support.  Old pipeline detected 64 on same mosaic using
+   single-channel top-hat with min_area=50 (blind to grain nodules).
+
+3. **Patch size tradeoff**: 1024px gives good local context but may be too
    large for very non-uniform lighting.  Try 512px for problem areas.
 
-3. **`meters_per_pixel`** is now auto-extracted from GeoTIFF metadata at
+4. **`meters_per_pixel`** is now auto-extracted from GeoTIFF metadata at
    load time (via `preprocessing/geo_resolution.py`).  The config default
    of 0.005 (5 mm/px) is used only as a fallback for non-GeoTIFF files.
-   Verified against `CameraMosaic_D1_Node3_L8.tif`: extracted 0.005015 m/px,
-   consistent with the config default.  The extracted value and coverage
-   dimensions are logged and saved in the pipeline manifest.
+   Verified against `CameraMosaic_D1_Node3_L8.tif`: extracted 0.005015 m/px.
 
-4. **tifffile fallback**: For TIFs > 2GB that OpenCV can't load, install
+5. **tifffile fallback**: For TIFs > 2GB that OpenCV can't load, install
    `pip install tifffile`.  The patcher auto-detects and falls back.
 
-5. **The filter chain is configurable**: Remove steps from
+6. **The filter chain is configurable**: Remove steps from
    `config.PREPROCESSING["filter_chain"]` to disable them.  Order matters.
 
-6. **Divot/bump false darkening** — was the primary issue in the old pipeline.
-   The old chain (illumination_normalize → aggressive CLAHE → nodule_boost)
-   progressively darkened gray sediment divots into dark nodule-like blobs.
+7. **Divot/bump false darkening** — was the primary issue in the old pipeline.
    Solved by replacing with MSR + gentle CLAHE.  If divot false positives
-   reappear, check that CLAHE clip max hasn't been raised above ~1.5 and
-   that nodule_boost hasn't been re-added to the chain.
+   reappear, check that CLAHE clip max hasn't been raised above ~1.5.
 
-7. **MSR grain amplification** — at very fine Gaussian scales (σ < 10), MSR's
+8. **MSR grain amplification** — at very fine Gaussian scales (σ < 10), MSR's
    log-domain division amplifies sediment grain texture.  The current sigmas
    [5, 20, 80] include σ=5 which can produce some texture amplification, but
-   this is controlled by the stats-matching step and gentle CLAHE.  If grain
-   noise becomes problematic, try removing σ=5 or increasing to σ=15.
+   this is controlled by the stats-matching step and gentle CLAHE.
+
+9. **Tuning the proxy label sensitivity** — to catch more/fewer nodules:
+   - `tophat_percentile`: lower = more detections (try 92-96)
+   - `tophat_threshold_floor`: lower = catch weaker responses (try 5-15)
+   - `min_contour_area`: lower = catch smaller grain nodules (min 1)
+   - `adaptive_abs_percentile`: higher = allow lighter pixels (try 15-30)
+   - `lcr_gain`: higher = more LCR boost for locally dark pixels (try 2-5)
+   - `composite_smooth_sigma`: lower = sharper detections, higher = merge nearby
+
+10. **Additive scoring pitfall** — early composite scoring used weighted
+    addition (w1*f1 + w2*f2 + ...) which failed because smoothness (P50=0.70)
+    and normalized top-hat (P50=0.25) elevate the baseline everywhere.  The
+    fix was multiplicative gating: tophat * LCR_boost * smooth_gate.
 
 ---
 
@@ -429,6 +520,7 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 
 ---
 
-*Last updated: March 27, 2026 — replaced illumination_normalize + nodule_boost
-with Multi-Scale Retinex (MSR) + gentle CLAHE to fix divot false-darkening;
-CLAHE clip range reduced to (1.0, 1.5); nodule_boost removed from default chain*
+*Last updated: March 27, 2026 — multi-feature composite proxy labelling with
+grain-size nodule support; multiplicative gating (top-hat * LCR * smoothness + DoG);
+watershed separation; size-aware contour filtering; top-hat radii [1,2,4,8,12];
+min_contour_area=3; 205 detections on D1 Node3 L8 (up from 64 with old pipeline)*

@@ -365,14 +365,258 @@ def unsharp_mask(
     return cv2.cvtColor(cv2.merge([l_sharp, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
 
-# ----------- PROXY LABEL GENERATION -----------
+# ----------- PROXY LABEL FEATURE EXTRACTORS -----------
+
+def _feature_tophat(
+    blurred: np.ndarray,
+    radii: list,
+    texture_sigma: float,
+    texture_threshold: float,
+) -> np.ndarray:
+    """Multi-scale black top-hat with texture gating.
+
+    Returns a float32 feature map where high values indicate dark compact
+    blobs (nodule candidates).  The texture gate suppresses responses in
+    grainy sediment regions where top-hat fires on grain, not nodules.
+    """
+    combined = np.zeros(blurred.shape, dtype=np.float32)
+    for r in radii:
+        se_size = 2 * r + 1
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
+        closed = cv2.morphologyEx(blurred, cv2.MORPH_CLOSE, se)
+        tophat = cv2.subtract(closed, blurred).astype(np.float32)
+        combined = np.maximum(combined, tophat)
+
+    # Texture gate: suppress response where local texture is high
+    blur_fine = cv2.GaussianBlur(blurred.astype(np.float32), (0, 0), texture_sigma)
+    local_diff = np.abs(blurred.astype(np.float32) - blur_fine)
+    texture_score = cv2.GaussianBlur(local_diff, (0, 0), texture_sigma * 2.0)
+    texture_weight = np.clip(1.0 - texture_score / texture_threshold, 0, 1)
+    combined *= texture_weight
+
+    return combined
+
+
+def _feature_local_contrast_ratio(
+    gray_f: np.ndarray,
+    bg_sigma: float,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    """Local contrast ratio — how dark each pixel is relative to its local background.
+
+    LCR = (local_background - pixel) / local_background
+
+    High LCR means the pixel is much darker than its surroundings — a
+    hallmark of a nodule sitting on sediment.  This is superior to a global
+    intensity percentile because it adapts to local illumination variations
+    that the preprocessing may not have fully removed.
+
+    The local background is estimated with a large Gaussian blur.  Black
+    border pixels are excluded via valid_mask.
+    """
+    # Estimate local background brightness with a large-kernel blur
+    # Fill invalid (border) pixels with valid mean to avoid edge artifacts
+    gray_filled = gray_f.copy()
+    valid_px = gray_f[valid_mask]
+    if valid_px.size > 0:
+        gray_filled[~valid_mask] = float(np.mean(valid_px))
+    local_bg = cv2.GaussianBlur(gray_filled, (0, 0), bg_sigma)
+    local_bg = np.clip(local_bg, 1.0, None)  # avoid division by zero
+
+    # LCR: how much darker than local background (0 = same, 1 = completely dark)
+    lcr = np.clip((local_bg - gray_f) / local_bg, 0, 1)
+    lcr[~valid_mask] = 0
+    return lcr
+
+
+def _feature_dog(
+    gray_f: np.ndarray,
+    sigma_pairs: list,
+) -> np.ndarray:
+    """Difference of Gaussians (DoG) blob detection — scale-normalized.
+
+    DoG approximates the Laplacian of Gaussian (LoG), the theoretically
+    optimal blob detector.  By using multiple sigma pairs we detect nodules
+    across a range of sizes.  Each pair is σ-normalized so that different
+    scales contribute equally, then we take the maximum response.
+
+    Each sigma pair (σ_small, σ_large) produces a response proportional to
+    the "blobness" at scale ≈ σ_large.  Only negative responses (dark blobs
+    on bright background) are kept.
+    """
+    combined = np.zeros_like(gray_f)
+    for s_small, s_large in sigma_pairs:
+        g_small = cv2.GaussianBlur(gray_f, (0, 0), s_small)
+        g_large = cv2.GaussianBlur(gray_f, (0, 0), s_large)
+        # DoG: negative = dark blob on bright background
+        dog = g_large - g_small
+        # σ-normalize: multiply by average σ so different scales are comparable
+        sigma_avg = (s_small + s_large) / 2.0
+        dog_norm = dog * sigma_avg
+        # Only keep dark-blob responses (positive after flip)
+        combined = np.maximum(combined, np.clip(dog_norm, 0, None))
+
+    return combined
+
+
+def _feature_smoothness(
+    gray_f: np.ndarray,
+    inner_sigma: float,
+    outer_sigma: float,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    """Smoothness score — nodules have smooth surfaces vs. grainy sediment.
+
+    Computes the ratio of local variance at two scales:
+    - inner_sigma (fine): captures sediment grain texture
+    - outer_sigma (coarse): captures broader intensity variation
+
+    A nodule region has low fine-scale variance (smooth surface) but may
+    have moderate coarse-scale variance (contrast with surrounding sediment).
+    The score = 1 - (fine_var / (coarse_var + eps)), clamped to [0, 1].
+
+    High smoothness = smooth dark region = likely nodule.
+    Low smoothness = textured region = likely sediment grain.
+    """
+    # Fine-scale local variance
+    mean_fine = cv2.GaussianBlur(gray_f, (0, 0), inner_sigma)
+    sq_fine = cv2.GaussianBlur(gray_f ** 2, (0, 0), inner_sigma)
+    var_fine = np.clip(sq_fine - mean_fine ** 2, 0, None)
+
+    # Coarse-scale local variance
+    mean_coarse = cv2.GaussianBlur(gray_f, (0, 0), outer_sigma)
+    sq_coarse = cv2.GaussianBlur(gray_f ** 2, (0, 0), outer_sigma)
+    var_coarse = np.clip(sq_coarse - mean_coarse ** 2, 0, None)
+
+    # Smoothness: low fine variance relative to coarse variance
+    smoothness = np.clip(1.0 - var_fine / (var_coarse + 1e-4), 0, 1)
+    smoothness[~valid_mask] = 0
+    return smoothness
+
+
+def _normalize_feature(feat: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """Normalize a feature map to [0, 1] using robust percentile scaling on valid pixels."""
+    valid_px = feat[valid_mask]
+    if valid_px.size < 100:
+        return np.zeros_like(feat)
+    p_low = float(np.percentile(valid_px, 2))
+    p_high = float(np.percentile(valid_px, 98))
+    if p_high - p_low < 1e-6:
+        return np.zeros_like(feat)
+    normed = np.clip((feat - p_low) / (p_high - p_low), 0, 1)
+    normed[~valid_mask] = 0
+    return normed
+
+
+def _watershed_split(
+    binary: np.ndarray,
+    patch_bgr: np.ndarray,
+    min_distance: int,
+) -> np.ndarray:
+    """Marker-controlled watershed to separate touching nodules.
+
+    Only applied to connected components large enough to plausibly contain
+    multiple nodules.  Small/medium blobs are passed through untouched.
+    This prevents the watershed from fragmenting individual nodules into
+    single-pixel dust.
+
+    The minimum component area for watershed consideration is set at 4x the
+    expected single-nodule area (based on min_distance as a proxy for nodule
+    radius).  Components below this threshold are kept as-is.
+    """
+    if np.sum(binary > 0) < 10:
+        return binary
+
+    # Only try to split components large enough to be multi-nodule clusters.
+    # Single-nodule blobs should pass through untouched.
+    min_single_area = max(50, int(np.pi * min_distance ** 2))
+    min_split_area = min_single_area * 4  # must be ~4x a single nodule
+
+    # Label all connected components
+    n_cc, cc_labels = cv2.connectedComponents(binary)
+    result = binary.copy()
+
+    for label_id in range(1, n_cc):
+        cc_mask = (cc_labels == label_id).astype(np.uint8) * 255
+        cc_area = np.sum(cc_mask > 0)
+
+        # Skip small components — no need to split
+        if cc_area < min_split_area:
+            continue
+
+        # Distance transform on this component only
+        dist = cv2.distanceTransform(cc_mask, cv2.DIST_L2, 5)
+        max_dist = float(dist.max())
+
+        # If the blob is thin (max distance < min_distance), don't split
+        if max_dist < min_distance:
+            continue
+
+        # Find peaks with adequate separation
+        # Use a dilation kernel proportional to min_distance
+        peak_kernel = max(min_distance * 2 + 1, 7)
+        if peak_kernel % 2 == 0:
+            peak_kernel += 1
+        dist_dilated = cv2.dilate(
+            dist, np.ones((peak_kernel, peak_kernel), np.uint8),
+        )
+        # Peaks: local maxima with meaningful distance from background
+        local_max = (
+            (dist == dist_dilated) & (dist > max(2.0, max_dist * 0.3))
+        ).astype(np.uint8)
+
+        n_peaks, peak_labels = cv2.connectedComponents(local_max)
+        # Need at least 2 peaks to warrant splitting
+        if n_peaks <= 2:
+            continue
+
+        # Set up watershed markers
+        markers = peak_labels + 1  # shift so background can be 0
+        markers[cc_mask == 0] = 0
+
+        ws_input = (
+            patch_bgr.copy()
+            if patch_bgr.ndim == 3
+            else cv2.cvtColor(patch_bgr, cv2.COLOR_GRAY2BGR)
+        )
+        markers_ws = markers.astype(np.int32)
+        cv2.watershed(ws_input, markers_ws)
+
+        # Replace this component: keep split regions, remove boundaries
+        result[cc_labels == label_id] = 0
+        result[(markers_ws > 1) & (cc_labels == label_id)] = 255
+
+    return result
+
+
+# ----------- PROXY LABEL GENERATION (Dark-Spot Detection) -----------
 
 def generate_proxy_label(
     patch_bgr: np.ndarray,
     params: TunedParams,
     proxy_cfg: dict,
 ) -> Tuple[np.ndarray, List[Tuple[str, np.ndarray]], Dict]:
-    """Generate a binary nodule mask for a single patch.
+    """Generate a binary nodule mask by detecting dark spots on the seafloor.
+
+    The core insight: polymetallic nodules are darker than surrounding
+    sediment.  The human eye spots them simply because they are locally
+    dark — no complex multi-feature scoring is needed.
+
+    Strategy
+    --------
+    1. **Smooth** the grayscale to eliminate grain texture (preserves
+       nodule-scale features).
+    2. **Estimate local background** with a large Gaussian blur, so each
+       pixel's darkness is measured relative to its neighborhood — adapting
+       naturally to illumination gradients across the patch.
+    3. **Darkness score** = background − smoothed.  High values mean the
+       region is significantly darker than its surroundings.
+    4. **Percentile threshold** on the darkness score to isolate candidate
+       dark regions.
+    5. **Morphological cleanup** to solidify scattered pixels into coherent
+       blobs and remove isolated noise pixels.
+    6. **Watershed separation** for large touching-nodule clusters.
+    7. **Contour shape filtering** rejects elongated / irregular shapes.
 
     Returns
     -------
@@ -383,87 +627,116 @@ def generate_proxy_label(
     steps: List[Tuple[str, np.ndarray]] = []
 
     def _log(name: str, img: np.ndarray):
-        # Store a copy so later mutations don't corrupt the log
-        steps.append((name, img.copy() if img.ndim == 2 else img.copy()))
+        steps.append((name, img.copy()))
 
-    # 1. Grayscale
+    # ── 1. Grayscale + valid pixel mask ──────────────────────────────────
     gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
+    gray_f = gray.astype(np.float32)
+    valid_mask = gray > 10  # exclude black mosaic borders
     _log("01_grayscale", gray)
 
-    # 2. Gaussian blur (smooth sediment grain texture)
-    if proxy_cfg.get("apply_gaussian_blur", True):
-        ksize = proxy_cfg.get("gaussian_kernel_size", 15)
-        sigma = proxy_cfg.get("gaussian_sigma", 5.0)
-        blurred = cv2.GaussianBlur(gray, (ksize, ksize), sigma)
+    n_valid = int(valid_mask.sum())
+    if n_valid < 100:
+        empty = np.zeros(gray.shape, dtype=np.uint8)
+        _log("02_smoothed", gray)
+        _log("03_local_background", gray)
+        _log("04_darkness_score", empty)
+        _log("05_thresholded", empty)
+        _log("06_morph_cleaned", empty)
+        _log("07_watershed_split", empty)
+        _log("08_proxy_mask", empty)
+        _log("09_overlay", patch_bgr)
+        return empty, steps, {
+            "candidates_before_filter": 0, "nodules_after_filter": 0,
+            "coverage_pct": 0.0, "threshold_used": 0.0,
+            "abs_intensity_gate": 0.0, "rejection_counts": {},
+        }
+
+    # ── 2. Smooth to eliminate grain texture ─────────────────────────────
+    # σ=5 smooths pixel-level sensor noise and sediment grain without
+    # blurring nodule-scale features (nodules are ≥3px across).
+    smooth_sigma = proxy_cfg.get("smooth_sigma", 5.0)
+    smoothed = cv2.GaussianBlur(gray_f, (0, 0), smooth_sigma)
+    _log("02_smoothed", np.clip(smoothed, 0, 255).astype(np.uint8))
+
+    # ── 3. Estimate local background ─────────────────────────────────────
+    # Large σ ensures the background estimate doesn't track individual
+    # nodules — it represents the average sediment brightness in the
+    # neighborhood.  Border pixels are filled with the valid mean to
+    # prevent edge artifacts.
+    bg_sigma = proxy_cfg.get("bg_sigma", 60.0)
+    filled = smoothed.copy()
+    valid_mean = float(np.mean(smoothed[valid_mask]))
+    filled[~valid_mask] = valid_mean
+    local_bg = cv2.GaussianBlur(filled, (0, 0), bg_sigma)
+    _log("03_local_background", np.clip(local_bg, 0, 255).astype(np.uint8))
+
+    # ── 4. Darkness score ────────────────────────────────────────────────
+    # Positive values mean the region is darker than its local background.
+    # This is the primary detection signal — it's exactly how the human
+    # eye spots nodules.
+    darkness = np.clip(local_bg - smoothed, 0, None)
+    darkness[~valid_mask] = 0
+
+    # Visualize as heatmap
+    dark_valid = darkness[valid_mask]
+    d_max = float(np.percentile(dark_valid, 99.5)) if dark_valid.size > 0 else 1.0
+    darkness_viz = np.clip(darkness / max(d_max, 1e-6) * 255, 0, 255).astype(np.uint8)
+    darkness_color = cv2.applyColorMap(darkness_viz, cv2.COLORMAP_JET)
+    darkness_color[~valid_mask] = 0
+    _log("04_darkness_score", darkness_color)
+
+    # ── 5. Percentile threshold ──────────────────────────────────────────
+    # Keep the top N% of darkness scores.  The threshold adapts per-patch
+    # because it's computed from each patch's own darkness distribution.
+    darkness_pct = proxy_cfg.get("darkness_percentile", 93)
+    darkness_floor = proxy_cfg.get("darkness_floor", 3.0)
+
+    pos = dark_valid[dark_valid > 0]
+    if pos.size > 100:
+        threshold = float(np.percentile(pos, darkness_pct))
     else:
-        blurred = gray.copy()
-    _log("02_gaussian_blur", blurred)
+        threshold = darkness_floor
+    threshold = max(threshold, darkness_floor)
 
-    gray_raw = gray.copy()  # keep pre-blur version for intensity gate
+    binary = (darkness >= threshold).astype(np.uint8) * 255
+    binary[~valid_mask] = 0
+    _log("05_thresholded", binary)
 
-    # 3. Multi-scale black top-hat
-    combined = np.zeros(blurred.shape, dtype=np.float32)
-    for r in params.tophat_radii:
-        se_size = 2 * r + 1
-        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
-        closed = cv2.morphologyEx(blurred, cv2.MORPH_CLOSE, se)
-        tophat = cv2.subtract(closed, blurred).astype(np.float32)
-        combined = np.maximum(combined, tophat)
-
-    # Texture gate
-    tex_sigma = params.texture_sigma
-    tex_thresh = params.texture_threshold
-    blur_fine = cv2.GaussianBlur(blurred.astype(np.float32), (0, 0), tex_sigma)
-    local_diff = np.abs(blurred.astype(np.float32) - blur_fine)
-    texture_score = cv2.GaussianBlur(local_diff, (0, 0), tex_sigma * 2.0)
-    texture_weight = np.clip(1.0 - texture_score / tex_thresh, 0, 1)
-    combined *= texture_weight
-
-    _log("03_tophat_response", np.clip(combined, 0, 255).astype(np.uint8))
-
-    # 4. Percentile thresholding with hard floor
-    pos = combined[combined > 0]
-    if pos.size > 0:
-        threshold = float(np.percentile(pos, params.tophat_percentile))
-    else:
-        threshold = params.tophat_threshold_floor
-    threshold = max(threshold, params.tophat_threshold_floor)
-
-    binary = (combined >= threshold).astype(np.uint8) * 255
-    _log("04_thresholded", binary)
-
-    # 5. Absolute intensity gate — only the darkest pixels can be nodules
-    if proxy_cfg.get("adaptive_abs_intensity", True):
-        pct = proxy_cfg.get("adaptive_abs_percentile", 8)
-        abs_max = float(np.percentile(gray_raw, pct))
-    else:
-        abs_max = proxy_cfg.get("absolute_intensity_max", 85)
-
-    abs_gate = (gray_raw <= abs_max).astype(np.uint8) * 255
-    binary = cv2.bitwise_and(binary, abs_gate)
-    _log("05_intensity_gated", binary)
-
-    # 6. Morphological cleanup
-    open_k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (params.morph_open_k, params.morph_open_k)
-    )
+    # ── 6. Morphological cleanup ─────────────────────────────────────────
+    # Close first: bridge small gaps to form solid dark blobs.
+    # Open second: remove isolated noise pixels / thin protrusions.
     close_k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (params.morph_close_k, params.morph_close_k)
+        cv2.MORPH_ELLIPSE, (params.morph_close_k, params.morph_close_k),
     )
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_k)
+    open_k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (params.morph_open_k, params.morph_open_k),
+    )
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, open_k)
     _log("06_morph_cleaned", cleaned)
 
-    # 7. Contour shape filtering
+    # ── 7. Watershed separation for touching nodules ─────────────────────
+    ws_min_dist = proxy_cfg.get("watershed_min_distance", 8)
+    separated = _watershed_split(cleaned, patch_bgr, ws_min_dist)
+    _log("07_watershed_split", separated)
+
+    # ── 8. Contour shape filtering ───────────────────────────────────────
     contours_raw, _ = cv2.findContours(
-        cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        separated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
     )
 
     reject_counts = {
         "area_too_small": 0, "area_too_large": 0,
         "low_solidity": 0, "eccentricity": 0, "low_circularity": 0,
+        "weak_local_contrast": 0,
     }
     filtered_contours = []
+
+    # Local background map for per-contour contrast verification
+    local_bg_map = local_bg
+
+    min_local_contrast = proxy_cfg.get("min_local_contrast", 0.02)
 
     for c in contours_raw:
         area = cv2.contourArea(c)
@@ -474,53 +747,73 @@ def generate_proxy_label(
             reject_counts["area_too_large"] += 1
             continue
 
-        # Solidity
-        hull_area = cv2.contourArea(cv2.convexHull(c))
-        solidity = area / hull_area if hull_area > 0 else 0
-        if solidity < params.min_solidity:
-            reject_counts["low_solidity"] += 1
-            continue
+        # Size-aware shape filtering: small contours (< 20px²) skip
+        # shape metrics which are unreliable at low pixel counts.
+        is_small = area < 20
 
-        # Eccentricity
-        if len(c) >= 5:
-            try:
-                _, (MA, ma), _ = cv2.fitEllipse(c)
-                long_ax, short_ax = max(MA, ma), min(MA, ma)
-                ecc = float(np.sqrt(1.0 - (short_ax / long_ax) ** 2)) if long_ax > 0 else 0
-            except Exception:
+        if not is_small:
+            # Solidity
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            solidity = area / hull_area if hull_area > 0 else 0
+            if solidity < params.min_solidity:
+                reject_counts["low_solidity"] += 1
+                continue
+
+            # Eccentricity
+            if len(c) >= 5:
+                try:
+                    _, (MA, ma), _ = cv2.fitEllipse(c)
+                    long_ax, short_ax = max(MA, ma), min(MA, ma)
+                    ecc = float(np.sqrt(1.0 - (short_ax / long_ax) ** 2)) if long_ax > 0 else 0
+                except Exception:
+                    ecc = 0.0
+            else:
                 ecc = 0.0
-        else:
-            ecc = 0.0
-        if ecc > params.max_eccentricity:
-            reject_counts["eccentricity"] += 1
-            continue
+            if ecc > params.max_eccentricity:
+                reject_counts["eccentricity"] += 1
+                continue
 
-        # Circularity
-        perimeter = cv2.arcLength(c, True)
-        circularity = (4.0 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-        if circularity < params.min_circularity:
-            reject_counts["low_circularity"] += 1
-            continue
+            # Circularity
+            perimeter = cv2.arcLength(c, True)
+            circularity = (4.0 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+            if circularity < params.min_circularity:
+                reject_counts["low_circularity"] += 1
+                continue
+
+        # ── Local contrast verification ──────────────────────────────
+        # Confirm the contour interior is actually darker than local bg.
+        contour_mask_tmp = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask_tmp, [c], 0, 255, cv2.FILLED)
+        interior = gray_f[contour_mask_tmp > 0]
+        bg_vals = local_bg_map[contour_mask_tmp > 0]
+        if interior.size > 0 and bg_vals.size > 0:
+            mean_interior = float(np.mean(interior))
+            mean_bg = float(np.mean(bg_vals))
+            if mean_bg > 1.0:
+                local_cr = (mean_bg - mean_interior) / mean_bg
+                if local_cr < min_local_contrast:
+                    reject_counts["weak_local_contrast"] += 1
+                    continue
 
         filtered_contours.append(c)
 
-    mask = np.zeros_like(cleaned)
+    mask = np.zeros_like(separated)
     if filtered_contours:
         cv2.drawContours(mask, filtered_contours, -1, 255, thickness=cv2.FILLED)
-    _log("07_proxy_mask", mask)
+    _log("08_proxy_mask", mask)
 
-    # Overlay for visual verification
+    # ── 9. Overlay for visual verification ───────────────────────────────
     overlay = patch_bgr.copy()
-    overlay[mask > 0] = [0, 255, 0]     # green for detected nodules
+    overlay[mask > 0] = [0, 255, 0]
     blended = cv2.addWeighted(patch_bgr, 0.6, overlay, 0.4, 0)
-    _log("08_overlay", blended)
+    _log("09_overlay", blended)
 
+    # ── Stats ────────────────────────────────────────────────────────────
     stats = {
         "candidates_before_filter": len(contours_raw),
         "nodules_after_filter": len(filtered_contours),
         "coverage_pct": 100.0 * np.sum(mask > 0) / mask.size,
-        "threshold_used": threshold,
-        "abs_intensity_gate": abs_max,
+        "threshold_used": float(threshold),
         "rejection_counts": reject_counts,
     }
 
