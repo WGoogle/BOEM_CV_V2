@@ -42,9 +42,9 @@ for _d in [
 
 PATCHING = {
     # Patch geometry  (pixels)
-    "patch_size":   1024,           # square patches — big enough to contain
-                                    # multiple nodules with local context
-    "overlap":      128,            # overlap in pixels between adjacent patches
+    "patch_size":   256,            # smaller patches for better local adaptation
+                                    # and higher nodule detection sensitivity
+    "overlap":      32,             # overlap in pixels between adjacent patches
                                     # to avoid cutting nodules at boundaries
 
     # Quality gate — reject featureless / black-border patches
@@ -182,7 +182,7 @@ PROXY_LABEL = {
 
 LOGGING = {
     "save_intermediate_steps":  True,       # master toggle
-    "log_every_n_patches":      1,          # log every Nth patch (1 = all)
+    "max_step_log_patches":     5,          # random subset of patches to log
     "composite_grid_cols":      4,          # columns in the summary grid
 }
 

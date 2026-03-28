@@ -112,7 +112,6 @@ def process_mosaic(
     manifest: dict,
     *,
     force: bool = False,
-    log_every_n: int = 1,
 ) -> dict:
     """Full Step-1 pipeline for a single mosaic.
 
@@ -190,6 +189,12 @@ def process_mosaic(
     total_nodules = 0
     valid_idx = 0          # tracks position in the `patches` list
 
+    # Pick a random subset of patches to log step-by-step images for
+    import random
+    max_step_logs = config.LOGGING.get("max_step_log_patches", 5)
+    valid_indices = [i for i, inf in enumerate(infos) if inf.is_valid]
+    logged_set = set(random.sample(valid_indices, min(max_step_logs, len(valid_indices))))
+
     for info in infos:
         if not info.is_valid:
             continue
@@ -211,10 +216,10 @@ def process_mosaic(
 
         total_nodules += label_stats["nodules_after_filter"]
 
-        # (d) Save intermediate step-by-step images (controlled by config)
+        # (d) Save intermediate step-by-step images (random subset)
         should_log = (
             config.LOGGING["save_intermediate_steps"]
-            and (info.patch_index % log_every_n == 0)
+            and info.patch_index in logged_set
         )
         if should_log:
             # Combine filter steps + label steps into one sequence
@@ -324,10 +329,6 @@ def main() -> None:
         "--mosaic", type=str, default=None,
         help="Process a single mosaic file (name or full path)",
     )
-    parser.add_argument(
-        "--log-patches", type=int, default=None,
-        help="Log step-by-step images for every Nth patch (default: from config)",
-    )
     args = parser.parse_args()
 
     _setup_logging()
@@ -353,8 +354,6 @@ def main() -> None:
 
     logger.info(f"  Mosaics found   : {len(mosaic_files)}")
 
-    log_every_n = args.log_patches or config.LOGGING.get("log_every_n_patches", 1)
-
     # ── Process each mosaic ──────────────────────────────────────────────
     manifest = _load_manifest()
     summaries = []
@@ -364,7 +363,6 @@ def main() -> None:
             summary = process_mosaic(
                 mosaic_path, manifest,
                 force=args.force,
-                log_every_n=log_every_n,
             )
             summaries.append(summary)
         except Exception as exc:
