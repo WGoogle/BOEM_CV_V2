@@ -9,7 +9,6 @@
 **Project**: Polymetallic Nodule Segmentation Pipeline  
 **Owner**: Brian Hwang (GitHub: WGoogle/BOEM_CV)  
 **Affiliation**: BOEM (Bureau of Ocean Energy Management) research project  
-**Date started with Claude**: March 24, 2026
 
 ### What it does
 Ingests massive `.tif` seafloor mosaic strips captured by AUVs (Autonomous

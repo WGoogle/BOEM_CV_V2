@@ -1,43 +1,28 @@
 """
-geo_resolution.py — Extract spatial resolution from GeoTIFF metadata
-=====================================================================
+Extract spatial resolution from GeoTIFF metadata
+
 Reads the ModelTransformationTag (tag 34264) or ModelPixelScaleTag
 (tag 33550) from a TIFF file and computes meters_per_pixel using the
 embedded coordinate reference system.
 
-Falls back gracefully to a user-supplied default when the file is not
-a GeoTIFF (e.g. plain PNG or TIFF without geo tags).
+Fail safe is a hardcoded value for meters_per_pixel. 
+
+Reason why this is an important addition is because on the researcher handoff i saw that it was 
+.05 meters/pixel which was warned that this varies, so I thought since we have all the geodata
+in the .tif files, might as well use them to improve our preprocessing. 
+
 """
-
-from __future__ import annotations
-
 import logging
 import math
 import struct
+
 from pathlib import Path
 from typing import Optional
+from __future__ import annotations
 
 logger = logging.getLogger(__name__)
 
-
-def extract_meters_per_pixel(
-    filepath: Path,
-    fallback: float | None = None,
-) -> Optional[float]:
-    """Return the ground-sample distance (m/px) embedded in a GeoTIFF.
-
-    Parameters
-    ----------
-    filepath : Path
-        Image file to inspect.  Non-TIFF files return *fallback* immediately.
-    fallback : float or None
-        Value returned when geo metadata is absent.
-
-    Returns
-    -------
-    float or None
-        Metres per pixel, or *fallback* if extraction fails.
-    """
+def extract_meters_per_pixel(filepath: Path, fallback: float | None = None) -> Optional[float]:
     filepath = Path(filepath)
     suffix = filepath.suffix.lower()
 
@@ -51,13 +36,13 @@ def extract_meters_per_pixel(
         logger.warning(f"{filepath.name}: failed to read TIFF tags — {exc}")
         return fallback
 
-    # --- Strategy 1: ModelTransformationTag (34264) — full 4×4 affine --------
+    #  ModelTransformationTag (34264)
     if 34264 in tags:
         mpp = _mpp_from_transformation_tag(tags, filepath.name)
         if mpp is not None:
             return mpp
 
-    # --- Strategy 2: ModelPixelScaleTag (33550) — simpler (ScaleX, ScaleY) ---
+    # ModelPixelScaleTag (33550)
     if 33550 in tags:
         mpp = _mpp_from_pixel_scale_tag(tags, filepath.name)
         if mpp is not None:
@@ -67,11 +52,6 @@ def extract_meters_per_pixel(
         f"{filepath.name}: no geo resolution tags found — using fallback ({fallback})"
     )
     return fallback
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 # TIFF type sizes (bytes per element)
 _TYPE_SIZE = {

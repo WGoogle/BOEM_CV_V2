@@ -1,50 +1,35 @@
 """
-auto_tuner.py — Per-Patch Adaptive Parameter Calculation
-==========================================================
-The core problem: a single set of preprocessing parameters cannot work
-across an entire seafloor mosaic because lighting, sediment type, depth,
-and camera altitude vary continuously along the AUV track.
+Per-Patch Adaptive Parameter Calculation
 
-This module analyzes each patch independently and computes "good"
-parameters for that specific region.  The analysis is fast (histograms
-and simple statistics) so it adds negligible overhead.
+This is where teammates can hopefully brainstorm some ideas to improve, but 
+essentially, a single set of preprocessing parameters cannot work across an entire seafloor mosaic.
 
-Signals used
-------------
-1. **Contrast ratio** (inter-quartile range of L-channel) → CLAHE clip limit.
-   Low contrast → high clip (aggressive enhancement).
-   High contrast → low clip (preserve existing dynamic range).
+This script should ideally analyze each patch independently and computes "good" parameters for that specific region.  
 
-2. **Noise estimate** (median absolute deviation of Laplacian) → bilateral
-   filter sigmas.  Noisy patches get stronger smoothing; clean patches
-   get lighter smoothing to preserve fine nodule edges.
+Signals used (More precise definitions left as comments under the functions, respectively).
+-------------
+1. Contrast ratio: (inter-quartile range of L-channel) alters CLAHE clip limit.
 
-3. **Brightness / darkness balance** (histogram skewness) → adaptive
-   threshold C-offset and morphological kernel sizes.  A dark patch
-   (left-skewed histogram) needs a smaller C-offset; a bright patch
-   needs a larger one to avoid false positives from bright sediment.
+2. Noise estimate: (median absolute deviation of Laplacian) alters bilateral filter sigmas.
 
-4. **Illumination uniformity** (std of large-scale blur) → whether to
-   apply local normalisation before thresholding.
+3. Brightness / darkness balance: (histogram skewness) alters adaptive threshold C-offset and morphological kernel sizes.
+
+4. Illumination uniformity (std of large-scale blur) alters whether to apply local normalisation before thresholding.
 """
-
-from __future__ import annotations
-
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, Tuple
-
 import cv2
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, Tuple
 
-# ----------- Output container -----------
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TunedParams:
     """Parameters computed for a single patch."""
-
+     
     # CLAHE
     clahe_clip_limit: float = 2.0
     clahe_tile_grid: Tuple[int, int] = (8, 8)
@@ -91,31 +76,19 @@ class TunedParams:
         """Serialisable snapshot for the pipeline manifest."""
         return {k: v for k, v in self.__dict__.items()}
 
-
-# ----------- Tuner -----------
-
 class PatchAutoTuner:
-    """Compute per-patch preprocessing parameters from image statistics.
-
-    Parameters
-    ----------
-    config : dict
-        The ``AUTO_TUNER`` section from ``config.py``.
+    """
+    Compute per-patch preprocessing parameters from image statistics.
     """
 
     def __init__(self, config: dict):
         self.cfg = config
 
-    # ── public API ───────────────────────────────────────────────────────────
-
-    # Pixels below this threshold are treated as black border / no-data
-    # and excluded from all diagnostic calculations.
+    # Pixels below this threshold are treated as black border / no-data and excluded from all diagnostic calculations.
     _BORDER_THRESHOLD = 10
 
     def analyse(self, patch_bgr: np.ndarray) -> TunedParams:
-        """Analyse *patch_bgr* and return tuned parameters.
-
-        This is the single entry point.  Internally it:
+        """
         1. Extracts the L channel (perceptual lightness).
         2. Builds a valid-pixel mask (excluding black mosaic borders).
         3. Computes four diagnostic signals on valid pixels only.
@@ -129,13 +102,13 @@ class PatchAutoTuner:
         # Build valid-pixel mask — exclude black borders from AUV mosaic
         valid_mask = gray > self._BORDER_THRESHOLD
 
-        # ── Diagnostic signals (computed on valid pixels only) ────────
+        # Diagnostic signals (computed on valid pixels only)
         contrast   = self._contrast_ratio(L, valid_mask)
         noise      = self._noise_estimate(gray, valid_mask)
         skew       = self._brightness_skew(L, valid_mask)
         uniformity = self._illumination_uniformity(L, valid_mask)
 
-        # ── Map signals → parameters ─────────────────────────────────────
+        # Map the signals to the parameters in config
         params = TunedParams()
 
         # 1. CLAHE clip limit  (inverse of contrast)
@@ -203,12 +176,12 @@ class PatchAutoTuner:
         )
         return params
 
-    # ── diagnostic signal extractors ─────────────────────────────────────────
     # All methods accept a valid_mask to exclude black mosaic borders.
 
     @staticmethod
     def _contrast_ratio(L: np.ndarray, valid_mask: np.ndarray) -> float:
-        """Inter-quartile range of L-channel valid pixels.
+        """
+        Inter-quartile range of L-channel valid pixels.
 
         A high IQR means the patch already has good contrast between
         nodules and sediment; a low IQR means everything looks flat.
@@ -221,10 +194,10 @@ class PatchAutoTuner:
 
     @staticmethod
     def _noise_estimate(gray: np.ndarray, valid_mask: np.ndarray) -> float:
-        """Estimate sensor noise using the Median Absolute Deviation of
-        the Laplacian on valid pixels only.
+        """
+        Estimate sensor noise using the Median Absolute Deviation of the Laplacian on valid pixels only.
 
-        Ref: Immerkaer, "Fast noise variance estimation", CVIU 1996.
+        Inspired from Immerkaer, "Fast noise variance estimation", CVIU 1996.
         """
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         valid_lap = np.abs(laplacian[valid_mask])
@@ -235,11 +208,12 @@ class PatchAutoTuner:
 
     @staticmethod
     def _brightness_skew(L: np.ndarray, valid_mask: np.ndarray) -> float:
-        """Skewness of the L-channel histogram (valid pixels only).
+        """
+        Skewness of the L-channel histogram (valid pixels only).
 
-        Negative skew → dark patch (many dark pixels, few bright).
-        Positive skew → bright patch.
-        Near zero → balanced.
+        Negative skew means dark patch (many dark pixels, few bright).
+        Positive skew means bright patch.
+        Near zero means balanced.
         """
         valid_px = L[valid_mask]
         if valid_px.size < 100:
@@ -252,13 +226,13 @@ class PatchAutoTuner:
 
     @staticmethod
     def _illumination_uniformity(L: np.ndarray, valid_mask: np.ndarray) -> float:
-        """Std-dev of a heavily blurred version of L (valid pixels only).
-
-        High value → strong illumination gradient across the patch
-        (e.g. AUV light cone falloff).  Low value → uniform lighting.
         """
-        # Fill black border regions with the valid-pixel mean so they
-        # don't create artificial gradients in the blur.
+        Std-dev of a heavily blurred version of L (valid pixels only).
+
+        High value means strong illumination gradient across the patch.
+        Low value means uniform lighting.
+        """
+        # Fill black border regions with the valid-pixel mean so they don't create artificial gradients in the blur.
         L_filled = L.copy()
         valid_px = L[valid_mask]
         if valid_px.size < 100:

@@ -1,45 +1,34 @@
-#!/usr/bin/env python3
 """
-Step 1 — Preprocess and Label
-==============================
-Entry-point / runner script.  All feature logic lives in the
-``preprocessing/`` module; this file only handles:
-
+Step 1 — Preprocess and Label:
   - CLI argument parsing
   - Raw mosaic discovery
   - Pipeline manifest (CoralNet-inspired idempotent state tracking)
   - Progress bars and summary reporting
 
-Usage
------
-    python 1_preprocess_and_label.py                 # full run
-    python 1_preprocess_and_label.py --force          # re-process everything
-    python 1_preprocess_and_label.py --mosaic FILE    # process a single file
-    python 1_preprocess_and_label.py --log-patches 5  # log first 5 patches only
+Helpful Shortcuts I use: 
+    python 1_preprocess_and_label.py                  # full run, for new data
+    python 1_preprocess_and_label.py --force          # re-process everything, when debugging 
+    python 1_preprocess_and_label.py --mosaic FILE    # process a single file, when debugging
+    python 1_preprocess_and_label.py --log-patches 5  # log first 5 patches only, to save space
 """
-
-from __future__ import annotations
-
 import argparse
 import json
 import logging
 import sys
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-
 import cv2
 import numpy as np
 
-# ── project imports ──────────────────────────────────────────────────────────
+from __future__ import annotations
+from datetime import datetime, timezone
+from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent))
 import config
 from preprocessing.patcher import MosaicPatcher, PatchInfo
 from preprocessing.auto_tuner import PatchAutoTuner
 from preprocessing.filters import FilterPipeline, generate_proxy_label
 from preprocessing.geo_resolution import extract_meters_per_pixel
-
-# ── logging ──────────────────────────────────────────────────────────────────
 
 def _setup_logging() -> None:
     """Configure root logger to write to console + rotating log file."""
@@ -64,13 +53,10 @@ def _setup_logging() -> None:
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
-
 logger = logging.getLogger(__name__)
 
-# ── manifest helpers (CoralNet pattern: audit trail per file) ────────────────
-
+# Inspired by CoralNet pattern: audit trail per file
 MANIFEST_PATH = config.OUTPUT_DIR / "pipeline_manifest.json"
-
 
 def _load_manifest() -> dict:
     if MANIFEST_PATH.exists():
@@ -78,14 +64,10 @@ def _load_manifest() -> dict:
             return json.load(f)
     return {"version": "2.0", "mosaics": {}}
 
-
 def _save_manifest(manifest: dict) -> None:
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
-
-
-# ── file discovery ───────────────────────────────────────────────────────────
 
 def _find_mosaics(single: str | None = None) -> list[Path]:
     """Return sorted list of raw mosaic files."""
@@ -104,16 +86,10 @@ def _find_mosaics(single: str | None = None) -> list[Path]:
         files.extend(config.RAW_MOSAICS_DIR.glob(ext))
     return sorted(set(files))
 
-
-# ----------- CORE PIPELINE -----------
-
-def process_mosaic(
-    mosaic_path: Path,
-    manifest: dict,
-    *,
-    force: bool = False,
-) -> dict:
-    """Full Step-1 pipeline for a single mosaic.
+# CORE PIPELINE
+def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) -> dict:
+    """
+    Full Step-1 pipeline for a single mosaic.
 
     1. Load the mosaic
     2. Split into overlapping patches  (patcher.py)
@@ -140,16 +116,15 @@ def process_mosaic(
     logger.info(f"Processing mosaic: {mosaic_path.name}")
     logger.info("─" * 70)
 
-    # ── Instantiate pipeline components ──────────────────────────────────
     patcher  = MosaicPatcher(**config.PATCHING)
     tuner    = PatchAutoTuner(config.AUTO_TUNER)
     pipeline = FilterPipeline(config.PREPROCESSING)
 
-    # ── 1. Load ──────────────────────────────────────────────────────────
+    # Load
     mosaic = patcher.load_mosaic(mosaic_path)
     mosaic_h, mosaic_w = mosaic.shape[:2]
 
-    # ── 1b. Extract spatial resolution from GeoTIFF metadata ─────────
+    # Extract spatial resolution from GeoTIFF metadata
     mpp = extract_meters_per_pixel(
         mosaic_path, fallback=config.METRICS["meters_per_pixel"],
     )
@@ -159,7 +134,7 @@ def process_mosaic(
             f"— image covers {mosaic_w * mpp:.1f} m × {mosaic_h * mpp:.1f} m"
         )
 
-    # ── 2. Patch ─────────────────────────────────────────────────────────
+    # Patch
     patches, infos = patcher.extract_patches(mosaic)
     n_valid = len(patches)
 
@@ -169,7 +144,7 @@ def process_mosaic(
         _save_manifest(manifest)
         return entry
 
-    # ── Prepare output dirs ──────────────────────────────────────────────
+    # Prepare output dirs
     mosaic_preproc_dir = config.PREPROCESSED_DIR / key
     mosaic_preproc_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,10 +159,10 @@ def process_mosaic(
     mosaic_log_dir = config.STEP_BY_STEP_DIR / key
     mosaic_log_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 3. Per-patch processing ──────────────────────────────────────────
+    # Per-patch processing
     patch_records = []
     total_nodules = 0
-    valid_idx = 0          # tracks position in the `patches` list
+    valid_idx = 0  # tracks position in the patches list
 
     # Pick a random subset of patches to log step-by-step images for
     import random
@@ -255,7 +230,7 @@ def process_mosaic(
                 f"({total_nodules} nodules detected so far)"
             )
 
-    # ── 4. Reassemble full-mosaic proxy mask for visualisation ───────────
+    # Reassemble full-mosaic proxy mask for visualisation
     patch_masks = []
     vi = 0
     for info in infos:
@@ -284,12 +259,12 @@ def process_mosaic(
     overlay_path = mosaic_proxy_dir / f"{key}_overlay.png"
     cv2.imwrite(str(overlay_path), blended)
 
-    # ── 5. Save patch manifest ───────────────────────────────────────────
+    # Save patch manifest
     patch_manifest_path = config.PATCHES_DIR / key / "patch_manifest.json"
     with open(patch_manifest_path, "w") as f:
         json.dump(patch_records, f, indent=2, default=str)
 
-    # ── 6. Update pipeline manifest ──────────────────────────────────────
+    # Update pipeline manifest
     elapsed = time.time() - t0
     entry.update({
         "source":           str(mosaic_path),
@@ -315,8 +290,7 @@ def process_mosaic(
     return entry
 
 
-# ----------- CLI ENTRY POINT -----------
-
+# CLI ENTRY POINT
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Step 1: Preprocess seafloor mosaics + generate proxy labels",
@@ -343,7 +317,6 @@ def main() -> None:
     logger.info(f"  Filter chain    : {config.PREPROCESSING['filter_chain']}")
     logger.info(f"  Force re-run    : {args.force}")
 
-    # ── Discover mosaics ─────────────────────────────────────────────────
     mosaic_files = _find_mosaics(args.mosaic)
     if not mosaic_files:
         logger.error(
@@ -354,7 +327,6 @@ def main() -> None:
 
     logger.info(f"  Mosaics found   : {len(mosaic_files)}")
 
-    # ── Process each mosaic ──────────────────────────────────────────────
     manifest = _load_manifest()
     summaries = []
 
@@ -370,7 +342,7 @@ def main() -> None:
             manifest["mosaics"].setdefault(mosaic_path.stem, {})["error"] = str(exc)
             _save_manifest(manifest)
 
-    # ── Final summary ────────────────────────────────────────────────────
+    # Final Summary
     logger.info("=" * 70)
     logger.info("PIPELINE COMPLETE")
     logger.info("=" * 70)
@@ -387,7 +359,6 @@ def main() -> None:
     logger.info(f"  Step-by-step logs : {config.STEP_BY_STEP_DIR}")
     logger.info("")
     logger.info("Next step: python 2_train.py")
-
 
 if __name__ == "__main__":
     main()

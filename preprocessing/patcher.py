@@ -1,31 +1,19 @@
 """
-patcher.py — Intelligent Mosaic Patching
-==========================================
-Splits massive seafloor .TIF strips into smaller, manageable patches and
-can recombine them later (for inference).  Key design decisions:
+patcher.py description:
 
-* **Tiled reading** via ``cv2.imread`` (with fallback to ``tifffile`` for
-  multi-GB TIFs that OpenCV cannot memory-map).
-* **Overlap** between patches so nodules on tile edges are never cut.
-* **Quality gate** rejects featureless (black border / uniform sediment)
-  patches before they enter the preprocessing pipeline.
-* Patch metadata is returned as a list of dicts for downstream tracking.
+Splits seafloor .TIF strips into smaller patches and can recombine them later (for inference). 
 """
+import cv2
+import numpy as np
+import logging
 
 from __future__ import annotations
-
-import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Optional
 
-import cv2
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
-
-# ----------- Data classes -----------
 
 @dataclass
 class PatchInfo:
@@ -41,28 +29,23 @@ class PatchInfo:
     rejection_reason: str = ""
 
 
-# ----------- MosaicPatcher -----------
-
 class MosaicPatcher:
-    """Split / recombine large seafloor mosaics.
+    """
+    Split then recombine large seafloor mosaics.
 
-    Parameters
-    ----------
-    patch_size : int
-        Side length of each square patch (pixels).
-    overlap : int
-        Overlap between adjacent patches (pixels).
+    Non Self-Explanatory Parameters:
     min_std, min_mean, max_black_fraction :
         Quality-gate thresholds.  Patches that fail are still tracked
-        (``is_valid=False``) so the grid can be reconstructed, but they
-        are excluded from preprocessing.
+        w/ (is_valid=False) so the grid can be reconstructed, but they
+        are excluded from preprocessing as these patches are deemed to have no seafloor image.
+
     """
 
     def __init__(
         self,
-        patch_size: int = 1024,
-        overlap: int = 128,
-        min_std: float = 5.0,
+        patch_size: int = 256,
+        overlap: int = 32,
+        min_std: float = 3.0,
         min_mean: float = 10.0,
         max_black_fraction: float = 0.25,
     ):
@@ -73,13 +56,11 @@ class MosaicPatcher:
         self.min_mean = min_mean
         self.max_black_fraction = max_black_fraction
 
-    # ── public ───────────────────────────────────────────────────────────────
 
     def load_mosaic(self, filepath: Path) -> np.ndarray:
-        """Load a mosaic from disk.  Handles TIF, PNG, JPG.
+        """Load a mosaic from disk.  Can use TIF, PNG, JPG.
 
-        For very large TIFs (>2 GB) that OpenCV cannot load, falls back
-        to ``tifffile`` if installed.
+        For TIF files greather than 2 GB, I got a failsafe to "tifffile."
         """
         filepath = Path(filepath)
         image = cv2.imread(str(filepath), cv2.IMREAD_UNCHANGED)
@@ -119,19 +100,11 @@ class MosaicPatcher:
         )
         return image
 
-    def extract_patches(
-        self,
-        mosaic: np.ndarray,
-    ) -> Tuple[List[np.ndarray], List[PatchInfo]]:
-        """Divide *mosaic* into overlapping patches.
+    def extract_patches(self, mosaic: np.ndarray) -> Tuple[List[np.ndarray], List[PatchInfo]]:
+        """
+        Divide mosaic into overlapping patches.
 
-        Returns
-        -------
-        patches : list[np.ndarray]
-            Only the patches that pass the quality gate.
-        infos : list[PatchInfo]
-            Metadata for **all** patches (including invalid ones so the
-            grid geometry is preserved for reassembly).
+        Returns patches (that pass quality gate) in list array and metadata for all patches for restructuring grid in future.
         """
         H, W = mosaic.shape[:2]
         ps, stride = self.patch_size, self.stride
@@ -181,24 +154,11 @@ class MosaicPatcher:
         )
         return patches, infos
 
-    def reassemble(
-        self,
-        patch_outputs: List[np.ndarray],
-        infos: List[PatchInfo],
-        mosaic_shape: Tuple[int, int],
-        dtype=np.float32,
-    ) -> np.ndarray:
-        """Recombine patch-level predictions into a full-mosaic map.
-
-        Uses simple averaging in overlapping regions.
-
-        Parameters
-        ----------
-        patch_outputs : list of 2-D arrays (H_patch, W_patch)
-            One per **valid** patch, same order as ``extract_patches`` output.
-        infos : list[PatchInfo]
-            Full info list (including invalid patches).
-        mosaic_shape : (H, W) of the original mosaic.
+    def reassemble(self, patch_outputs: List[np.ndarray], infos: List[PatchInfo], mosaic_shape: Tuple[int, int], dtype=np.float32) -> np.ndarray:
+        """
+        Recombine patches into a full-mosaic map.
+       
+        mosaic_shape is just the dimensions of original mosaic loaded before patching.
         """
         H, W = mosaic_shape
         accum = np.zeros((H, W), dtype=np.float64)
@@ -219,8 +179,7 @@ class MosaicPatcher:
 
         count[count == 0] = 1.0
         return (accum / count).astype(dtype)
-
-    # ── private ──────────────────────────────────────────────────────────────
+    
 
     @staticmethod
     def _grid_positions(length: int, patch_size: int, stride: int) -> List[int]:
