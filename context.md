@@ -96,9 +96,10 @@ The original repo at `github.com/WGoogle/BOEM_CV` had:
   distinguish reflectance darkness (real nodules) from shading darkness
   (divot shadows).  MSR handles the illumination separation that nodule_boost
   was attempting.  The function remains in code for optional re-enablement.
-- **CLAHE clip range reduced from (1.0, 4.0) to (1.0, 1.5)** — MSR handles
+- **CLAHE clip range reduced from (1.0, 4.0) to (1.0, 2.0)** — MSR handles
   illumination normalization; CLAHE now only needs to provide gentle local
-  contrast enhancement, not compensate for lighting gradients.
+  contrast enhancement, not compensate for lighting gradients.  Ceiling
+  raised from 1.5→2.0 so the lowest-contrast patches get a meaningful lift.
 - **Fixed sediment fade** — old static L-threshold (80) brightened nodules
   by +12-14 levels.  New adaptive threshold (patch median L) with wider
   ramp (40 levels) and minimal blur ensures dark pixels are untouched (+2)
@@ -106,29 +107,34 @@ The original repo at `github.com/WGoogle/BOEM_CV` had:
   real boundaries (nodule edges), not sediment grain texture
 - **Added step-by-step intermediate logging** — every filter step saves a
   numbered image + composite grid for visual debugging
-- **Multi-feature composite proxy labelling** (V2.1) — replaced single-channel
-  top-hat proxy labelling with multi-feature composite scoring:
+- **Multi-feature proxy labelling** (V2.1→V2.2) — replaced the four-feature
+  composite scoring (top-hat × LCR × smoothness + DoG) with a simpler,
+  more robust two-feature approach:
   1. Top-hat (primary signal): multi-scale black top-hat with texture gate
-  2. Local Contrast Ratio (LCR gate): darkness relative to local background,
-     adapts to illumination variations preprocessing didn't fully remove
-  3. Difference of Gaussians (DoG, supplementary): scale-normalized blob
-     detection that catches nodules at scales the top-hat misses
-  4. Smoothness (soft gate): fine vs. coarse local variance ratio;
-     suppresses sediment grain texture responses
-  Combined via multiplicative gating: tophat * (1 + lcr_gain*LCR) *
-  smoothness^power + dog_blend * DoG (same gates).  This ensures a pixel
-  must be BOTH morphologically blob-like AND locally dark AND smooth.
-- **Grain-size nodule support** — top-hat radii extended to [1,2,4,8,12]
-  (from [12,20,30]) to detect 5-15mm grain nodules that are only 1-3px
-  at 5mm/px resolution.  Pre-blur reduced to σ=1.5 (from σ=5), contour
-  min_area lowered to 3px² (from 50), morph kernels shrunk to 1-3px opening.
+  2. Local Contrast Ratio (LCR gate): darkness relative to local background
+  Combined via **raw multiplication** (`tophat × LCR`) on absolute magnitudes
+  (no per-patch normalization).  Real nodules score 9–42; noise scores <3.
+  Thresholded by an **absolute score floor** (default 5.0) — patches with no
+  real nodules never exceed it — plus a secondary percentile gate (85th) for
+  dense-nodule patches.  Removed DoG and smoothness features (unnecessary
+  complexity once the absolute-magnitude scoring was adopted).
+  Removed watershed separation step (touching nodules handled adequately by
+  contour filtering alone).
+- **Top-hat radii extended** to [1, 2, 4, 8, 12, 16, 20] (from [1,2,4,8,12])
+  to detect very large nodules/clusters (90–200mm = 18–40px at 5mm/px).
+  Grain-size support retained at r=1-2.
 - **Size-aware contour filtering** — grain-size contours (<20px²) skip
   unreliable shape checks (eccentricity, circularity, solidity) since
   pixelated blobs can't produce meaningful shape metrics.  Only area +
   local contrast are checked.  Larger contours get full shape filtering.
-- **Watershed separation** for touching nodules — distance transform →
-  local maxima (nodule centers) → marker-controlled watershed to split
-  clusters into individual detections.
+- **Noise-adaptive contour shape filters** — all four shape parameters
+  (min_area, max_eccentricity, min_solidity, min_circularity) now scale
+  with the auto-tuner's noise estimate.  Noisy patches get relaxed criteria
+  (pixelated contours look irregular); clean patches get tighter filters.
+  Configured via range tuples in config.py (e.g. `eccentricity_range`,
+  `solidity_range`).
+- **Bilateral filter sigma capped at 60** (from 75) to avoid blending
+  across nodule–sediment boundaries.
 - **Enhanced contour filtering** — two new checks beyond shape:
   1. Local contrast: contour interior must be darker than local background
   2. Boundary gradient: mean Sobel magnitude along contour boundary must
@@ -191,17 +197,14 @@ For each mosaic in data/raw_mosaics/:
         00_original → 01_gray_world_white_balance →
         02_multi_scale_retinex → 03_clahe_lab → 04_bilateral_denoise →
         05_sediment_fade → 06_unsharp_mask
-     c. PROXY LABEL generation (multi-feature composite scoring):
-        01_grayscale → 02_gaussian_blur →
-        03_tophat (multi-scale black top-hat + texture gate) →
-        04_local_contrast (LCR: darkness vs. local background) →
-        05_dog_blobs (Difference of Gaussians blob detection) →
-        06_smoothness (fine vs. coarse local variance) →
-        07_composite_score (multiplicative gating: tophat * LCR_boost * smooth_gate + DoG) →
-        08_thresholded (percentile-based) →
-        09_intensity_gated (adaptive dark-pixel gate) →
-        10_morph_cleaned → 11_watershed_split (separate touching nodules) →
-        12_proxy_mask (size-aware contour filtering) → 13_overlay
+     c. PROXY LABEL generation (top-hat × LCR scoring):
+        01_grayscale →
+        02_tophat_response (multi-scale black top-hat + texture gate) →
+        03_local_contrast (LCR: darkness vs. local background) →
+        04_combined_score (tophat × LCR, absolute magnitude) →
+        05_thresholded (absolute floor + percentile gate) →
+        06_morph_cleaned →
+        07_proxy_mask (noise-adaptive contour filtering) → 08_overlay
      d. SAVE: preprocessed patch, proxy mask, step-by-step images
   4. REASSEMBLE full-mosaic proxy mask (average overlapping regions)
   5. SAVE overlay visualization + patch manifest JSON
@@ -281,12 +284,13 @@ This made CLAHE clip max out at 4.0 on nearly every patch regardless of
 actual content.  Masking pixels below gray=10 gives accurate per-patch
 diagnostics.
 
-### Why conservative CLAHE (clip max 1.5) after MSR?
+### Why conservative CLAHE (clip max 2.0) after MSR?
 MSR removes illumination/shading but its stats-matching step compresses
 the output to the original brightness distribution, which is inherently
-low-contrast.  Gentle CLAHE (clip 1.0–1.5) recovers local contrast for
+low-contrast.  Gentle CLAHE (clip 1.0–2.0) recovers local contrast for
 nodule detection without re-introducing the shading amplification that
-aggressive CLAHE (clip up to 4.0) caused in the old pipeline.
+aggressive CLAHE (clip up to 4.0) caused in the old pipeline.  The ceiling
+was raised from 1.5→2.0 so the lowest-contrast patches get a meaningful lift.
 
 ### Why adaptive sediment fade threshold?
 The old hardcoded L-threshold (80) was below the median brightness of most
@@ -320,21 +324,24 @@ CLAHE creates bright halos around dark nodule edges.  The bottom-hat
 transform reads these halos as part of the "bright background", reducing
 the response.  Using the L channel captured before CLAHE avoids this.
 
-### Why multi-feature composite scoring instead of single top-hat?
-The original single-channel top-hat approach has blind spots:
-1. **Fixed scale** — top-hat at radii [12,20,30] misses grain nodules
-   (1-3px at 5mm/px resolution) and can't adapt to multi-scale input.
-2. **No local context** — the absolute intensity gate uses a global
-   percentile, missing nodules in locally bright regions.
-3. **No touching-nodule separation** — clusters merge into one contour
-   that gets rejected by shape filters.
-4. **Additive scoring doesn't work** — features like smoothness score
-   high everywhere (P50=0.70), drowning out selective features when
-   combined additively.
+### Why top-hat × LCR instead of four-feature composite scoring?
+The earlier V2.1 composite (tophat × LCR × smoothness + DoG) was
+unnecessarily complex.  Two features are sufficient:
+1. **Top-hat** detects compact dark blobs (the morphological signal)
+2. **LCR** verifies they are actually darker than surroundings (the
+   contrast signal)
 
-Multiplicative gating solves this: tophat * LCR_boost * smooth_gate
-ensures a detection must score high on ALL features simultaneously.
-The DoG supplementary channel catches blobs at unexpected scales.
+Raw multiplication (`tophat × LCR`) on absolute magnitudes (no per-patch
+normalization) produces a score with natural separation: real nodules
+score 9–42, noise/artifacts score <3.  An **absolute score floor**
+(default 5.0) replaces per-patch percentile as the primary gate — patches
+with no real nodules never exceed it — eliminating the problem of
+percentile thresholds finding "detections" in empty patches.  The
+secondary percentile gate (85th) only activates in dense-nodule patches.
+
+DoG and smoothness features were removed: DoG added marginal recall at
+the cost of false positives; smoothness was redundant once the absolute
+threshold gate was in place.
 
 ### Why size-aware contour filtering?
 At 5mm/px, polymetallic nodules span a huge pixel-size range:
@@ -349,18 +356,24 @@ threshold: below it, only area + local contrast are checked;
 above it, full shape filtering (eccentricity, circularity, solidity,
 boundary gradient) is applied.
 
-### Why multiplicative gating over additive weighting?
-Early testing showed that additive weighted combination
-(score = w1*f1 + w2*f2 + ...) fails because non-selective features
-(smoothness P50=0.70, normalized top-hat P50=0.25) elevate the
-composite baseline everywhere.  The 94th percentile of positive scores
-then cuts at ~0.53, fragmenting detections into tiny disconnected pixels.
+### Why absolute score threshold instead of percentile-only?
+Per-patch percentile thresholds (e.g. 96th percentile of positive values)
+always find "detections" — even in empty patches — because the percentile
+adapts to whatever signal is present.  Using absolute-magnitude scoring
+(raw tophat × raw LCR, no normalization) means patches with no real
+nodules produce scores well below the absolute floor (5.0), yielding
+zero detections correctly.  The percentile gate (85th) acts as a
+secondary filter only in patches that have many pixels above the floor.
 
-Multiplicative gating (tophat * LCR_boost * smooth_gate) naturally
-produces near-zero scores where ANY feature is low, concentrating
-high scores at true nodule locations.  The proven percentile threshold
-from V1 (96th percentile of positive values with hard floor) then
-works correctly.
+### Why noise-adaptive contour shape filters?
+Contour shape metrics (eccentricity, circularity, solidity) are noisy
+for pixelated contours in high-noise patches.  Fixed thresholds either
+reject valid detections in noisy regions or accept false positives in
+clean regions.  Scaling all four shape parameters with the auto-tuner's
+noise estimate (0–1 normalized) resolves this: noisy patches get relaxed
+criteria while clean patches get tighter filters.  The area floor also
+scales up with noise to reject the extra tiny noise blobs that noisy
+patches produce.
 
 ---
 
@@ -405,8 +418,8 @@ FilterPipeline.save_step_images(steps, output_dir, prefix="patch_0001")
 ```python
 mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LABEL)
 # mask: (H,W) uint8 binary [0, 255]
-# steps: 13 intermediate images (grayscale → blur → 4 features → composite →
-#         threshold → intensity gate → morph → watershed → mask → overlay)
+# steps: 8 intermediate images (grayscale → tophat → LCR → combined_score →
+#         threshold → morph → mask → overlay)
 # stats: dict with candidates, nodules, coverage, rejections, feature params
 ```
 
@@ -417,9 +430,9 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 | Section | Used by | Key parameters |
 |---------|---------|----------------|
 | `PATCHING` | `patcher.py` | `patch_size`, `overlap`, `min_std`, `max_black_fraction` |
-| `AUTO_TUNER` | `auto_tuner.py` | `clahe_clip_range`, `bilateral_sigma_*_range`, `block_size_range`, `tophat_radii`, contour filters |
+| `AUTO_TUNER` | `auto_tuner.py` | `clahe_clip_range`, `bilateral_sigma_*_range`, `block_size_range`, noise-adaptive contour filter ranges (`contour_area_min_range`, `eccentricity_range`, `solidity_range`, `circularity_range`) |
 | `PREPROCESSING` | `filters.py` | `filter_chain` (ordered list), `msr_sigmas`, `msr_gain`, `sediment_fade_*`, `unsharp_*` |
-| `PROXY_LABEL` | `filters.py` | `gaussian_*`, `adaptive_abs_*` |
+| `PROXY_LABEL` | `filters.py` | `tophat_radii`, `texture_*`, `lcr_bg_sigma`, `score_threshold`, `score_percentile`, `min_local_contrast` |
 | `LOGGING` | `1_preprocess_and_label.py` | `save_intermediate_steps`, `log_every_n_patches` |
 | `MODEL` | `2_train.py` (future) | U-Net architecture params |
 | `TRAINING` | `2_train.py` (future) | batch_size, lr, epochs, splits |
@@ -493,17 +506,17 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
    this is controlled by the stats-matching step and gentle CLAHE.
 
 9. **Tuning the proxy label sensitivity** — to catch more/fewer nodules:
-   - `tophat_percentile`: lower = more detections (try 92-96)
-   - `tophat_threshold_floor`: lower = catch weaker responses (try 5-15)
-   - `min_contour_area`: lower = catch smaller grain nodules (min 1)
-   - `adaptive_abs_percentile`: higher = allow lighter pixels (try 15-30)
-   - `lcr_gain`: higher = more LCR boost for locally dark pixels (try 2-5)
-   - `composite_smooth_sigma`: lower = sharper detections, higher = merge nearby
+   - `score_threshold`: lower = more detections, higher = fewer (try 3-8)
+   - `score_percentile`: lower = keep more above-threshold detections (try 80-90)
+   - `contour_area_min_range`: lower lo = catch smaller grain nodules
+   - `tophat_radii`: add larger radii for bigger nodules/clusters
+   - `lcr_bg_sigma`: smaller = more local adaptation, larger = smoother background
+   - `eccentricity_range` / `solidity_range` / `circularity_range`: widen
+     ranges to relax shape filters in noisy patches
 
-10. **Additive scoring pitfall** — early composite scoring used weighted
-    addition (w1*f1 + w2*f2 + ...) which failed because smoothness (P50=0.70)
-    and normalized top-hat (P50=0.25) elevate the baseline everywhere.  The
-    fix was multiplicative gating: tophat * LCR_boost * smooth_gate.
+10. **Bilateral sigma capped at 60** (from 75) — higher sigma was blending
+    across nodule–sediment boundaries, softening the edges that proxy labelling
+    relies on for contour detection.
 
 ---
 
@@ -519,7 +532,7 @@ mask, steps, stats = generate_proxy_label(preprocessed, params, config.PROXY_LAB
 
 ---
 
-*Last updated: March 27, 2026 — multi-feature composite proxy labelling with
-grain-size nodule support; multiplicative gating (top-hat * LCR * smoothness + DoG);
-watershed separation; size-aware contour filtering; top-hat radii [1,2,4,8,12];
-min_contour_area=3; 205 detections on D1 Node3 L8 (up from 64 with old pipeline)*
+*Last updated: March 30, 2026 — simplified proxy labelling to top-hat × LCR with
+absolute score threshold (no per-patch normalization); removed DoG, smoothness, and
+watershed steps; extended top-hat radii to [1,2,4,8,12,16,20]; noise-adaptive contour
+shape filters; CLAHE ceiling raised to 2.0; bilateral sigma capped at 60*
