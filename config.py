@@ -64,13 +64,14 @@ AUTO_TUNER = {
     # ── CLAHE ────────────────────────────────────────────────────────────────
     # Clip limit is scaled by local contrast: low-contrast patches get a
     # stronger boost, high-contrast patches are left mostly alone.
-    "clahe_clip_range":     (1.0, 1.5),     # conservative — MSR handles illumination, CLAHE just adds gentle local contrast
+    "clahe_clip_range":     (1.0, 2.0),     # MSR handles illumination; CLAHE adds gentle local contrast — ceiling raised
+                                            # slightly from 1.5 so the lowest-contrast patches get a meaningful lift
     "clahe_tile_grid":      (8, 8),         # tile grid for CLAHE
 
     # ── Bilateral filter ─────────────────────────────────────────────────────
     "bilateral_d":          7,
-    "bilateral_sigma_color_range": (30, 75),  # scaled by noise estimate
-    "bilateral_sigma_space_range": (30, 75),
+    "bilateral_sigma_color_range": (30, 60),  # scaled by noise estimate — capped at 60 to avoid
+    "bilateral_sigma_space_range": (30, 60),  # blending across nodule–sediment boundaries
 
     # ── Adaptive thresholding (for proxy-label generation) ───────────────────
     "block_size_range":     (11, 51),        # adaptive threshold block size
@@ -88,25 +89,24 @@ AUTO_TUNER = {
     "texture_threshold":    18.0,
     "max_darkening":        70,
 
-    # ── Top-hat proxy labelling ──────────────────────────────────────────────
-    # Radii must cover the full nodule size range at survey resolution:
-    #   At 5mm/px: grain (5-15mm) = 1-3px, medium (25-50mm) = 5-10px,
-    #   large (40-90mm) = 8-18px.  Need radii from 1 (grain) to 12 (large).
-    "tophat_radii":         [1, 2, 4, 8, 12],
-    "tophat_percentile":    88,       # was 96 — too aggressive, only captured peak pixels
-                                    # creating fragmented detections.  88 captures fuller
-                                    # nodule extent while still rejecting most background.
-    "tophat_threshold_floor": 8.0,    # lowered for grain nodules' weaker response
+    # ── Contour shape filters (adaptive — noise-driven) ──────────────────────
+    # All four shape parameters scale with noise_estimate so that noisy patches
+    # (which produce pixelated, irregular contours) get relaxed criteria while
+    # clean patches get tighter ones.
+    #
+    # At 5mm/px, a 10mm grain nodule ≈ 2px diameter ≈ 3px² area.
+    # Shape filters are skipped entirely for contours < 20px² (size-aware gate
+    # in filters.py), so the area floor is the primary grain-nodule guard.
+    "contour_area_min_range": (3, 12),   # [low-noise min, high-noise min]
+    "max_contour_area":       5000,      # fixed — physical upper bound
 
-    # ── Contour shape filters ────────────────────────────────────────────────
-    # At 5mm/px, a 10mm grain nodule is ~2px diameter = ~3px² area.
-    # Shape filters relaxed for tiny contours (filters.py applies size-aware
-    # filtering: strict shape criteria only for contours > 20px²).
-    "min_contour_area":     3,        # catch grain nodules (was 50)
-    "max_contour_area":     5000,     # allow largest nodules + clusters
-    "max_eccentricity":     0.85,     # relaxed — small contours have noisy shape
-    "min_solidity":         0.50,     # relaxed for small/irregular shapes
-    "min_circularity":      0.30,     # relaxed — pixelated small blobs score low
+    # Eccentricity: high noise → allow more elongated shapes (relax upward)
+    "eccentricity_range":  (0.80, 0.90),  # [low-noise max, high-noise max]
+
+    # Solidity & circularity: high noise → lower threshold (relax downward)
+    # Tuple is [high-noise floor, low-noise floor] — mapping is inverted in analyse()
+    "solidity_range":      (0.45, 0.65),
+    "circularity_range":   (0.25, 0.40),
 }
 
 
@@ -145,35 +145,47 @@ PREPROCESSING = {
 # ----------- PROXY LABEL GENERATION -----------
 
 PROXY_LABEL = {
-    # ── Dark-spot detection ──────────────────────────────────────────────
-    # The core signal: nodules are DARKER than surrounding sediment.
-    # We smooth to remove grain texture, estimate local background with
-    # a large blur, then threshold the darkness score (bg - smoothed).
+    # ── Multi-feature blob detection ─────────────────────────────────────
+    # Primary signal: multi-scale black top-hat (compact dark blob detector).
+    # Top-hat only fires on features SMALLER than the structuring element,
+    # so diffuse gray sediment patches get zero response.
+    # Gated by local contrast ratio so detections must actually be darker
+    # than their surroundings.
 
-    # Smoothing: removes sediment grain texture while preserving nodule-
-    # scale features.  σ=5 is ~2.5mm at 5mm/px resolution — smooths
-    # individual sand grains but preserves nodules ≥ 5mm.
-    "smooth_sigma":             5.0,
+    # Top-hat radii covering grain (1-3px) through large/cluster (18-40px)
+    # nodules at 5mm/px resolution.  SE diameter = 2r+1, so the SE must be
+    # larger than the nodule for the closing to fully fill it.
+    #   r=1-2:  grain nodules (5-15mm = 1-3px)
+    #   r=4-8:  medium nodules (25-50mm = 5-10px)
+    #   r=12:   large nodules (40-90mm = 8-18px)
+    #   r=16-20: very large nodules / clusters (90-200mm = 18-40px)
+    "tophat_radii":             [1, 2, 4, 8, 12, 16, 20],
 
-    # Background estimation: large σ ensures the background doesn't
-    # track individual nodules.  At σ=60, the kernel covers ~300px,
-    # far larger than any single nodule, so it represents the average
-    # sediment brightness in the neighborhood.
-    "bg_sigma":                 60.0,
+    # Texture gate: suppresses top-hat response in grainy sediment where
+    # individual grains fire the morphological filter.
+    "texture_sigma":            2.0,
+    "texture_threshold":        18.0,
 
-    # Darkness threshold: keep the top N% of darkness scores.
-    # 93 = top 7% darkest regions relative to local background.
-    "darkness_percentile":      93,
-    "darkness_floor":           3.0,    # absolute minimum darkness score
+    # ── Local contrast ratio gate ────────────────────────────────────────
+    # σ for background estimation in LCR.  30px = 150mm at 5mm/px —
+    # large enough to not track individual nodules but small enough to
+    # adapt to local illumination.
+    "lcr_bg_sigma":             30.0,
 
-    # ── Watershed separation ─────────────────────────────────────────────
-    # Only applied to connected components large enough to contain
-    # multiple nodules.  Minimum distance between nodule centers.
-    "watershed_min_distance":   8,
+    # ── Score thresholding ───────────────────────────────────────────────
+    # Combined score = raw_tophat × raw_lcr (absolute magnitude).
+    # Real nodules score 9-42; noise/artifacts score < 3.
+    # Absolute threshold is the primary gate — patches with no real
+    # nodules never exceed it.  Lower for higher recall (more grain
+    # nodules), raise for higher precision (fewer false positives).
+    "score_threshold":          5.0,
+    # Percentile is secondary: in dense-nodule patches, keeps only the
+    # strongest N% of detections above the absolute threshold.
+    "score_percentile":         85,
 
     # ── Contour filters ──────────────────────────────────────────────────
-    # Local contrast: contour interior must be this fraction darker than
-    # the local background (guards against noise detections).
+    # Per-contour contrast check: interior must be this fraction darker
+    # than local background.
     "min_local_contrast":       0.02,
 }
 

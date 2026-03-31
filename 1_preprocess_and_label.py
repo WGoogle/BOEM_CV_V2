@@ -11,6 +11,8 @@ Helpful Shortcuts I use:
     python 1_preprocess_and_label.py --mosaic FILE    # process a single file, when debugging
     python 1_preprocess_and_label.py --log-patches 5  # log first 5 patches only, to save space
 """
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -18,8 +20,6 @@ import sys
 import time
 import cv2
 import numpy as np
-
-from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -169,6 +169,8 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
     max_step_logs = config.LOGGING.get("max_step_log_patches", 5)
     valid_indices = [i for i, inf in enumerate(infos) if inf.is_valid]
     logged_set = set(random.sample(valid_indices, min(max_step_logs, len(valid_indices))))
+    # Always log specific patches for debugging
+    logged_set.update({303, 443})
 
     for info in infos:
         if not info.is_valid:

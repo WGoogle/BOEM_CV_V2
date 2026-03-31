@@ -3,11 +3,11 @@ Individual CV Preprocessing Steps + Proxy Label Generation
 
 Each filter takes a BGR np.ndarray and a TunedParams and returns a BGR np.ndarray.
 """
+from __future__ import annotations
+
 import logging
 import cv2
 import numpy as np
-
-from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from .auto_tuner import TunedParams
@@ -455,77 +455,94 @@ def _watershed_split(binary: np.ndarray, patch_bgr: np.ndarray, min_distance: in
 # ACTUAL CREATION OF PROXY LABEL
 def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: dict) -> Tuple[np.ndarray, List[Tuple[str, np.ndarray]], Dict]:
     """
-    Generate a binary nodule mask by detecting dark spots on the seafloor.
+    Generate a binary nodule mask using multi-feature blob detection.
+
+    Uses top-hat (compact dark blob detector) gated by local contrast ratio
+    (must actually be darker than surroundings) instead of the old diffuse
+    darkness-score approach which picked up gray sediment patches.
     """
     steps: List[Tuple[str, np.ndarray]] = []
 
     def _log(name: str, img: np.ndarray):
         steps.append((name, img.copy()))
 
-    # Grayscale + valid pixel mask
+    def _heatmap(feat: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        fv = feat[valid]
+        vmax = float(np.percentile(fv, 99.5)) if fv.size > 0 else 1.0
+        viz = np.clip(feat / max(vmax, 1e-6) * 255, 0, 255).astype(np.uint8)
+        color = cv2.applyColorMap(viz, cv2.COLORMAP_JET)
+        color[~valid] = 0
+        return color
+
+    # ── 01 Grayscale + valid pixel mask ──────────────────────────────────
     gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
     gray_f = gray.astype(np.float32)
-    valid_mask = gray > 10  # exclude black mosaic borders
+    valid_mask = gray > 10
     _log("01_grayscale", gray)
 
     n_valid = int(valid_mask.sum())
     if n_valid < 100:
         empty = np.zeros(gray.shape, dtype=np.uint8)
-        _log("02_smoothed", gray)
-        _log("03_local_background", gray)
-        _log("04_darkness_score", empty)
+        _log("02_tophat_response", empty)
+        _log("03_local_contrast", empty)
+        _log("04_combined_score", empty)
         _log("05_thresholded", empty)
         _log("06_morph_cleaned", empty)
-        _log("07_watershed_split", empty)
-        _log("08_proxy_mask", empty)
-        _log("09_overlay", patch_bgr)
+        _log("07_proxy_mask", empty)
+        _log("08_overlay", patch_bgr)
         return empty, steps, {
             "candidates_before_filter": 0, "nodules_after_filter": 0,
             "coverage_pct": 0.0, "threshold_used": 0.0,
-            "abs_intensity_gate": 0.0, "rejection_counts": {},
+            "rejection_counts": {},
         }
 
-    # Smooth to eliminate grain texture 
-    smooth_sigma = proxy_cfg.get("smooth_sigma", 5.0)
-    smoothed = cv2.GaussianBlur(gray_f, (0, 0), smooth_sigma)
-    _log("02_smoothed", np.clip(smoothed, 0, 255).astype(np.uint8))
+    # ── 02 Multi-scale black top-hat ─────────────────────────────────────
+    # Fires on compact dark features smaller than the structuring element.
+    # Gray sediment patches are larger than the SE → zero response.
+    # RAW values (no per-patch normalization) so absolute magnitude is
+    # preserved — patches with no real nodules produce weak scores.
+    tophat_radii = proxy_cfg.get("tophat_radii", [1, 2, 4, 8, 12])
+    texture_sigma = proxy_cfg.get("texture_sigma", 2.0)
+    texture_threshold = proxy_cfg.get("texture_threshold", 18.0)
+    tophat = _feature_tophat(gray, tophat_radii, texture_sigma, texture_threshold)
+    _log("02_tophat_response", _heatmap(tophat, valid_mask))
 
-    # Estimate local background 
-    bg_sigma = proxy_cfg.get("bg_sigma", 60.0)
-    filled = smoothed.copy()
-    valid_mean = float(np.mean(smoothed[valid_mask]))
-    filled[~valid_mask] = valid_mean
-    local_bg = cv2.GaussianBlur(filled, (0, 0), bg_sigma)
-    _log("03_local_background", np.clip(local_bg, 0, 255).astype(np.uint8))
+    # ── 03 Local contrast ratio ──────────────────────────────────────────
+    # How dark each pixel is relative to its local background (0–1 range).
+    # Gates the top-hat so only genuinely darker-than-surroundings blobs pass.
+    lcr_sigma = proxy_cfg.get("lcr_bg_sigma", 30.0)
+    lcr = _feature_local_contrast_ratio(gray_f, lcr_sigma, valid_mask)
+    _log("03_local_contrast", _heatmap(lcr, valid_mask))
 
-    # Darkness score 
-    darkness = np.clip(local_bg - smoothed, 0, None)
-    darkness[~valid_mask] = 0
+    # ── 04 Combined score ────────────────────────────────────────────────
+    # Raw tophat (0–255) × raw LCR (0–1) = absolute-magnitude score.
+    # Real nodules: tophat≈30-60 × LCR≈0.3-0.7 → score 9-42.
+    # Noise/artifacts: tophat≈1-5 × LCR≈0.05-0.2 → score 0.05-1.0.
+    # Patches with no nodules stay well below the absolute threshold.
+    score = tophat * lcr
+    score[~valid_mask] = 0
+    _log("04_combined_score", _heatmap(score, valid_mask))
 
-    # Visualize as heatmap
-    dark_valid = darkness[valid_mask]
-    d_max = float(np.percentile(dark_valid, 99.5)) if dark_valid.size > 0 else 1.0
-    darkness_viz = np.clip(darkness / max(d_max, 1e-6) * 255, 0, 255).astype(np.uint8)
-    darkness_color = cv2.applyColorMap(darkness_viz, cv2.COLORMAP_JET)
-    darkness_color[~valid_mask] = 0
-    _log("04_darkness_score", darkness_color)
+    # ── 05 Threshold ─────────────────────────────────────────────────────
+    # Absolute threshold is the primary gate: patches with no real nodules
+    # never exceed it.  Percentile is the secondary gate for dense patches
+    # where many pixels exceed the absolute threshold.
+    abs_threshold = proxy_cfg.get("score_threshold", 5.0)
+    score_pct = proxy_cfg.get("score_percentile", 85)
 
-    # Percentile threshold
-    darkness_pct = proxy_cfg.get("darkness_percentile", 93)
-    darkness_floor = proxy_cfg.get("darkness_floor", 3.0)
-
-    pos = dark_valid[dark_valid > 0]
+    valid_scores = score[valid_mask]
+    pos = valid_scores[valid_scores > 0]
     if pos.size > 100:
-        threshold = float(np.percentile(pos, darkness_pct))
+        pct_threshold = float(np.percentile(pos, score_pct))
     else:
-        threshold = darkness_floor
-    threshold = max(threshold, darkness_floor)
+        pct_threshold = abs_threshold
+    threshold = max(pct_threshold, abs_threshold)
 
-    binary = (darkness >= threshold).astype(np.uint8) * 255
+    binary = (score >= threshold).astype(np.uint8) * 255
     binary[~valid_mask] = 0
     _log("05_thresholded", binary)
 
-    # Morphological cleanup 
+    # ── 06 Morphological cleanup ─────────────────────────────────────────
     close_k = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (params.morph_close_k, params.morph_close_k),
     )
@@ -536,14 +553,9 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, open_k)
     _log("06_morph_cleaned", cleaned)
 
-    # Watershed separation for touching nodules
-    ws_min_dist = proxy_cfg.get("watershed_min_distance", 8)
-    separated = _watershed_split(cleaned, patch_bgr, ws_min_dist)
-    _log("07_watershed_split", separated)
-
-    # Contour shape filtering
+    # ── Contour shape filtering ──────────────────────────────────────────
     contours_raw, _ = cv2.findContours(
-        separated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+        cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
     )
     reject_counts = {
         "area_too_small": 0, "area_too_large": 0,
@@ -552,8 +564,10 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
     }
     filtered_contours = []
 
-    # Local background map for per-contour contrast verification
-    local_bg_map = local_bg
+    # Local background for per-contour contrast verification
+    gray_filled = gray_f.copy()
+    gray_filled[~valid_mask] = float(np.mean(gray_f[valid_mask]))
+    local_bg_map = cv2.GaussianBlur(gray_filled, (0, 0), lcr_sigma)
 
     min_local_contrast = proxy_cfg.get("min_local_contrast", 0.02)
 
@@ -566,7 +580,8 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
             reject_counts["area_too_large"] += 1
             continue
 
-        # Size-aware shape filtering: small contours (< 20px²) skip shape metrics which are unreliable at low pixel counts.
+        # Size-aware shape filtering: small contours (< 20px²) skip shape
+        # metrics which are unreliable at low pixel counts.
         is_small = area < 20
 
         if not is_small:
@@ -613,16 +628,16 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
 
         filtered_contours.append(c)
 
-    mask = np.zeros_like(separated)
+    mask = np.zeros_like(cleaned)
     if filtered_contours:
         cv2.drawContours(mask, filtered_contours, -1, 255, thickness=cv2.FILLED)
-    _log("08_proxy_mask", mask)
+    _log("07_proxy_mask", mask)
 
-    # Overlay for visual verification 
+    # Overlay for visual verification
     overlay = patch_bgr.copy()
     overlay[mask > 0] = [0, 255, 0]
     blended = cv2.addWeighted(patch_bgr, 0.6, overlay, 0.4, 0)
-    _log("09_overlay", blended)
+    _log("08_overlay", blended)
 
     # Stats
     stats = {

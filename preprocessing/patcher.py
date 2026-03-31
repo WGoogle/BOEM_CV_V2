@@ -3,11 +3,11 @@ patcher.py description:
 
 Splits seafloor .TIF strips into smaller patches and can recombine them later (for inference). 
 """
+from __future__ import annotations
+
 import cv2
 import numpy as np
 import logging
-
-from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Optional

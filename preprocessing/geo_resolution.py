@@ -12,13 +12,14 @@ Reason why this is an important addition is because on the researcher handoff i 
 in the .tif files, might as well use them to improve our preprocessing. 
 
 """
+from __future__ import annotations
+
 import logging
 import math
 import struct
 
 from pathlib import Path
 from typing import Optional
-from __future__ import annotations
 
 logger = logging.getLogger(__name__)
 

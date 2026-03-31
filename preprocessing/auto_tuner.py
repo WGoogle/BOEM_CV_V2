@@ -16,11 +16,11 @@ Signals used (More precise definitions left as comments under the functions, res
 
 4. Illumination uniformity (std of large-scale blur) alters whether to apply local normalisation before thresholding.
 """
+from __future__ import annotations
+
 import logging
 import cv2
 import numpy as np
-
-from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
 
@@ -54,17 +54,12 @@ class TunedParams:
     texture_threshold: float = 12.0
     max_darkening: int = 70
 
-    # Top-hat proxy labelling
-    tophat_radii: list = field(default_factory=lambda: [12, 20, 30])
-    tophat_percentile: float = 96.0
-    tophat_threshold_floor: float = 15.0
-
-    # Contour filters
-    min_contour_area: int = 50
-    max_contour_area: int = 3000
-    max_eccentricity: float = 0.80
-    min_solidity: float = 0.60
-    min_circularity: float = 0.45
+    # Contour filters (adaptive — driven by noise_estimate in PatchAutoTuner.analyse)
+    min_contour_area: int = 5
+    max_contour_area: int = 5000
+    max_eccentricity: float = 0.85
+    min_solidity: float = 0.50
+    min_circularity: float = 0.30
 
     # Diagnostics
     contrast_ratio: float = 0.0
@@ -145,20 +140,29 @@ class PatchAutoTuner:
         params.morph_open_k = raw_open if raw_open % 2 == 1 else raw_open + 1
         params.morph_close_k = raw_close if raw_close % 2 == 1 else raw_close + 1
 
-        # 5. Static pass-through from config (not adaptive yet)
+        # 5. Nodule-boost pass-through (static — nodule_boost is dormant in filter_chain)
         params.nodule_boost_factor  = self.cfg["nodule_boost_factor"]
         params.morph_radius         = self.cfg["morph_radius"]
         params.texture_sigma        = self.cfg["texture_sigma"]
         params.texture_threshold    = self.cfg["texture_threshold"]
         params.max_darkening        = self.cfg["max_darkening"]
-        params.tophat_radii         = list(self.cfg["tophat_radii"])
-        params.tophat_percentile    = self.cfg["tophat_percentile"]
-        params.tophat_threshold_floor = self.cfg["tophat_threshold_floor"]
-        params.min_contour_area     = self.cfg["min_contour_area"]
-        params.max_contour_area     = self.cfg["max_contour_area"]
-        params.max_eccentricity     = self.cfg["max_eccentricity"]
-        params.min_solidity         = self.cfg["min_solidity"]
-        params.min_circularity      = self.cfg["min_circularity"]
+
+        # 6. Contour shape filters — driven by noise_estimate
+        # High noise → pixelated contours look irregular → relax shape criteria
+        # High noise → more tiny noise blobs → raise area floor
+        ca_lo, ca_hi = self.cfg["contour_area_min_range"]
+        params.min_contour_area = int(round(ca_lo + n * (ca_hi - ca_lo)))
+        params.max_contour_area = self.cfg["max_contour_area"]
+
+        ecc_lo, ecc_hi = self.cfg["eccentricity_range"]
+        params.max_eccentricity = float(ecc_lo + n * (ecc_hi - ecc_lo))
+
+        # Solidity and circularity: high noise → lower (more relaxed) threshold
+        sol_lo, sol_hi = self.cfg["solidity_range"]
+        params.min_solidity = float(sol_hi - n * (sol_hi - sol_lo))
+
+        circ_lo, circ_hi = self.cfg["circularity_range"]
+        params.min_circularity = float(circ_hi - n * (circ_hi - circ_lo))
 
         # Store diagnostics
         params.contrast_ratio           = float(contrast)
@@ -172,7 +176,9 @@ class PatchAutoTuner:
             f"CLAHE clip={params.clahe_clip_limit:.2f}  "
             f"bilateral σc={params.bilateral_sigma_color:.0f}  "
             f"block={params.adaptive_block_size}  "
-            f"morph open/close={params.morph_open_k}/{params.morph_close_k}"
+            f"morph open/close={params.morph_open_k}/{params.morph_close_k}  "
+            f"contour area_min={params.min_contour_area}  "
+            f"ecc≤{params.max_eccentricity:.2f}  sol≥{params.min_solidity:.2f}  circ≥{params.min_circularity:.2f}"
         )
         return params
 
