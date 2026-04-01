@@ -102,25 +102,51 @@ class PatchAutoTuner:
         noise      = self._noise_estimate(gray, valid_mask)
         skew       = self._brightness_skew(L, valid_mask)
         uniformity = self._illumination_uniformity(L, valid_mask)
+        mean = cv2.blur(gray, (5, 5))
+        mean_sq = cv2.blur(gray**2, (5, 5))
+        variance = np.maximum(0, mean_sq - (mean**2))
+        avg_variance = np.median(variance)
+        std_dev = np.sqrt(avg_variance)
 
         # Map the signals to the parameters in config
         params = TunedParams()
 
         # 1. CLAHE clip limit  (inverse of contrast)
         cmin, cmax = self.cfg["clahe_clip_range"]
-        # Normalise contrast into [0, 1] — typical IQR for seafloor is 15-80
-        t = np.clip((contrast - 15.0) / 65.0, 0.0, 1.0)
-        params.clahe_clip_limit = float(cmax - t * (cmax - cmin))
+        if avg_variance < 64:
+            params.clahe_clip_limit = 4.0
+        elif avg_variance > 102:
+            params.clahe_clip_limit = 2.0
+        else:
+            params.clahe_clip_limit = 3.0
         params.clahe_tile_grid = tuple(self.cfg["clahe_tile_grid"])
 
         # 2. Bilateral sigmas  (proportional to noise)
-        params.bilateral_d = self.cfg["bilateral_d"]
-        sc_min, sc_max = self.cfg["bilateral_sigma_color_range"]
-        ss_min, ss_max = self.cfg["bilateral_sigma_space_range"]
-        # Normalise noise into [0, 1] — typical MAD-Laplacian 2-20
-        n = np.clip((noise - 2.0) / 18.0, 0.0, 1.0)
-        params.bilateral_sigma_color = float(sc_min + n * (sc_max - sc_min))
-        params.bilateral_sigma_space = float(ss_min + n * (ss_max - ss_min))
+        max_v = np.percentile(variance, 90)
+        if max_v == 0: max_v = 1
+        normalized_v = np.clip(variance / max_v, 0, 1)
+        d_map = max_d - (normalized_v * (max_d - min_d))
+        optimal_d = int(np.median(d_map))
+        if optimal_d % 2 == 0:
+            optimal_d += 1
+        params.bilateral_d = optimal_d
+
+        sigma_colors = [50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+        sigma_spaces = [50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+        combinations = []
+        variances = []
+        for color in sigma_colors:
+            for space in sigma_spaces:
+                combinations.append({'sigma_color': color, 'sigma_space': space})
+                filtered = cv2.bilateralFilter(images[2], d = 5, sigmaColor = color, sigmaSpace = space)
+                mean_filtered = cv2.blur(filtered, (5, 5))
+                mean_sq_filtered = cv2.blur(filtered**2, (5, 5))
+                variance_filtered = np.maximum(0, mean_sq_filtered - (mean_filtered**2)) 
+                variances.append(np.median(variance_filtered))
+        for i in range(len(variances)):
+            if variances[i] = min(variances):
+                params.bilateral_sigma_color = combinations[i]['sigma_color']
+                params.bilateral_sigma_space = combinations[i]['sigma_space']
 
         # 3. Adaptive threshold block size & C-offset (from skewness)
         bmin, bmax = self.cfg["block_size_range"]
