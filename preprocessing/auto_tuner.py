@@ -138,13 +138,13 @@ class PatchAutoTuner:
         for color in sigma_colors:
             for space in sigma_spaces:
                 combinations.append({'sigma_color': color, 'sigma_space': space})
-                filtered = cv2.bilateralFilter(images[2], d = 5, sigmaColor = color, sigmaSpace = space)
+                filtered = cv2.bilateralFilter(gray, d = 5, sigmaColor = color, sigmaSpace = space)
                 mean_filtered = cv2.blur(filtered, (5, 5))
                 mean_sq_filtered = cv2.blur(filtered**2, (5, 5))
                 variance_filtered = np.maximum(0, mean_sq_filtered - (mean_filtered**2)) 
                 variances.append(np.median(variance_filtered))
         for i in range(len(variances)):
-            if variances[i] = min(variances):
+            if variances[i] == min(variances):
                 params.bilateral_sigma_color = combinations[i]['sigma_color']
                 params.bilateral_sigma_space = combinations[i]['sigma_space']
 
