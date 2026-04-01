@@ -122,6 +122,8 @@ class PatchAutoTuner:
         params.clahe_tile_grid = tuple(self.cfg["clahe_tile_grid"])
 
         # 2. Bilateral sigmas  (proportional to noise)
+        min_d = 5
+        max_d = 15
         max_v = np.percentile(variance, 90)
         if max_v == 0: max_v = 1
         normalized_v = np.clip(variance / max_v, 0, 1)
