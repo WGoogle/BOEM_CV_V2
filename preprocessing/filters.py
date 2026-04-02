@@ -70,15 +70,16 @@ def illumination_normalize(image: np.ndarray, params: TunedParams, preprocess_cf
 
 def clahe_lab(image: np.ndarray, params: TunedParams) -> np.ndarray:
     # CLAHE on the L channel of LAB colour space.
-
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l_orig = lab[:, :, 0].copy()
     clahe = cv2.createCLAHE(
         clipLimit=params.clahe_clip_limit,
         tileGridSize=params.clahe_tile_grid,
     )
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    l_clahe = clahe.apply(l_orig)
+    alpha = params.clahe_blend
+    lab[:, :, 0] = cv2.addWeighted(l_clahe, alpha, l_orig, 1.0 - alpha, 0)
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
 
 def bilateral_denoise(image: np.ndarray, params: TunedParams) -> np.ndarray:
     # Bilateral filter — edge-preserving noise suppression.
@@ -157,55 +158,16 @@ def multi_scale_retinex(image: np.ndarray, params: TunedParams, preprocess_cfg: 
     if lr_std > 1e-6:
         l_retinex = (l_retinex - lr_mean) / lr_std * valid_std + valid_mean
 
+    # Blend retinex with original L to control enhancement strength.
+    # Low-contrast (sediment) patches use msr_blend < 1 to avoid amplifying noise.
+    alpha = params.msr_blend
+    l_retinex = l_retinex * alpha + l_f * (1.0 - alpha)
+
     # Restore black borders
     l_retinex[~valid_mask] = 0
     l_retinex = np.clip(l_retinex, 0, 255).astype(np.uint8)
 
     return cv2.cvtColor(cv2.merge([l_retinex, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
-
-def nodule_boost(image: np.ndarray, params: TunedParams, preprocess_cfg: dict, l_pre_clahe: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Darken nodule blobs using bottom-hat transform + texture gate.
-    Uses the pre-CLAHE L channel when available to avoid halo artefacts.
-
-    The bottom-hat response is soft-thresholded at the 60th percentile so that background sediment 
-    (which also has a small bottom-hat value from grain texture) is left untouched, while nodules are darkened. 
-    """
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l_ch, a_ch, b_ch = cv2.split(lab)
-
-    l_ref = l_pre_clahe if l_pre_clahe is not None else l_ch
-    l_ref_u8 = l_ref.astype(np.uint8)
-
-    # Bottom-hat: close(L) − L -> large response at dark compact blobs
-    se_size = 2 * params.morph_radius + 1
-    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
-    closed = cv2.morphologyEx(l_ref_u8, cv2.MORPH_CLOSE, se)
-    bottom_hat = cv2.subtract(closed, l_ref_u8).astype(np.float32)
-
-    # Texture gate: suppress response in grainy sediment regions
-    blur_fine = cv2.GaussianBlur(
-        l_ref_u8.astype(np.float32), (0, 0), params.texture_sigma
-    )
-    abs_diff = np.abs(l_ref_u8.astype(np.float32) - blur_fine)
-    texture_score = cv2.GaussianBlur(abs_diff, (0, 0), params.texture_sigma * 1.5)
-    texture_weight = np.clip(1.0 - texture_score / params.texture_threshold, 0, 1)
-
-    # Soft-threshold: subtract the background bottom-hat floor
-    nonzero = bottom_hat[bottom_hat > 0]
-    if nonzero.size > 0:
-        bh_floor = float(np.percentile(nonzero, 60))
-    else:
-        bh_floor = 5.0
-    boosted_bh = np.clip(bottom_hat - bh_floor, 0, None)
-
-    darkening = np.clip(
-        params.nodule_boost_factor * boosted_bh * texture_weight,
-        0, params.max_darkening,
-    )
-    l_boosted = np.clip(l_ch.astype(np.float32) - darkening, 0, 255).astype(np.uint8)
-
-    return cv2.cvtColor(cv2.merge([l_boosted, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
 
 def sediment_fade(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -> np.ndarray:
@@ -249,7 +211,7 @@ def unsharp_mask(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -
     while a grain-suppression guard computed at fine scale (sigma≈0.7px) prevents amplification of sediment texture.
     """
     sigma = preprocess_cfg.get("unsharp_sigma", 2.0)
-    strength = preprocess_cfg.get("unsharp_strength", 0.5)
+    strength = params.unsharp_strength
 
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -523,17 +485,21 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
     score[~valid_mask] = 0
     _log("04_combined_score", _heatmap(score, valid_mask))
 
-    # ── 05 Threshold ─────────────────────────────────────────────────────
-    # Absolute threshold is the primary gate: patches with no real nodules
-    # never exceed it.  Percentile is the secondary gate for dense patches
-    # where many pixels exceed the absolute threshold.
+    # ── 05 Threshold (density-adaptive) ─────────────────────────────────
+    # Absolute threshold is the primary gate: patches with no real nodules never exceed it.  
+    # The percentile adapts to nodule density.
     abs_threshold = proxy_cfg.get("score_threshold", 5.0)
-    score_pct = proxy_cfg.get("score_percentile", 85)
+    pct_lo, pct_hi = proxy_cfg.get("score_percentile_range", (70, 90))
 
     valid_scores = score[valid_mask]
     pos = valid_scores[valid_scores > 0]
     if pos.size > 100:
-        pct_threshold = float(np.percentile(pos, score_pct))
+        # Density: fraction of valid pixels exceeding the absolute threshold
+        frac_above = float(np.sum(valid_scores > abs_threshold)) / n_valid
+        # Use pct_hi if 0 (sparse) (strict) and if greater than 5% use pct_lo (dense) (relaxed)
+        density_t = np.clip(frac_above / 0.05, 0.0, 1.0)
+        adaptive_pct = float(pct_hi - density_t * (pct_hi - pct_lo))
+        pct_threshold = float(np.percentile(pos, adaptive_pct))
     else:
         pct_threshold = abs_threshold
     threshold = max(pct_threshold, abs_threshold)
@@ -553,7 +519,7 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, open_k)
     _log("06_morph_cleaned", cleaned)
 
-    # ── Contour shape filtering ──────────────────────────────────────────
+    # ── Contour shape filtering (score-gated) ──────────────────────────
     contours_raw, _ = cv2.findContours(
         cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
     )
@@ -570,6 +536,9 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
     local_bg_map = cv2.GaussianBlur(gray_filled, (0, 0), lcr_sigma)
 
     min_local_contrast = proxy_cfg.get("min_local_contrast", 0.02)
+    # Score-gate: contours whose mean combined score exceeds this multiple of the threshold
+    shape_bypass_mult = proxy_cfg.get("shape_bypass_score_mult", 2.0)
+    shape_bypass_threshold = threshold * shape_bypass_mult
 
     for c in contours_raw:
         area = cv2.contourArea(c)
@@ -580,11 +549,17 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
             reject_counts["area_too_large"] += 1
             continue
 
-        # Size-aware shape filtering: small contours (< 20px²) skip shape
-        # metrics which are unreliable at low pixel counts.
-        is_small = area < 20
+        # Mean combined score inside this contour
+        contour_mask_tmp = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask_tmp, [c], 0, 255, cv2.FILLED)
+        contour_scores = score[contour_mask_tmp > 0]
+        mean_score = float(np.mean(contour_scores)) if contour_scores.size > 0 else 0.0
+        high_confidence = mean_score >= shape_bypass_threshold
 
-        if not is_small:
+        # Size-aware shape filtering
+        skip_shape = area < 20 or high_confidence
+
+        if not skip_shape:
             # Solidity
             hull_area = cv2.contourArea(cv2.convexHull(c))
             solidity = area / hull_area if hull_area > 0 else 0
@@ -613,8 +588,7 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
                 reject_counts["low_circularity"] += 1
                 continue
 
-        contour_mask_tmp = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.drawContours(contour_mask_tmp, [c], 0, 255, cv2.FILLED)
+        # Per-contour local contrast check (always applied)
         interior = gray_f[contour_mask_tmp > 0]
         bg_vals = local_bg_map[contour_mask_tmp > 0]
         if interior.size > 0 and bg_vals.size > 0:
@@ -659,7 +633,6 @@ _FILTER_REGISTRY = {
     "clahe_lab":                clahe_lab,
     "bilateral_denoise":        bilateral_denoise,
     "multi_scale_retinex":      multi_scale_retinex,
-    "nodule_boost":             nodule_boost,
     "sediment_fade":            sediment_fade,
     "unsharp_mask":             unsharp_mask,
 }
@@ -675,24 +648,14 @@ class FilterPipeline:
 
         image = patch_bgr.copy()
 
-        # Snapshot L-channel before CLAHE for nodule_boost
-        l_pre_clahe = None
-
         for i, step_name in enumerate(self.chain, start=1):
             fn = _FILTER_REGISTRY.get(step_name)
             if fn is None:
                 logger.warning(f"Unknown filter step '{step_name}' — skipping")
                 continue
 
-            # Capture pre-CLAHE L channel (used by nodule_boost if present)
-            if step_name == "clahe_lab":
-                lab_tmp = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-                l_pre_clahe = lab_tmp[:, :, 0].copy()
-
             # Call the filter with the right signature
-            if step_name in ("nodule_boost",):
-                image = fn(image, params, self.cfg, l_pre_clahe)
-            elif step_name in (
+            if step_name in (
                 "illumination_normalize", "multi_scale_retinex",
                 "sediment_fade", "unsharp_mask",
             ):

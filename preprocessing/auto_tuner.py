@@ -1,8 +1,7 @@
 """
 Per-Patch Adaptive Parameter Calculation
 
-This is where teammates can hopefully brainstorm some ideas to improve, but 
-essentially, a single set of preprocessing parameters cannot work across an entire seafloor mosaic.
+Essentially, a single set of preprocessing parameters cannot work across an entire seafloor mosaic.
 
 This script should ideally analyze each patch independently and computes "good" parameters for that specific region.  
 
@@ -30,8 +29,12 @@ logger = logging.getLogger(__name__)
 class TunedParams:
     """Parameters computed for a single patch."""
      
+    # MSR
+    msr_blend: float = 1.0  # 0 = keep original L, 1 = full retinex
+
     # CLAHE
     clahe_clip_limit: float = 2.0
+    clahe_blend: float = 1.0 # 0 = keep original, 1 = full CLAHE
     clahe_tile_grid: Tuple[int, int] = (8, 8)
 
     # Bilateral filter
@@ -47,12 +50,8 @@ class TunedParams:
     morph_open_k: int = 5
     morph_close_k: int = 9
 
-    # Nodule boost
-    nodule_boost_factor: float = 2.0
-    morph_radius: int = 20
-    texture_sigma: float = 2.0
-    texture_threshold: float = 12.0
-    max_darkening: int = 70
+    # Unsharp mask
+    unsharp_strength: float = 0.5 # adaptive — low-contrast patches get less sharpening
 
     # Contour filters (adaptive — driven by noise_estimate in PatchAutoTuner.analyse)
     min_contour_area: int = 5
@@ -111,17 +110,25 @@ class PatchAutoTuner:
         # Map the signals to the parameters in config
         params = TunedParams()
 
-        # 1. CLAHE clip limit  (inverse of contrast)
+        # Shared contrast factor: how much enhancement this patch needs.
+        t = np.clip(contrast / 40.0, 0.0, 1.0)
+
+        # Normalized noise factor for contour shape filters.
+        # noise_estimate (MAD of Laplacian) typically 0–20; map to [0,1].
+        n = np.clip(noise / 20.0, 0.0, 1.0)
+
+        # MSR blend — low-contrast patches get less retinex enhancement
+        msr_lo, msr_hi = self.cfg.get("msr_blend_range", (0.3, 1.0))
+        params.msr_blend = float(msr_lo + t * (msr_hi - msr_lo))
+
+        # CLAHE clip limit & blend factor (scaled by contrast ratio)
         cmin, cmax = self.cfg["clahe_clip_range"]
-        if avg_variance < 64:
-            params.clahe_clip_limit = 4.0
-        elif avg_variance > 102:
-            params.clahe_clip_limit = 2.0
-        else:
-            params.clahe_clip_limit = 3.0
+        params.clahe_clip_limit = float(cmin + t * (cmax - cmin))
+        bmin, bmax = self.cfg.get("clahe_blend_range", (0.3, 1.0))
+        params.clahe_blend = float(bmin + t * (bmax - bmin))
         params.clahe_tile_grid = tuple(self.cfg["clahe_tile_grid"])
 
-        # 2. Bilateral sigmas  (proportional to noise)
+        # Bilateral sigmas  (proportional to noise)
         min_d = 5
         max_d = 15
         max_v = np.percentile(variance, 90)
@@ -150,7 +157,7 @@ class PatchAutoTuner:
                 params.bilateral_sigma_color = combinations[i]['sigma_color']
                 params.bilateral_sigma_space = combinations[i]['sigma_space']
 
-        # 3. Adaptive threshold block size & C-offset (from skewness)
+        # Adaptive threshold block size & C-offset (from skewness)
         bmin, bmax = self.cfg["block_size_range"]
         coff_min, coff_max = self.cfg["c_offset_range"]
         # Normalise skewness into [0, 1] — typical range -1 to +1
@@ -159,7 +166,7 @@ class PatchAutoTuner:
         params.adaptive_block_size = raw_block if raw_block % 2 == 1 else raw_block + 1
         params.adaptive_c_offset = float(coff_min + s * (coff_max - coff_min))
 
-        # 4. Morphological kernels  (from uniformity)
+        # Morphological kernels  (from uniformity)
         mo_min, mo_max = self.cfg["morph_open_range"]
         mc_min, mc_max = self.cfg["morph_close_range"]
         u = np.clip((uniformity - 2.0) / 15.0, 0.0, 1.0)
@@ -168,16 +175,11 @@ class PatchAutoTuner:
         params.morph_open_k = raw_open if raw_open % 2 == 1 else raw_open + 1
         params.morph_close_k = raw_close if raw_close % 2 == 1 else raw_close + 1
 
-        # 5. Nodule-boost pass-through (static — nodule_boost is dormant in filter_chain)
-        params.nodule_boost_factor  = self.cfg["nodule_boost_factor"]
-        params.morph_radius         = self.cfg["morph_radius"]
-        params.texture_sigma        = self.cfg["texture_sigma"]
-        params.texture_threshold    = self.cfg["texture_threshold"]
-        params.max_darkening        = self.cfg["max_darkening"]
+        # 6. Unsharp mask strength — low-contrast patches get less sharpening
+        us_lo, us_hi = self.cfg.get("unsharp_strength_range", (0.1, 0.5))
+        params.unsharp_strength = float(us_lo + t * (us_hi - us_lo))
 
-        # 6. Contour shape filters — driven by noise_estimate
-        # High noise → pixelated contours look irregular → relax shape criteria
-        # High noise → more tiny noise blobs → raise area floor
+        # 7. Contour shape filters — driven by noise_estimate
         ca_lo, ca_hi = self.cfg["contour_area_min_range"]
         params.min_contour_area = int(round(ca_lo + n * (ca_hi - ca_lo)))
         params.max_contour_area = self.cfg["max_contour_area"]
@@ -201,7 +203,9 @@ class PatchAutoTuner:
         logger.debug(
             f"AutoTune: contrast={contrast:.1f}  noise={noise:.1f}  "
             f"skew={skew:.2f}  uniformity={uniformity:.1f}  →  "
-            f"CLAHE clip={params.clahe_clip_limit:.2f}  "
+            f"MSR blend={params.msr_blend:.2f}  "
+            f"CLAHE clip={params.clahe_clip_limit:.2f} blend={params.clahe_blend:.2f}  "
+            f"unsharp={params.unsharp_strength:.2f}  "
             f"bilateral σc={params.bilateral_sigma_color:.0f}  "
             f"block={params.adaptive_block_size}  "
             f"morph open/close={params.morph_open_k}/{params.morph_close_k}  "

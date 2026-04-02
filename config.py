@@ -64,9 +64,15 @@ AUTO_TUNER = {
     # ── CLAHE ────────────────────────────────────────────────────────────────
     # Clip limit is scaled by local contrast: low-contrast patches get a
     # stronger boost, high-contrast patches are left mostly alone.
-    "clahe_clip_range":     (1.0, 2.0),     # MSR handles illumination; CLAHE adds gentle local contrast — ceiling raised
-                                            # slightly from 1.5 so the lowest-contrast patches get a meaningful lift
+    # All three enhancement stages (MSR, CLAHE, unsharp) are scaled by the
+    # patch's contrast ratio so low-contrast (sediment-heavy) patches stay
+    # close to the original and only high-contrast (nodule-rich) patches
+    # receive full enhancement.
+    "msr_blend_range":      (0.3, 1.0),     # MSR blend: 30% for flat sediment, 100% for nodule-rich
+    "clahe_clip_range":     (1.0, 2.0),     # CLAHE clip limit range
+    "clahe_blend_range":    (0.3, 1.0),     # CLAHE blend: 30% for flat sediment, 100% for nodule-rich
     "clahe_tile_grid":      (8, 8),         # tile grid for CLAHE
+    "unsharp_strength_range": (0.1, 0.5),   # unsharp: 0.1 for flat sediment, 0.5 for nodule-rich
 
     # ── Bilateral filter ─────────────────────────────────────────────────────
     "bilateral_d":          7,
@@ -82,12 +88,6 @@ AUTO_TUNER = {
     "morph_close_range":    (5, 11),         # closing kernel — solidify scattered detections
                                             # into coherent nodule blobs (was 3-7, too small)
 
-    # ── Nodule-boost (bottom-hat) ────────────────────────────────────────────
-    "nodule_boost_factor":  2.0,
-    "morph_radius":         20,              # SE radius for bottom-hat
-    "texture_sigma":        2.0,
-    "texture_threshold":    18.0,
-    "max_darkening":        70,
 
     # ── Contour shape filters (adaptive — noise-driven) ──────────────────────
     # All four shape parameters scale with noise_estimate so that noisy patches
@@ -179,14 +179,20 @@ PROXY_LABEL = {
     # nodules never exceed it.  Lower for higher recall (more grain
     # nodules), raise for higher precision (fewer false positives).
     "score_threshold":          5.0,
-    # Percentile is secondary: in dense-nodule patches, keeps only the
-    # strongest N% of detections above the absolute threshold.
-    "score_percentile":         85,
+    # Percentile adapts to nodule density:
+    #   sparse patches → high percentile (strict, abs_threshold dominates)
+    #   dense patches  → low percentile (relaxed, more nodules survive)
+    "score_percentile_range":   (70, 90),
 
     # ── Contour filters ──────────────────────────────────────────────────
     # Per-contour contrast check: interior must be this fraction darker
     # than local background.
     "min_local_contrast":       0.02,
+    # Score-gate: contours with mean score ≥ threshold × this multiplier
+    # are high-confidence and skip strict shape filters (solidity,
+    # eccentricity, circularity). Prevents strong detections from being
+    # killed by irregular blob shape at low pixel counts.
+    "shape_bypass_score_mult":  2.0,
 }
 
 
