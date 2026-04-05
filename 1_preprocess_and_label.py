@@ -170,7 +170,7 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
     valid_indices = [i for i, inf in enumerate(infos) if inf.is_valid]
     logged_set = set(random.sample(valid_indices, min(max_step_logs, len(valid_indices))))
     # Always log specific patches for debugging
-    logged_set.update({303, 443, 473, 501, 573})
+    logged_set.update({80, 298, 303, 443, 473, 501, 573})
 
     for info in infos:
         if not info.is_valid:

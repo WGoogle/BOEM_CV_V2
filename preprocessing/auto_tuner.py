@@ -122,13 +122,20 @@ class PatchAutoTuner:
         params.msr_blend = float(msr_lo + t * (msr_hi - msr_lo))
 
         # CLAHE clip limit & blend factor (scaled by contrast ratio)
+        # Noise-aware: high noise → reduce clip & blend to avoid
+        # amplifying grain texture into false nodule detections.
         cmin, cmax = self.cfg["clahe_clip_range"]
-        params.clahe_clip_limit = float(cmin + t * (cmax - cmin))
+        base_clip = float(cmin + t * (cmax - cmin))
         bmin, bmax = self.cfg.get("clahe_blend_range", (0.3, 1.0))
-        params.clahe_blend = float(bmin + t * (bmax - bmin))
+        base_blend = float(bmin + t * (bmax - bmin))
+        noise_penalty = np.clip(noise / 15.0, 0.0, 1.0)
+        params.clahe_clip_limit = float(base_clip * (1.0 - 0.6 * noise_penalty))
+        params.clahe_blend = float(base_blend * (1.0 - 0.5 * noise_penalty))
         params.clahe_tile_grid = tuple(self.cfg["clahe_tile_grid"])
 
         # Bilateral sigmas  (proportional to noise)
+        # Noise-aware: extend grid search range for noisy patches so the
+        # bilateral filter can smooth grain more aggressively.
         min_d = 5
         max_d = 15
         max_v = np.percentile(variance, 90)
@@ -142,8 +149,12 @@ class PatchAutoTuner:
 
         sc_lo, sc_hi = self.cfg.get("bilateral_sigma_color_range", (30, 60))
         ss_lo, ss_hi = self.cfg.get("bilateral_sigma_space_range", (30, 60))
-        sigma_colors = np.arange(sc_lo, sc_hi + 1, 10).tolist()
-        sigma_spaces = np.arange(ss_lo, ss_hi + 1, 10).tolist()
+        # Extend range for noisy patches (up to 1.5× at max noise)
+        noise_extend = 1.0 + 0.5 * noise_penalty
+        sc_hi_eff = int(sc_hi * noise_extend)
+        ss_hi_eff = int(ss_hi * noise_extend)
+        sigma_colors = np.arange(sc_lo, sc_hi_eff + 1, 10).tolist()
+        sigma_spaces = np.arange(ss_lo, ss_hi_eff + 1, 10).tolist()
         combinations = []
         variances = []
         for color in sigma_colors:
@@ -152,7 +163,7 @@ class PatchAutoTuner:
                 filtered = cv2.bilateralFilter(gray, d=optimal_d, sigmaColor=color, sigmaSpace=space)
                 mean_filtered = cv2.blur(filtered, (5, 5))
                 mean_sq_filtered = cv2.blur(filtered**2, (5, 5))
-                variance_filtered = np.maximum(0, mean_sq_filtered - (mean_filtered**2)) 
+                variance_filtered = np.maximum(0, mean_sq_filtered - (mean_filtered**2))
                 variances.append(np.median(variance_filtered))
         for i in range(len(variances)):
             if variances[i] == min(variances):

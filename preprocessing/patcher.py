@@ -48,6 +48,7 @@ class MosaicPatcher:
         min_std: float = 3.0,
         min_mean: float = 10.0,
         max_black_fraction: float = 0.25,
+        max_noise: float = 0,
     ):
         self.patch_size = patch_size
         self.overlap = overlap
@@ -55,6 +56,7 @@ class MosaicPatcher:
         self.min_std = min_std
         self.min_mean = min_mean
         self.max_black_fraction = max_black_fraction
+        self.max_noise = max_noise
 
 
     def load_mosaic(self, filepath: Path) -> np.ndarray:
@@ -209,5 +211,13 @@ class MosaicPatcher:
         mean = float(np.mean(gray))
         if mean < self.min_mean:
             return False, f"mean={mean:.1f}"
+
+        # Excessive noise / grain check — MAD of Laplacian.
+        # Extremely grainy patches produce only false detections downstream.
+        if self.max_noise > 0:
+            lap = cv2.Laplacian(gray, cv2.CV_64F)
+            noise = float(np.median(np.abs(lap)))
+            if noise > self.max_noise:
+                return False, f"noise={noise:.1f}"
 
         return True, ""

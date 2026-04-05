@@ -503,6 +503,12 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
         frac_above = float(np.sum(valid_scores > abs_threshold)) / n_valid
         density_t = np.clip(frac_above / dense_frac, 0.0, 1.0)
 
+        # Noise-aware density: suppress the dense path for noisy patches.
+        # Grain noise fires the tophat everywhere, faking high density.
+        # noise < 4 → no suppression; noise > 8 → full suppression.
+        noise_suppress = np.clip((params.noise_estimate - 4.0) / 4.0, 0.0, 1.0)
+        density_t = density_t * (1.0 - noise_suppress)
+
         # Dense patches get a lowered absolute threshold
         effective_abs = float(abs_threshold - density_t * (abs_threshold - dense_abs_min))
 
