@@ -97,7 +97,7 @@ AUTO_TUNER = {
     # At 5mm/px, a 10mm grain nodule ≈ 2px diameter ≈ 3px² area.
     # Shape filters are skipped entirely for contours < 20px² (size-aware gate
     # in filters.py), so the area floor is the primary grain-nodule guard.
-    "contour_area_min_range": (3, 12),   # [low-noise min, high-noise min]
+    "contour_area_min_range": (2, 8),    # [low-noise min, high-noise min]
     "max_contour_area":       5000,      # fixed — physical upper bound
 
     # Eccentricity: high noise → allow more elongated shapes (relax upward)
@@ -178,11 +178,20 @@ PROXY_LABEL = {
     # Absolute threshold is the primary gate — patches with no real
     # nodules never exceed it.  Lower for higher recall (more grain
     # nodules), raise for higher precision (fewer false positives).
-    "score_threshold":          5.0,
+    "score_threshold":          4.0,
     # Percentile adapts to nodule density:
     #   sparse patches → high percentile (strict, abs_threshold dominates)
     #   dense patches  → low percentile (relaxed, more nodules survive)
     "score_percentile_range":   (70, 90),
+    # Dense-patch two-pass thresholding:
+    # When ≥ dense_frac_trigger of valid pixels exceed score_threshold,
+    # the effective abs threshold is lowered toward dense_score_threshold_min
+    # AND the percentile gate is faded out so it no longer dominates.
+    # This lets dense-nodule patches keep faint-but-real detections while
+    # sparse patches remain unaffected.
+    "dense_score_threshold_min": 3.0,   # lowest abs threshold for very dense patches
+    "dense_frac_trigger":        0.01,  # fraction of pixels above score_threshold
+                                        # that triggers the dense-patch path
 
     # ── Contour filters ──────────────────────────────────────────────────
     # Per-contour contrast check: interior must be this fraction darker

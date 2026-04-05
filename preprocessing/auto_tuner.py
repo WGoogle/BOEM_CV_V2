@@ -140,14 +140,16 @@ class PatchAutoTuner:
             optimal_d += 1
         params.bilateral_d = optimal_d
 
-        sigma_colors = [50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
-        sigma_spaces = [50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+        sc_lo, sc_hi = self.cfg.get("bilateral_sigma_color_range", (30, 60))
+        ss_lo, ss_hi = self.cfg.get("bilateral_sigma_space_range", (30, 60))
+        sigma_colors = np.arange(sc_lo, sc_hi + 1, 10).tolist()
+        sigma_spaces = np.arange(ss_lo, ss_hi + 1, 10).tolist()
         combinations = []
         variances = []
         for color in sigma_colors:
             for space in sigma_spaces:
                 combinations.append({'sigma_color': color, 'sigma_space': space})
-                filtered = cv2.bilateralFilter(gray, d = 5, sigmaColor = color, sigmaSpace = space)
+                filtered = cv2.bilateralFilter(gray, d=optimal_d, sigmaColor=color, sigmaSpace=space)
                 mean_filtered = cv2.blur(filtered, (5, 5))
                 mean_sq_filtered = cv2.blur(filtered**2, (5, 5))
                 variance_filtered = np.maximum(0, mean_sq_filtered - (mean_filtered**2)) 

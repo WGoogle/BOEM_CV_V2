@@ -485,24 +485,37 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
     score[~valid_mask] = 0
     _log("04_combined_score", _heatmap(score, valid_mask))
 
-    # ── 05 Threshold (density-adaptive) ─────────────────────────────────
-    # Absolute threshold is the primary gate: patches with no real nodules never exceed it.  
-    # The percentile adapts to nodule density.
+    # ── 05 Threshold (density-adaptive, two-pass) ─────────────────────
+    # Pass 1: count detections at the default absolute threshold.
+    # Pass 2: if dense, lower the effective threshold and fade out the
+    #          percentile gate so more real nodules survive.
+    # Sparse patches are unchanged — the abs floor + strict percentile
+    # still reject noise.
     abs_threshold = proxy_cfg.get("score_threshold", 5.0)
     pct_lo, pct_hi = proxy_cfg.get("score_percentile_range", (70, 90))
+    dense_abs_min = proxy_cfg.get("dense_score_threshold_min", 3.0)
+    dense_frac = proxy_cfg.get("dense_frac_trigger", 0.03)
 
     valid_scores = score[valid_mask]
     pos = valid_scores[valid_scores > 0]
     if pos.size > 100:
         # Density: fraction of valid pixels exceeding the absolute threshold
         frac_above = float(np.sum(valid_scores > abs_threshold)) / n_valid
-        # Use pct_hi if 0 (sparse) (strict) and if greater than 5% use pct_lo (dense) (relaxed)
-        density_t = np.clip(frac_above / 0.05, 0.0, 1.0)
+        density_t = np.clip(frac_above / dense_frac, 0.0, 1.0)
+
+        # Dense patches get a lowered absolute threshold
+        effective_abs = float(abs_threshold - density_t * (abs_threshold - dense_abs_min))
+
+        # Percentile gate (strict for sparse, relaxed for dense)
         adaptive_pct = float(pct_hi - density_t * (pct_hi - pct_lo))
         pct_threshold = float(np.percentile(pos, adaptive_pct))
+
+        # Blend: sparse → max(pct, abs) as before;
+        #         dense → effective_abs only (percentile gate faded out)
+        threshold = effective_abs + (1.0 - density_t) * max(0.0, pct_threshold - effective_abs)
     else:
         pct_threshold = abs_threshold
-    threshold = max(pct_threshold, abs_threshold)
+        threshold = abs_threshold
 
     binary = (score >= threshold).astype(np.uint8) * 255
     binary[~valid_mask] = 0
@@ -542,19 +555,23 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
 
     for c in contours_raw:
         area = cv2.contourArea(c)
-        if area < params.min_contour_area:
-            reject_counts["area_too_small"] += 1
-            continue
         if area > params.max_contour_area:
             reject_counts["area_too_large"] += 1
             continue
 
-        # Mean combined score inside this contour
+        # Mean combined score inside this contour (computed before area
+        # check so high-confidence tiny contours can use a relaxed floor)
         contour_mask_tmp = np.zeros(gray.shape, dtype=np.uint8)
         cv2.drawContours(contour_mask_tmp, [c], 0, 255, cv2.FILLED)
         contour_scores = score[contour_mask_tmp > 0]
         mean_score = float(np.mean(contour_scores)) if contour_scores.size > 0 else 0.0
         high_confidence = mean_score >= shape_bypass_threshold
+
+        # Area check: high-confidence contours get a relaxed floor (1px²)
+        area_floor = 1 if high_confidence else params.min_contour_area
+        if area < area_floor:
+            reject_counts["area_too_small"] += 1
+            continue
 
         # Size-aware shape filtering
         skip_shape = area < 20 or high_confidence
