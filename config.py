@@ -53,6 +53,8 @@ PATCHING = {
     "min_std":      3.0,            # minimum grayscale std-dev
     "min_mean":     10.0,           # minimum grayscale mean (rejects black)
     "max_black_fraction": 0.25,     # reject if >25 % of pixels are near-zero
+    "max_noise":    4.5,            # reject extremely grainy patches
+                                    # (MAD of Laplacian; clean patches ≈ 3, grain ≈ 5+)
 }
 
 
@@ -166,6 +168,7 @@ PROXY_LABEL = {
     "texture_sigma":            2.0,
     "texture_threshold":        18.0,
 
+
     # ── Local contrast ratio gate ────────────────────────────────────────
     # σ for background estimation in LCR.  30px = 150mm at 5mm/px —
     # large enough to not track individual nodules but small enough to
@@ -234,6 +237,23 @@ TRAINING = {
     "val_split":        0.1,
     "test_split":       0.1,
     "random_seed":      42,
+
+    # Early stopping — halt training when val Dice stops improving
+    "early_stopping_patience": 15,
+
+    # ReduceLROnPlateau scheduler — cuts LR when val Dice plateaus
+    "scheduler_patience":  7,       # epochs without improvement before LR drop
+    "scheduler_factor":    0.5,     # multiply LR by this factor on plateau
+
+    # Loss weights (BCE + Dice combined loss)
+    "bce_weight":       0.5,
+    "dice_weight":      0.5,
+
+    # DataLoader workers (set 0 for debugging, 4+ for GPU training)
+    "num_workers":      4,
+
+    # Augmentation toggle (disable for ablation studies)
+    "augmentation":     True,
 }
 
 INFERENCE = {
