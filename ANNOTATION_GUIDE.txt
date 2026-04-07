@@ -1,0 +1,229 @@
+================================================================================
+  ANNOTATION GUIDE — Manual Mask Correction & Collaboration
+================================================================================
+
+TABLE OF CONTENTS
+  1. Quick Start
+  2. Editor Controls
+  3. CLI Commands
+  4. Collaboration Workflow
+  5. Tips
+
+================================================================================
+1. QUICK START
+================================================================================
+
+  # Open the editor on test patches
+  python 4_annotate.py edit --split test --annotator yourname
+
+  # Check your progress
+  python 4_annotate.py status
+
+  # Retrain with your corrected masks (automatic, no extra flags)
+  python 2_train.py
+
+================================================================================
+2. EDITOR CONTROLS
+================================================================================
+
+  MOUSE
+  ──────────────────────────────────────────────────────────────────────────
+  Left-click + drag       Paint nodule pixels onto the mask
+  Right-click + drag      Erase pixels from the mask
+  Scroll wheel            Zoom in/out (centered on cursor)
+
+  KEYBOARD
+  ──────────────────────────────────────────────────────────────────────────
+  SPACE (hold)            Peek — hide overlay to see raw image underneath
+                          Release to bring overlay back
+
+  C                       Toggle outline mode — shows mask as contour
+                          edges only instead of filled color, so you can
+                          see the image through the mask
+
+  O                       Toggle overlay on/off completely
+
+  [ / ]                   Decrease / increase overlay opacity
+
+  + / -                   Increase / decrease brush size (1px to 30px)
+                          Use 1-3px for small grain nodules
+
+  S                       Save current mask
+
+  N                       Next patch (auto-saves if modified)
+  P                       Previous patch (auto-saves if modified)
+
+  R                       Reset mask to original proxy label
+
+  Ctrl+Z                  Undo (up to 50 steps)
+  Ctrl+Y                  Redo
+
+  OVERLAY COLORS
+  ──────────────────────────────────────────────────────────────────────────
+  Green                   Original proxy label (from Step 1)
+  Cyan                    Pixels you added
+  Red                     Pixels you removed from the original
+
+================================================================================
+3. CLI COMMANDS
+================================================================================
+
+  ── EDIT (open the annotation editor) ──────────────────────────────────
+
+  python 4_annotate.py edit --split test --annotator alice
+      Open editor on test split (101 patches).
+      Options for --split: train, val, test, all
+
+  python 4_annotate.py edit --mosaic CameraMosaic_D1_Node3_L8 --annotator alice
+      Open editor filtered to a specific mosaic.
+
+  python 4_annotate.py edit --worst 20 --annotator alice
+      Open editor on the 20 worst-performing patches.
+
+  python 4_annotate.py edit --unannotated --annotator alice
+      Open editor on only patches that haven't been corrected yet.
+
+  python 4_annotate.py edit --start 10 --annotator alice --split test
+      Start from patch index 10 (skip the first 10).
+
+  python 4_annotate.py edit --bundle some_bundle.zip --annotator bob
+      Open a bundle .zip directly (for collaborators who don't have
+      the full dataset — see Collaboration Workflow below).
+
+  ── EXPORT (create a bundle to share with collaborators) ───────────────
+
+  python 4_annotate.py export --split test --output batch_for_bob.zip --annotator alice
+      Package test patches into a .zip for sharing.
+
+  python 4_annotate.py export --unannotated --output remaining.zip --annotator alice
+      Export only patches that haven't been corrected yet.
+
+  python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 --output node2.zip --annotator alice
+      Export patches from a specific mosaic.
+
+  python 4_annotate.py export --split test --max-patches 50 --output small_batch.zip --annotator alice
+      Limit the bundle to 50 patches.
+
+  python 4_annotate.py export --split test --output batch.zip --annotator alice --notes "Focus on small grain nodules"
+      Attach instructions for the collaborator.
+
+  ── IMPORT (bring in corrections from a collaborator) ──────────────────
+
+  python 4_annotate.py import --bundle corrected_by_bob.zip
+      Import corrected masks from a single bundle.
+
+  python 4_annotate.py import --bundle corrected_by_bob.zip --strategy overwrite
+      Always overwrite existing corrections.
+      Options for --strategy: newest (default), overwrite, skip
+
+  ── IMPORT-ALL (batch import from the inbox folder) ────────────────────
+
+  python 4_annotate.py import-all
+      Import all .zip files from outputs/annotation_inbox/.
+      Processed bundles are moved to annotation_inbox/imported/.
+
+  python 4_annotate.py import-all --strategy skip
+      Skip patches that already have corrections.
+
+  ── REPACK (collaborator sends corrections back) ──────────────────────
+
+  python 4_annotate.py repack --work-dir batch_for_bob_work --output corrected_by_bob.zip --annotator bob
+      Re-package a working directory into a .zip to send back.
+      The work directory is created automatically when you open
+      a bundle with "edit --bundle".
+
+  ── INSPECT (peek inside a bundle) ────────────────────────────────────
+
+  python 4_annotate.py inspect --bundle some_bundle.zip
+      Show bundle metadata (who created it, how many patches,
+      notes) without importing.
+
+  ── STATUS (check progress) ───────────────────────────────────────────
+
+  python 4_annotate.py status
+      Show how many patches have been annotated, by whom,
+      and how many remain.
+
+================================================================================
+4. COLLABORATION WORKFLOW
+================================================================================
+
+  You (lead annotator) have the full repo with TIF files and outputs.
+  Collaborators only need: the repo code + a .zip bundle you send them.
+
+  STEP-BY-STEP:
+
+  1. You export a batch:
+
+       python 4_annotate.py export --split test --output batch_for_bob.zip \
+           --annotator alice --notes "Focus on small grain nodules"
+
+  2. Send batch_for_bob.zip to Bob (Slack, email, Google Drive, etc.)
+
+  3. Bob opens the bundle directly:
+
+       python 4_annotate.py edit --bundle batch_for_bob.zip --annotator bob
+
+     This extracts to batch_for_bob_work/ next to the .zip.
+     Bob annotates in the GUI, closes when done.
+
+  4. Bob repacks his corrections:
+
+       python 4_annotate.py repack \
+           --work-dir batch_for_bob_work \
+           --output corrected_by_bob.zip \
+           --annotator bob
+
+  5. Bob sends corrected_by_bob.zip back to you.
+
+  6. You drop it in outputs/annotation_inbox/ and run:
+
+       python 4_annotate.py import-all
+
+     Or import directly:
+
+       python 4_annotate.py import --bundle corrected_by_bob.zip
+
+  7. Check progress:
+
+       python 4_annotate.py status
+
+  8. Retrain with corrected masks:
+
+       python 2_train.py
+
+     The training script automatically detects and uses corrected masks
+     from outputs/corrected_masks/. No flags or config changes needed.
+
+================================================================================
+5. TIPS
+================================================================================
+
+  - Start with the worst patches from inference to get the biggest
+    improvement per annotation:
+
+      python 4_annotate.py edit --worst 20 --annotator yourname
+
+  - Use outline mode (C key) most of the time — it lets you see the
+    actual nodule texture under the mask boundary.
+
+  - Hold Space to peek at the raw image when you're unsure if a
+    region is a real nodule or an artifact.
+
+  - Zoom in (scroll wheel) before annotating small grain nodules.
+    Use brush size 1-3px for these.
+
+  - Masks auto-save when you press N/P to navigate between patches,
+    but press S to save explicitly if you want to be sure.
+
+  - You don't need to correct every patch. Even correcting 50-100
+    of the worst patches can meaningfully improve the model.
+
+  - Split work across collaborators by mosaic:
+
+      python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 \
+          --output node3_for_bob.zip --annotator alice
+      python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 \
+          --output node2_for_carol.zip --annotator alice
+
+================================================================================

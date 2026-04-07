@@ -252,9 +252,18 @@ def main() -> None:
     train_transform = get_train_augmentations(patch_size) if use_aug else get_val_augmentations()
     val_transform   = get_val_augmentations()
 
-    train_ds = NoduleSegmentationDataset(train_recs, transform=train_transform)
-    val_ds   = NoduleSegmentationDataset(val_recs,   transform=val_transform)
-    test_ds  = NoduleSegmentationDataset(test_recs,  transform=val_transform)
+    # Use manually corrected masks when available (from Step 4)
+    corrected_dir = str(config.CORRECTED_MASKS_DIR) if config.CORRECTED_MASKS_DIR.exists() else None
+    if corrected_dir:
+        n_corrected = len(list(config.CORRECTED_MASKS_DIR.glob("*.png")))
+        logger.info(f"  Found {n_corrected} manually corrected masks — will prefer over proxy labels")
+
+    train_ds = NoduleSegmentationDataset(train_recs, transform=train_transform,
+                                         corrected_masks_dir=corrected_dir)
+    val_ds   = NoduleSegmentationDataset(val_recs,   transform=val_transform,
+                                         corrected_masks_dir=corrected_dir)
+    test_ds  = NoduleSegmentationDataset(test_recs,  transform=val_transform,
+                                         corrected_masks_dir=corrected_dir)
 
     num_workers = train_cfg.get("num_workers", 4)
     pin_memory  = (device == "cuda")

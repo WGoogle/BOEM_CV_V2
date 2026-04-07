@@ -27,12 +27,14 @@ RESULTS_DIR         = OUTPUT_DIR / "results"
 STEP_BY_STEP_DIR    = OUTPUT_DIR / "step_by_step_logs"
 LOGS_DIR            = OUTPUT_DIR / "logs"
 MANUAL_LABELS_DIR   = DATA_DIR / "manual_labels"
+CORRECTED_MASKS_DIR = OUTPUT_DIR / "corrected_masks"
+ANNOTATION_INBOX    = OUTPUT_DIR / "annotation_inbox"
 
 # Create all directories at import time
 for _d in [
     DATA_DIR, RAW_MOSAICS_DIR, OUTPUT_DIR, PREPROCESSED_DIR,
     PROXY_LABELS_DIR, PATCHES_DIR, CHECKPOINTS_DIR, RESULTS_DIR,
-    STEP_BY_STEP_DIR, LOGS_DIR,
+    STEP_BY_STEP_DIR, LOGS_DIR, ANNOTATION_INBOX,
 ]:
     _d.mkdir(parents=True, exist_ok=True)
 

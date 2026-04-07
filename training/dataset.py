@@ -14,6 +14,8 @@ Design notes:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 import torch
@@ -87,15 +89,20 @@ class NoduleSegmentationDataset(Dataset):
     transform : A.Compose | None
         Albumentations pipeline.  If *None*, raw tensors are returned
         with only ImageNet normalisation applied.
+    corrected_masks_dir : Path | str | None
+        Directory containing manually corrected masks.  If a corrected
+        mask exists for a patch, it is used instead of the proxy label.
     """
 
     def __init__(
         self,
         records: list[dict],
         transform: A.Compose | None = None,
+        corrected_masks_dir: str | None = None,
     ) -> None:
         self.records = records
         self.transform = transform or get_val_augmentations()
+        self.corrected_masks_dir = Path(corrected_masks_dir) if corrected_masks_dir else None
 
     def __len__(self) -> int:
         return len(self.records)
@@ -109,10 +116,17 @@ class NoduleSegmentationDataset(Dataset):
             raise FileNotFoundError(f"Image not found: {rec['image_path']}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Load mask (grayscale) → binary {0, 1}
-        mask = cv2.imread(rec["mask_path"], cv2.IMREAD_GRAYSCALE)
+        # Load mask: prefer corrected mask over proxy label
+        mask_path = rec["mask_path"]
+        if self.corrected_masks_dir:
+            patch_id = rec.get("patch_id", "")
+            corrected = self.corrected_masks_dir / f"{patch_id}.png"
+            if corrected.exists():
+                mask_path = str(corrected)
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
-            raise FileNotFoundError(f"Mask not found: {rec['mask_path']}")
+            raise FileNotFoundError(f"Mask not found: {mask_path}")
         mask = (mask > 127).astype(np.float32)
 
         # Apply augmentation (jointly to image + mask)
