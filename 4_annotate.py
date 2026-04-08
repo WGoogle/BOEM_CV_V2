@@ -179,16 +179,23 @@ def cmd_edit(args):
         records = filter_by_split(all_records, args.split)
         records = filter_worst_patches(records, args.worst)
         logger.info(f"Selected {len(records)} worst-performing patches")
-    elif args.unannotated:
-        records = filter_by_split(all_records, args.split)
-        tracker = AnnotationTracker(TRACKER_PATH)
-        all_ids = [r.get("patch_id") for r in records]
-        unannotated_ids = set(tracker.get_unannotated_ids(all_ids))
-        records = [r for r in records if r.get("patch_id") in unannotated_ids]
-        logger.info(f"Filtered to {len(records)} unannotated patches")
     else:
         records = filter_by_split(all_records, args.split)
         logger.info(f"Using {len(records)} patches from '{args.split}' split")
+
+    # Apply --unannotated filter (works with any of the above)
+    if args.unannotated:
+        # Check both tracker AND corrected masks on disk
+        tracker = AnnotationTracker(TRACKER_PATH)
+        tracked_ids = set(tracker.data.get("patches", {}).keys())
+        disk_ids = set()
+        if CORRECTED_MASKS_DIR.exists():
+            disk_ids = {p.stem for p in CORRECTED_MASKS_DIR.glob("*.png")}
+        done_ids = tracked_ids | disk_ids
+        before = len(records)
+        records = [r for r in records if r.get("patch_id") not in done_ids]
+        logger.info(f"Filtered to {len(records)} unannotated patches "
+                    f"(removed {before - len(records)} already corrected)")
 
     if not records:
         logger.info("No patches to annotate!")
@@ -214,17 +221,22 @@ def cmd_export(args):
     """Export patches as a shareable bundle."""
     all_records = load_all_records()
 
-    if args.unannotated:
-        records = filter_by_split(all_records, args.split)
-        tracker = AnnotationTracker(TRACKER_PATH)
-        all_ids = [r.get("patch_id") for r in records]
-        unannotated_ids = set(tracker.get_unannotated_ids(all_ids))
-        records = [r for r in records if r.get("patch_id") in unannotated_ids]
-        logger.info(f"Exporting {len(records)} unannotated patches")
-    elif args.mosaic:
+    if args.mosaic:
         records = filter_by_mosaic(all_records, args.mosaic)
     else:
         records = filter_by_split(all_records, args.split)
+
+    if args.unannotated:
+        tracker = AnnotationTracker(TRACKER_PATH)
+        tracked_ids = set(tracker.data.get("patches", {}).keys())
+        disk_ids = set()
+        if CORRECTED_MASKS_DIR.exists():
+            disk_ids = {p.stem for p in CORRECTED_MASKS_DIR.glob("*.png")}
+        done_ids = tracked_ids | disk_ids
+        before = len(records)
+        records = [r for r in records if r.get("patch_id") not in done_ids]
+        logger.info(f"Exporting {len(records)} unannotated patches "
+                    f"(removed {before - len(records)} already corrected)")
 
     if args.max_patches and len(records) > args.max_patches:
         records = records[:args.max_patches]
