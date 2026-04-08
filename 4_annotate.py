@@ -134,12 +134,26 @@ def cmd_edit(args):
             logger.info("Bundle is empty!")
             return
 
+        # Auto-resume: start at the first patch that hasn't been corrected yet
+        start = args.start
+        if start == 0 and masks_dir.exists():
+            corrected_ids = {p.stem for p in masks_dir.glob("*.png")}
+            if corrected_ids:
+                for i, rec in enumerate(records):
+                    if rec.get("patch_id") not in corrected_ids:
+                        start = i
+                        break
+                else:
+                    start = 0  # all done, start from beginning for review
+                logger.info(f"Resuming at patch {start + 1}/{len(records)} "
+                            f"({len(corrected_ids)} already corrected)")
+
         editor = AnnotationEditor(
             records=records,
             output_dir=masks_dir,
             annotator=args.annotator,
         )
-        editor.launch(start_idx=args.start)
+        editor.launch(start_idx=start)
 
         # After editor closes, tell user how to send corrections back
         work_dir = masks_dir.parent

@@ -176,13 +176,9 @@ TABLE OF CONTENTS
 
   1. Export batches (split by mosaic to avoid overlap):
 
-       python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 \
-           --output batch_for_bob.zip --annotator alice \
-           --notes "Bob: D1 Node3 patches"
+       python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 --output batch_for_Kailash.zip --annotator Brian --notes "Kailash: D1 Node3 patches"
 
-       python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 \
-           --output batch_for_craig.zip --annotator alice \
-           --notes "Craig: Node2 patches"
+       python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 --output batch_for_Thang.zip --annotator Brian --notes "Thang: Node2 patches"
 
   2. Send the .zip files to Bob and Craig (Slack, email, Google Drive, etc.)
 
@@ -256,7 +252,7 @@ TABLE OF CONTENTS
   ──────────────────────────────────────────────────────────────────────────
   From the repo root, run:
 
-    python 4_annotate.py edit --bundle ~/Downloads/batch_for_bob.zip --annotator bob
+    python 4_annotate.py edit --bundle ~/Downloads/batch_for_bob.zip --annotator bob (replace bob with whatever your name is / name assigned by Leader)
 
   Replace "bob" with your name. Replace the path with wherever you
   put the .zip file.
@@ -296,7 +292,22 @@ TABLE OF CONTENTS
       you have time for. Patches you skip will NOT be counted as
       annotated — they'll remain available for someone else.
 
-  When you're done, close the window.
+  When you're done for now, close the window. Your work is saved.
+
+  STEP 3b: COMING BACK LATER (RESUME)
+  ──────────────────────────────────────────────────────────────────────────
+  You do NOT have to finish everything in one sitting. To pick up
+  where you left off, just run the same command again:
+
+    python 4_annotate.py edit --bundle ~/Downloads/batch_for_bob.zip --annotator bob
+
+  It will:
+    - Detect your existing work folder (no re-extraction)
+    - Remember which patches you already corrected
+    - Auto-jump to the first patch you haven't annotated yet
+
+  You can close and reopen as many times as you want. Your saved
+  corrections are preserved in the _work/ folder until you repack.
 
   STEP 4: REPACK YOUR CORRECTIONS
   ──────────────────────────────────────────────────────────────────────────

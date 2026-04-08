@@ -294,10 +294,17 @@ def open_bundle(
         work_dir = bundle_path.parent / f"{bundle_path.stem}_work"
     work_dir = Path(work_dir)
     masks_dir = work_dir / "corrected_masks"
-    masks_dir.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(bundle_path, "r") as zf:
-        zf.extractall(work_dir)
+    # If work dir already exists, reuse it (resume session)
+    already_extracted = (work_dir / "patches").exists()
+    if already_extracted:
+        n_existing = len(list(masks_dir.glob("*.png"))) if masks_dir.exists() else 0
+        logger.info(f"Resuming from existing work directory: {work_dir}")
+        logger.info(f"  Already corrected: {n_existing} patches")
+    else:
+        masks_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(bundle_path, "r") as zf:
+            zf.extractall(work_dir)
 
     # Build records from extracted files
     patches_dir = work_dir / "patches"
