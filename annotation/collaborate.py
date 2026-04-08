@@ -158,14 +158,26 @@ def import_bundle(
     skipped = 0
     conflicts = 0
 
+    untouched = 0
+
     with zipfile.ZipFile(bundle_path, "r") as zf:
         # Read bundle metadata
         bundle_meta = json.loads(zf.read("bundle_metadata.json"))
         collaborator = bundle_meta.get("created_by", "unknown")
+
+        # Determine which patches were actually corrected
+        corrected_set = set(bundle_meta.get("corrected_ids", []))
+
+        total = bundle_meta.get("patch_count", 0)
+        n_corrected = len(corrected_set)
         logger.info(
             f"Importing bundle from '{collaborator}' "
-            f"({bundle_meta['patch_count']} patches)"
+            f"({total} patches total, {n_corrected} corrected)"
         )
+
+        # If no corrected_ids in metadata (old format bundle), fall back
+        # to checking mask_source in each patch's metadata
+        has_corrected_list = bool(corrected_set)
 
         # Find all mask files in the bundle
         mask_entries = [
@@ -180,6 +192,20 @@ def import_bundle(
                 continue
             patch_id = parts[1]
 
+            # Skip patches that were not corrected
+            if has_corrected_list:
+                if patch_id not in corrected_set:
+                    untouched += 1
+                    continue
+            else:
+                # Old format: check per-patch metadata
+                meta_entry = f"patches/{patch_id}/metadata.json"
+                if meta_entry in zf.namelist():
+                    patch_meta = json.loads(zf.read(meta_entry))
+                    if patch_meta.get("mask_source") == "untouched":
+                        untouched += 1
+                        continue
+
             dest_path = corrected_dir / f"{patch_id}.png"
 
             # Conflict resolution
@@ -188,7 +214,6 @@ def import_bundle(
                     skipped += 1
                     continue
                 elif merge_strategy == "newest":
-                    # Read metadata to compare timestamps
                     meta_entry = f"patches/{patch_id}/metadata.json"
                     if meta_entry in zf.namelist():
                         patch_meta = json.loads(zf.read(meta_entry))
@@ -219,7 +244,6 @@ def import_bundle(
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "merge_strategy": merge_strategy,
                 })
-                # Save updated metadata alongside mask
                 meta_dest = corrected_dir / f"{patch_id}_meta.json"
                 with open(meta_dest, "w") as f:
                     json.dump(patch_meta, f, indent=2)
@@ -228,6 +252,7 @@ def import_bundle(
 
     summary = {
         "imported": imported,
+        "untouched": untouched,
         "skipped": skipped,
         "conflicts_resolved": conflicts,
         "bundle_annotator": collaborator,
@@ -235,8 +260,8 @@ def import_bundle(
         "bundle_notes": bundle_meta.get("notes", ""),
     }
 
-    logger.info(f"  Imported: {imported} | Skipped: {skipped} | "
-                f"Conflicts resolved: {conflicts}")
+    logger.info(f"  Imported: {imported} | Untouched (ignored): {untouched} | "
+                f"Skipped: {skipped} | Conflicts resolved: {conflicts}")
     return summary
 
 
@@ -336,24 +361,34 @@ def repack_bundle(
     masks_dir = work_dir / "corrected_masks"
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Collect patch IDs
-    patch_ids = [d.name for d in sorted(patches_dir.iterdir()) if d.is_dir()]
+    # Collect all patch IDs and separate corrected from untouched
+    all_patch_ids = [d.name for d in sorted(patches_dir.iterdir()) if d.is_dir()]
+    corrected_ids = [
+        pid for pid in all_patch_ids
+        if (masks_dir / f"{pid}.png").exists()
+    ]
+    untouched_ids = [pid for pid in all_patch_ids if pid not in set(corrected_ids)]
 
     bundle_meta = {
         "created_by": annotator,
         "created_at": timestamp,
         "notes": f"Corrections by {annotator}",
-        "patch_count": len(patch_ids),
-        "patch_ids": patch_ids,
-        "format_version": "1.0",
+        "patch_count": len(all_patch_ids),
+        "corrected_count": len(corrected_ids),
+        "untouched_count": len(untouched_ids),
+        "corrected_ids": corrected_ids,
+        "untouched_ids": untouched_ids,
+        "patch_ids": all_patch_ids,
+        "format_version": "1.1",
     }
 
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("bundle_metadata.json", json.dumps(bundle_meta, indent=2))
 
-        for patch_id in patch_ids:
+        for patch_id in all_patch_ids:
             src_dir = patches_dir / patch_id
             prefix = f"patches/{patch_id}"
+            is_corrected = patch_id in set(corrected_ids)
 
             # Image (unchanged)
             img = src_dir / "image.png"
@@ -363,8 +398,8 @@ def repack_bundle(
             # Mask: use corrected if it exists, otherwise original
             corrected_mask = masks_dir / f"{patch_id}.png"
             original_mask = src_dir / "mask.png"
-            mask_to_use = corrected_mask if corrected_mask.exists() else original_mask
-            mask_source = "corrected" if corrected_mask.exists() else "proxy_label"
+            mask_to_use = corrected_mask if is_corrected else original_mask
+            mask_source = "corrected" if is_corrected else "untouched"
 
             if mask_to_use.exists():
                 zf.write(str(mask_to_use), f"{prefix}/mask.png")
@@ -376,16 +411,18 @@ def repack_bundle(
                 with open(meta_path) as f:
                     meta = json.load(f)
             history = meta.get("annotation_history", [])
-            history.append({
-                "action": "corrected" if corrected_mask.exists() else "reviewed",
-                "annotator": annotator,
-                "timestamp": timestamp,
-            })
+            if is_corrected:
+                history.append({
+                    "action": "corrected",
+                    "annotator": annotator,
+                    "timestamp": timestamp,
+                })
             meta["annotation_history"] = history
             meta["mask_source"] = mask_source
             zf.writestr(f"{prefix}/metadata.json", json.dumps(meta, indent=2))
 
-    logger.info(f"Repacked bundle: {len(patch_ids)} patches → {output_path}")
+    logger.info(f"Repacked bundle: {len(corrected_ids)} corrected, "
+                f"{len(untouched_ids)} untouched → {output_path}")
     return output_path
 
 

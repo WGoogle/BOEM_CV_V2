@@ -299,10 +299,11 @@ class AnnotationEditor:
 
         logger.info("Annotation editor launched. Controls:")
         logger.info("  Left-click: paint nodules | Right-click: erase")
-        logger.info("  Scroll: zoom | +/-: brush size | S: save | N/P: next/prev")
+        logger.info("  +/-: zoom in/out | Arrow keys: pan | S: save | N/P: next/prev")
         logger.info("  SPACE (hold): peek at raw image underneath overlay")
         logger.info("  C: toggle outline mode (contours only, no fill)")
         logger.info("  O: toggle overlay | [/]: opacity | Ctrl+Z: undo | R: reset")
+        logger.info("  Brush size: use the slider at the bottom")
 
         plt.show()
 
@@ -368,21 +369,27 @@ class AnnotationEditor:
         elif key == "r":
             self._reset_mask()
         elif key in ("+", "="):
-            self.brush_radius = min(self.brush_radius + 1, self.max_brush)
-            self._brush_slider.set_val(self.brush_radius)
+            self._zoom(zoom_in=True)
         elif key in ("-", "_"):
-            self.brush_radius = max(self.brush_radius - 1, self.min_brush)
-            self._brush_slider.set_val(self.brush_radius)
+            self._zoom(zoom_in=False)
+        elif key == "left":
+            self._pan(-1, 0)
+        elif key == "right":
+            self._pan(1, 0)
+        elif key == "up":
+            self._pan(0, -1)
+        elif key == "down":
+            self._pan(0, 1)
         elif key == "[":
             self.overlay_alpha = max(0.1, self.overlay_alpha - 0.05)
             self._refresh()
         elif key == "]":
             self.overlay_alpha = min(0.9, self.overlay_alpha + 0.05)
             self._refresh()
-        elif key == "ctrl+z":
+        elif key in ("z", "ctrl+z"):
             self._undo()
             self._refresh()
-        elif key == "ctrl+y":
+        elif key in ("y", "ctrl+y"):
             self._redo()
             self._refresh()
 
@@ -392,29 +399,82 @@ class AnnotationEditor:
             self._refresh()
 
     def _on_scroll(self, event):
-        """Zoom in/out centred on cursor position."""
-        if event.inaxes != self.ax:
-            return
-        base_scale = 1.3
+        """Scroll is disabled — use +/- to zoom instead."""
+        pass
+
+    def _clamp_view(self):
+        """Clamp the current view so it never leaves the image bounds."""
+        h, w = self.image.shape[:2]
+        xlim = list(self.ax.get_xlim())
+        ylim = list(self.ax.get_ylim())
+
+        # Current view size
+        vw = xlim[1] - xlim[0]
+        vh = ylim[0] - ylim[1]  # y is inverted (ylim[0] > ylim[1])
+
+        # Don't allow zooming out past the full image
+        vw = min(vw, w)
+        vh = min(vh, h)
+
+        # Clamp x
+        if xlim[0] < -0.5:
+            xlim[0] = -0.5
+            xlim[1] = xlim[0] + vw
+        if xlim[1] > w - 0.5:
+            xlim[1] = w - 0.5
+            xlim[0] = xlim[1] - vw
+
+        # Clamp y (inverted: ylim[0] is bottom = higher number)
+        if ylim[1] < -0.5:
+            ylim[1] = -0.5
+            ylim[0] = ylim[1] + vh
+        if ylim[0] > h - 0.5:
+            ylim[0] = h - 0.5
+            ylim[1] = ylim[0] - vh
+
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
+
+    def _zoom(self, zoom_in: bool = True):
+        """Zoom in/out centered on the current view, clamped to image."""
+        scale = 1 / 1.4 if zoom_in else 1.4
+        h, w = self.image.shape[:2]
+
         cur_xlim = self.ax.get_xlim()
         cur_ylim = self.ax.get_ylim()
-        xdata, ydata = event.xdata, event.ydata
 
-        if event.button == "up":
-            scale = 1 / base_scale
-        else:
-            scale = base_scale
+        # Center of current view
+        cx = (cur_xlim[0] + cur_xlim[1]) / 2
+        cy = (cur_ylim[0] + cur_ylim[1]) / 2
 
         new_width = (cur_xlim[1] - cur_xlim[0]) * scale
-        new_height = (cur_ylim[0] - cur_ylim[1]) * scale  # y is inverted
+        new_height = (cur_ylim[0] - cur_ylim[1]) * scale  # y inverted
 
-        relx = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
-        rely = (cur_ylim[0] - ydata) / (cur_ylim[0] - cur_ylim[1])
+        # Don't zoom out past full image
+        new_width = min(new_width, w)
+        new_height = min(new_height, h)
 
-        self.ax.set_xlim([xdata - new_width * (1 - relx),
-                          xdata + new_width * relx])
-        self.ax.set_ylim([ydata + new_height * (1 - rely),
-                          ydata - new_height * rely])
+        # Don't zoom in past 1:1 pixel level (4px minimum view)
+        new_width = max(new_width, 4)
+        new_height = max(new_height, 4)
+
+        self.ax.set_xlim(cx - new_width / 2, cx + new_width / 2)
+        self.ax.set_ylim(cy + new_height / 2, cy - new_height / 2)
+        self._clamp_view()
+        self.fig.canvas.draw_idle()
+
+    def _pan(self, dx: int, dy: int):
+        """Pan the view by a fraction of the current viewport, clamped to image."""
+        cur_xlim = self.ax.get_xlim()
+        cur_ylim = self.ax.get_ylim()
+
+        # Pan by 20% of current view size
+        step_x = (cur_xlim[1] - cur_xlim[0]) * 0.2 * dx
+        step_y = (cur_ylim[0] - cur_ylim[1]) * 0.2 * dy  # y inverted
+
+        self.ax.set_xlim(cur_xlim[0] + step_x, cur_xlim[1] + step_x)
+        self.ax.set_ylim(cur_ylim[0] + step_y, cur_ylim[1] + step_y)
+        self._clamp_view()
         self.fig.canvas.draw_idle()
 
     def _on_brush_slider(self, val):
@@ -496,7 +556,7 @@ class AnnotationEditor:
         self.fig.text(
             0.5, 0.96,
             f"Green=proxy label  Cyan=added  Red=removed  |  "
-            f"Left=paint  Right=erase  Scroll=zoom  |  "
+            f"Left=paint  Right=erase  +/-=zoom  Arrows=pan  |  "
             f"SPACE=peek  C=outline  [{mode}]{peek}",
             ha="center", fontsize=8, color="gray",
         )

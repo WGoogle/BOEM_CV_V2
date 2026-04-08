@@ -247,13 +247,12 @@ def cmd_import(args):
         merge_strategy=args.strategy,
     )
 
-    # Update tracker for imported patches
+    # Update tracker only for actually corrected patches
     tracker = AnnotationTracker(TRACKER_PATH)
-    # Re-read the imported metadata to find patch IDs
-    from annotation.collaborate import list_bundle_contents
     meta = list_bundle_contents(bundle_path)
     annotator = meta.get("created_by", "unknown")
-    for pid in meta.get("actual_patches_found", []):
+    corrected_ids = meta.get("corrected_ids", [])
+    for pid in corrected_ids:
         tracker.record_annotation(pid, annotator)
 
     logger.info(f"Import summary: {json.dumps(summary, indent=2)}")
@@ -283,10 +282,11 @@ def cmd_import_all(args):
         )
         total_imported += summary["imported"]
 
-        # Update tracker
+        # Update tracker only for actually corrected patches
         meta = list_bundle_contents(zip_path)
         annotator = meta.get("created_by", "unknown")
-        for pid in meta.get("actual_patches_found", []):
+        corrected_ids = meta.get("corrected_ids", [])
+        for pid in corrected_ids:
             tracker.record_annotation(pid, annotator)
 
         # Move processed bundle to imported/
