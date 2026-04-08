@@ -537,15 +537,30 @@ class AnnotationEditor:
         self._update_title()
         self.fig.canvas.draw_idle()
 
+    def _count_corrected(self) -> int:
+        """Count how many patches have a corrected mask on disk."""
+        count = 0
+        for rec in self.records:
+            pid = rec.get("patch_id", "")
+            if pid in self.modified_patches:
+                count += 1
+            elif (self.output_dir / f"{pid}.png").exists():
+                count += 1
+        return count
+
     def _update_title(self):
         rec = self.records[self.current_idx]
         patch_id = rec.get("patch_id", f"patch_{self.current_idx:04d}")
         modified = " [MODIFIED]" if not np.array_equal(self.mask, self.original_mask) else ""
         saved = " [SAVED]" if patch_id in self.modified_patches else ""
         n_pixels = int(self.mask.sum()) if self.mask is not None else 0
+        done = self._count_corrected()
+        total = len(self.records)
+        remaining = total - done
         self.ax.set_title(
-            f"[{self.current_idx + 1}/{len(self.records)}] {patch_id}"
-            f"  |  brush={self.brush_radius}px  |  mask={n_pixels}px"
+            f"[{self.current_idx + 1}/{total}] {patch_id}"
+            f"  |  Done: {done}  Remaining: {remaining}"
+            f"  |  mask={n_pixels}px"
             f"  |  alpha={self.overlay_alpha:.2f}{modified}{saved}",
             fontsize=10,
         )
