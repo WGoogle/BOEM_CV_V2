@@ -282,12 +282,21 @@ class AnnotationEditor:
         self._btn_toggle = Button(ax_toggle, "Toggle (O)")
         self._btn_reset = Button(ax_reset, "Reset (R)")
 
-        self._btn_save.on_clicked(lambda _: self._do_save())
-        self._btn_prev.on_clicked(lambda _: self._go_prev())
-        self._btn_next.on_clicked(lambda _: self._go_next())
-        self._btn_undo.on_clicked(lambda _: (self._undo(), self._refresh()))
-        self._btn_toggle.on_clicked(lambda _: self._toggle_overlay())
-        self._btn_reset.on_clicked(lambda _: self._reset_mask())
+        # Button callbacks — always refocus the main axes afterward
+        # so keyboard shortcuts (arrow keys, etc.) keep working
+        def _click_and_refocus(func):
+            def wrapper(_event):
+                func()
+                self.fig.canvas.manager.window.focus_force()
+                self.ax.figure.canvas.draw_idle()
+            return wrapper
+
+        self._btn_save.on_clicked(_click_and_refocus(self._do_save))
+        self._btn_prev.on_clicked(_click_and_refocus(self._go_prev))
+        self._btn_next.on_clicked(_click_and_refocus(self._go_next))
+        self._btn_undo.on_clicked(_click_and_refocus(lambda: (self._undo(), self._refresh())))
+        self._btn_toggle.on_clicked(_click_and_refocus(self._toggle_overlay))
+        self._btn_reset.on_clicked(_click_and_refocus(self._reset_mask))
 
         # ── Event connections ───────────────────────────────────────
         self.fig.canvas.mpl_connect("button_press_event", self._on_press)
@@ -412,25 +421,26 @@ class AnnotationEditor:
         vw = xlim[1] - xlim[0]
         vh = ylim[0] - ylim[1]  # y is inverted (ylim[0] > ylim[1])
 
-        # Don't allow zooming out past the full image
-        vw = min(vw, w)
-        vh = min(vh, h)
+        # If view is >= full image, just reset to full view (no panning needed)
+        if vw >= w:
+            xlim = [-0.5, w - 0.5]
+        else:
+            if xlim[0] < -0.5:
+                xlim[0] = -0.5
+                xlim[1] = xlim[0] + vw
+            if xlim[1] > w - 0.5:
+                xlim[1] = w - 0.5
+                xlim[0] = xlim[1] - vw
 
-        # Clamp x
-        if xlim[0] < -0.5:
-            xlim[0] = -0.5
-            xlim[1] = xlim[0] + vw
-        if xlim[1] > w - 0.5:
-            xlim[1] = w - 0.5
-            xlim[0] = xlim[1] - vw
-
-        # Clamp y (inverted: ylim[0] is bottom = higher number)
-        if ylim[1] < -0.5:
-            ylim[1] = -0.5
-            ylim[0] = ylim[1] + vh
-        if ylim[0] > h - 0.5:
-            ylim[0] = h - 0.5
-            ylim[1] = ylim[0] - vh
+        if vh >= h:
+            ylim = [h - 0.5, -0.5]
+        else:
+            if ylim[1] < -0.5:
+                ylim[1] = -0.5
+                ylim[0] = ylim[1] + vh
+            if ylim[0] > h - 0.5:
+                ylim[0] = h - 0.5
+                ylim[1] = ylim[0] - vh
 
         self.ax.set_xlim(xlim)
         self.ax.set_ylim(ylim)
