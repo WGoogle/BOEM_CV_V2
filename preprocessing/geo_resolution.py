@@ -5,15 +5,9 @@ Reads the ModelTransformationTag (tag 34264) or ModelPixelScaleTag
 (tag 33550) from a TIFF file and computes meters_per_pixel using the
 embedded coordinate reference system.
 
-Fail safe is a hardcoded value for meters_per_pixel. 
-
-Reason why this is an important addition is because on the researcher handoff i saw that it was 
-.05 meters/pixel which was warned that this varies, so I thought since we have all the geodata
-in the .tif files, might as well use them to improve our preprocessing. 
-
+Fail safe is a hardcoded value for meters_per_pixel of .05 
 """
 from __future__ import annotations
-
 import logging
 import math
 import struct
@@ -23,7 +17,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-def extract_meters_per_pixel(filepath: Path, fallback: float | None = None) -> Optional[float]:
+def extract_meters_per_pixel(filepath, fallback):
     filepath = Path(filepath)
     suffix = filepath.suffix.lower()
 
@@ -37,13 +31,10 @@ def extract_meters_per_pixel(filepath: Path, fallback: float | None = None) -> O
         logger.warning(f"{filepath.name}: failed to read TIFF tags — {exc}")
         return fallback
 
-    #  ModelTransformationTag (34264)
     if 34264 in tags:
         mpp = _mpp_from_transformation_tag(tags, filepath.name)
         if mpp is not None:
             return mpp
-
-    # ModelPixelScaleTag (33550)
     if 33550 in tags:
         mpp = _mpp_from_pixel_scale_tag(tags, filepath.name)
         if mpp is not None:
@@ -61,9 +52,8 @@ _TYPE_SIZE = {
     11: 4, 12: 8,                       # FLOAT, DOUBLE
 }
 
-
-def _read_tiff_tags(filepath: Path) -> dict:
-    """Read IFD0 tags from a TIFF file.  Returns {tag_id: raw_bytes}."""
+def _read_tiff_tags(filepath):
+    # Read IFD0 tags from a TIFF file
     with open(filepath, "rb") as f:
         header = f.read(4)
         bo = "<" if header[:2] == b"II" else ">"
@@ -98,20 +88,16 @@ def _read_tiff_tags(filepath: Path) -> dict:
 
     return tags
 
-
-def _unpack_doubles(tag_entry: tuple, n: int) -> list[float]:
-    """Unpack *n* IEEE-754 doubles from a tag entry."""
+def _unpack_doubles(tag_entry, n):
     bo, dtype, count, data = tag_entry
     return [struct.unpack(bo + "d", data[i * 8 : (i + 1) * 8])[0] for i in range(n)]
 
 
-def _unpack_shorts(tag_entry: tuple, n: int) -> list[int]:
+def _unpack_shorts(tag_entry, n):
     bo, dtype, count, data = tag_entry
     return [struct.unpack(bo + "H", data[i * 2 : (i + 1) * 2])[0] for i in range(n)]
 
-
-def _get_latitude(tags: dict) -> Optional[float]:
-    """Try to extract a reference latitude from the geo metadata."""
+def _get_latitude(tags):
     # From ModelTransformationTag: ty = matrix[7] is the latitude origin
     if 34264 in tags:
         doubles = _unpack_doubles(tags[34264], 16)
@@ -131,8 +117,7 @@ def _get_latitude(tags: dict) -> Optional[float]:
     return None
 
 
-def _is_geographic_crs(tags: dict) -> bool:
-    """Check if GeoKeyDirectoryTag indicates a geographic (degree) CRS."""
+def _is_geographic_crs(tags):
     if 34735 not in tags:
         return True  # assume geographic if we can't tell
     shorts = _unpack_shorts(tags[34735], tags[34735][2])
@@ -141,25 +126,24 @@ def _is_geographic_crs(tags: dict) -> bool:
         key_id = shorts[i] if i < len(shorts) else 0
         if key_id == 1024:
             value = shorts[i + 3] if i + 3 < len(shorts) else 0
-            return value == 2  # ModelTypeGeographic
-    return True  # default assumption
+            return value == 2 
+    return True 
 
 
-def _mpp_from_transformation_tag(tags: dict, name: str) -> Optional[float]:
-    """Compute m/px from the 4×4 ModelTransformationTag."""
+def _mpp_from_transformation_tag(tags, name):
+    # Compute m/px from the 4×4 ModelTransformationTag
     doubles = _unpack_doubles(tags[34264], 16)
     # 4×4 row-major: [a, b, 0, tx,  e, f, 0, ty,  ...]
     a, b = doubles[0], doubles[1]
     e, f = doubles[4], doubles[5]
 
     if _is_geographic_crs(tags):
-        # Units are degrees — convert to metres
         deg_per_px_x = math.sqrt(a ** 2 + b ** 2)
         deg_per_px_y = math.sqrt(e ** 2 + f ** 2)
 
         lat = _get_latitude(tags)
         if lat is None:
-            lat = 0.0  # equator fallback
+            lat = 0.0  
 
         m_per_deg_lat = 111_320.0
         m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat))
@@ -185,9 +169,8 @@ def _mpp_from_transformation_tag(tags: dict, name: str) -> Optional[float]:
         )
         return mpp
 
-
-def _mpp_from_pixel_scale_tag(tags: dict, name: str) -> Optional[float]:
-    """Compute m/px from ModelPixelScaleTag (ScaleX, ScaleY, ScaleZ)."""
+def _mpp_from_pixel_scale_tag(tags, name):
+    # Compute m/px from ModelPixelScaleTag (ScaleX, ScaleY, ScaleZ)
     doubles = _unpack_doubles(tags[33550], 3)
     sx, sy = doubles[0], doubles[1]
 

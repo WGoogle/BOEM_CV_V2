@@ -4,7 +4,6 @@ Individual CV Preprocessing Steps + Proxy Label Generation
 Each filter takes a BGR np.ndarray and a TunedParams and returns a BGR np.ndarray.
 """
 from __future__ import annotations
-
 import logging
 import cv2
 import numpy as np
@@ -14,12 +13,9 @@ from .auto_tuner import TunedParams
 
 logger = logging.getLogger(__name__)
 
-def gray_world_white_balance(image: np.ndarray, params: TunedParams) -> np.ndarray:
-    """
-    Gray-world white balance to compensate AUV/ROV lighting bias.
-    Scales each BGR channel so that the per-channel means are equal,
-    approximating the assumption that the average scene reflectance is achromatic.
-    """
+def gray_world_white_balance(image, params: TunedParams):
+   # Gray-world white balance to compensate AUV/ROV lighting bias.
+
     img = image.astype(np.float32)
     means = img.mean(axis=(0, 1))  # (B, G, R)
     gray_mean = means.mean()
@@ -32,13 +28,8 @@ def gray_world_white_balance(image: np.ndarray, params: TunedParams) -> np.ndarr
     balanced = np.clip(img * scale[np.newaxis, np.newaxis, :], 0, 255)
     return balanced.astype(np.uint8)
 
-def illumination_normalize(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -> np.ndarray:
-    """
-    Flatten the AUV light-cone gradient by dividing out low-frequency illumination.
-
-    Estimates the illumination field with a large Gaussian blur (sigma ≈ 51px, capturing gradients over ~300px) 
-    then divides L by it and rescales to the original mean.
-    """
+def illumination_normalize(image, params: TunedParams, preprocess_cfg):
+    # Flatten the AUV light-cone gradient by dividing out low-frequency illumination.
     sigma = preprocess_cfg.get("illum_norm_sigma", 51.0)
 
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -49,7 +40,7 @@ def illumination_normalize(image: np.ndarray, params: TunedParams, preprocess_cf
     valid_mask = l_f > 8
     valid_px = l_f[valid_mask]
     if valid_px.size < 100:
-        return image  # patch is nearly empty, skip
+        return image  
 
     valid_mean = float(np.mean(valid_px))
 
@@ -57,19 +48,16 @@ def illumination_normalize(image: np.ndarray, params: TunedParams, preprocess_cf
     l_filled = l_f.copy()
     l_filled[~valid_mask] = valid_mean
 
-    # Estimate illumination field
     illum = cv2.GaussianBlur(l_filled, (0, 0), sigma)
-    illum = np.clip(illum, 1.0, None)  # prevent division by zero
+    illum = np.clip(illum, 1.0, None) 
 
-    # Divide and rescale to original mean brightness
     l_norm = (l_f / illum) * valid_mean
     l_norm[~valid_mask] = 0  # restore black borders
     l_norm = np.clip(l_norm, 0, 255).astype(np.uint8)
 
     return cv2.cvtColor(cv2.merge([l_norm, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
-def clahe_lab(image: np.ndarray, params: TunedParams) -> np.ndarray:
-    # CLAHE on the L channel of LAB colour space.
+def clahe_lab(image, params: TunedParams):
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_orig = lab[:, :, 0].copy()
     clahe = cv2.createCLAHE(
@@ -81,9 +69,7 @@ def clahe_lab(image: np.ndarray, params: TunedParams) -> np.ndarray:
     lab[:, :, 0] = cv2.addWeighted(l_clahe, alpha, l_orig, 1.0 - alpha, 0)
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-def bilateral_denoise(image: np.ndarray, params: TunedParams) -> np.ndarray:
-    # Bilateral filter — edge-preserving noise suppression.
-
+def bilateral_denoise(image, params: TunedParams):
     return cv2.bilateralFilter(
         image,
         d=params.bilateral_d,
@@ -91,14 +77,9 @@ def bilateral_denoise(image: np.ndarray, params: TunedParams) -> np.ndarray:
         sigmaSpace=params.bilateral_sigma_space,
     )
 
-def multi_scale_retinex(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -> np.ndarray:
+def multi_scale_retinex(image, params: TunedParams, preprocess_cfg):
     """
     Multi-Scale Retinex on the L channel — reflectance/illumination separation.
-    Retinex theory: an image I = R * L, where R is reflectance (material
-    property) and L is illumination (lighting + shading from 3D relief).
-    In log domain: log(R) = log(I) - log(L).  We estimate L at multiple
-    Gaussian scales and average the resulting reflectance images.
-
     This intrinsically suppresses:
     - AUV light-cone gradients (large-scale illumination)
     - Shadow artifacts from sediment bumps/divots (medium-scale shading)
@@ -170,13 +151,8 @@ def multi_scale_retinex(image: np.ndarray, params: TunedParams, preprocess_cfg: 
     return cv2.cvtColor(cv2.merge([l_retinex, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
 
-def sediment_fade(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -> np.ndarray:
-    """
-    Fade bright sediment toward a smooth background without touching nodules.
-
-    The L-threshold is computed adaptively from the patch's own brightness distribution: only pixels above the median L value can be faded. 
-    This guarantees that nodules are never brightened. 
-    """
+def sediment_fade(image, params: TunedParams, preprocess_cfg):
+    # Fade bright sediment toward a smooth background without touching nodules.
     fade_sigma = preprocess_cfg.get("sediment_fade_blur_sigma", 15.0)
     fade_strength = preprocess_cfg.get("sediment_fade_strength", 0.6)
 
@@ -193,8 +169,6 @@ def sediment_fade(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) 
     else:
         l_threshold = preprocess_cfg.get("sediment_l_threshold", 80)
 
-    # Soft sediment mask: ramps from 0 at l_threshold to 1 at l_threshold+40.
-    # The wider ramp (40 vs old 20) + higher adaptive threshold keeps dark nodule pixels firmly at 0. Minimal mask blur (sigma=2) prevents bleed.
     sediment_mask = np.clip((l_f - l_threshold) / 40.0, 0, 1)
     sediment_mask = cv2.GaussianBlur(sediment_mask, (0, 0), 2.0)
 
@@ -204,12 +178,8 @@ def sediment_fade(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) 
 
     return cv2.cvtColor(cv2.merge([l_faded, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
-def unsharp_mask(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -> np.ndarray:
-    """
-    Edge-selective unsharp mask — sharpens nodule boundaries, not grain.
-    Uses a two-sigma approach: the sharpening kernel targets nodule-edge scale (sigma≈2px),
-    while a grain-suppression guard computed at fine scale (sigma≈0.7px) prevents amplification of sediment texture.
-    """
+def unsharp_mask(image, params: TunedParams, preprocess_cfg):
+    # enhances contrast
     sigma = preprocess_cfg.get("unsharp_sigma", 2.0)
     strength = params.unsharp_strength
 
@@ -218,15 +188,12 @@ def unsharp_mask(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -
     l_f = l_ch.astype(np.float32)
 
     blur = cv2.GaussianBlur(l_f, (0, 0), sigma)
-    detail = l_f - blur  # high-pass at nodule-edge scale
+    detail = l_f - blur  
 
-    # Edge magnitude — stronger at real boundaries, weaker at grain
     grad_x = cv2.Sobel(l_f, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(l_f, cv2.CV_32F, 0, 1, ksize=3)
     edge_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
 
-    # Soft gate: ramp from 0 at low edges to 1 at strong edges.
-    # Threshold at the median edge magnitude of non-black pixels.
     valid = l_ch > 8
     if valid.any():
         edge_thresh = float(np.median(edge_mag[valid]))
@@ -241,12 +208,8 @@ def unsharp_mask(image: np.ndarray, params: TunedParams, preprocess_cfg: dict) -
 
 # BELOW ARE PROXY LABELLING FEATURES    
 
-def _feature_tophat(blurred: np.ndarray, radii: list, texture_sigma: float, texture_threshold: float) -> np.ndarray:
-    """
-    Multi-scale black top-hat with texture gating.
-    Returns a float32 feature map where high values indicate dark compact blobs (nodule candidates).  
-    The texture gate suppresses responses in grainy sediment regions where top-hat fires on grain, not nodules.
-    """
+def _feature_tophat(blurred, radii, texture_sigma, texture_threshold):
+    # The texture gate suppresses responses in grainy sediment regions where top-hat fires on grain, not nodules.
     combined = np.zeros(blurred.shape, dtype=np.float32)
     for r in radii:
         se_size = 2 * r + 1
@@ -255,7 +218,6 @@ def _feature_tophat(blurred: np.ndarray, radii: list, texture_sigma: float, text
         tophat = cv2.subtract(closed, blurred).astype(np.float32)
         combined = np.maximum(combined, tophat)
 
-    # Texture gate: suppress response where local texture is high
     blur_fine = cv2.GaussianBlur(blurred.astype(np.float32), (0, 0), texture_sigma)
     local_diff = np.abs(blurred.astype(np.float32) - blur_fine)
     texture_score = cv2.GaussianBlur(local_diff, (0, 0), texture_sigma * 2.0)
@@ -264,13 +226,8 @@ def _feature_tophat(blurred: np.ndarray, radii: list, texture_sigma: float, text
 
     return combined
 
-def _feature_local_contrast_ratio(gray_f: np.ndarray, bg_sigma: float, valid_mask: np.ndarray) -> np.ndarray:
-    """
-    Local contrast ratio — how dark each pixel is relative to its local background.
-    LCR = (local_background - pixel) / local_background
-
-    High LCR means the pixel is much darker than its surroundings.
-    """
+def _feature_local_contrast_ratio(gray_f, bg_sigma, valid_mask):
+    # Local contrast ratio — how dark each pixel is relative to its local background.
     # Estimate local background brightness with a large-kernel blur
     # Fill invalid (border) pixels with valid mean to avoid edge artifacts
     gray_filled = gray_f.copy()
@@ -285,7 +242,7 @@ def _feature_local_contrast_ratio(gray_f: np.ndarray, bg_sigma: float, valid_mas
     lcr[~valid_mask] = 0
     return lcr
 
-def _feature_dog(gray_f: np.ndarray, sigma_pairs: list) -> np.ndarray:
+def _feature_dog(gray_f, sigma_pairs):
     """
     Difference of Gaussians (DoG) blob detection — scale-normalized.
     DoG approximates the Laplacian of Gaussian (LoG), the theoretically optimal blob detector.  
@@ -296,46 +253,35 @@ def _feature_dog(gray_f: np.ndarray, sigma_pairs: list) -> np.ndarray:
     for s_small, s_large in sigma_pairs:
         g_small = cv2.GaussianBlur(gray_f, (0, 0), s_small)
         g_large = cv2.GaussianBlur(gray_f, (0, 0), s_large)
-        # DoG: negative = dark blob on bright background
         dog = g_large - g_small
-        # σ-normalize: multiply by average σ so different scales are comparable
         sigma_avg = (s_small + s_large) / 2.0
         dog_norm = dog * sigma_avg
-        # Only keep dark-blob responses (positive after flip)
         combined = np.maximum(combined, np.clip(dog_norm, 0, None))
 
     return combined
 
 
-def _feature_smoothness(gray_f: np.ndarray, inner_sigma: float, outer_sigma: float, valid_mask: np.ndarray) -> np.ndarray:
+def _feature_smoothness(gray_f, inner_sigma, outer_sigma, valid_mask):
     """
     Smoothness score — nodules have smooth surfaces vs. grainy sediment.
     Computes the ratio of local variance at two scales:
     - inner_sigma (fine): captures sediment grain texture
     - outer_sigma (coarse): captures broader intensity variation
-
-    The score = 1 - (fine_var / (coarse_var + eps)), clamped to [0, 1].
-
-    High smoothness = smooth dark region = likely nodule.
-    Low smoothness = textured region = likely sediment grain.
     """
-    # Fine-scale local variance
     mean_fine = cv2.GaussianBlur(gray_f, (0, 0), inner_sigma)
     sq_fine = cv2.GaussianBlur(gray_f ** 2, (0, 0), inner_sigma)
     var_fine = np.clip(sq_fine - mean_fine ** 2, 0, None)
 
-    # Coarse-scale local variance
     mean_coarse = cv2.GaussianBlur(gray_f, (0, 0), outer_sigma)
     sq_coarse = cv2.GaussianBlur(gray_f ** 2, (0, 0), outer_sigma)
     var_coarse = np.clip(sq_coarse - mean_coarse ** 2, 0, None)
 
-    # Smoothness: low fine variance relative to coarse variance
     smoothness = np.clip(1.0 - var_fine / (var_coarse + 1e-4), 0, 1)
     smoothness[~valid_mask] = 0
     return smoothness
 
-def _normalize_feature(feat: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-    """Normalize a feature map to [0, 1] using robust percentile scaling on valid pixels."""
+def _normalize_feature(feat, valid_mask):
+    # Normalize a feature map to [0, 1] using robust percentile scaling on valid pixels
     valid_px = feat[valid_mask]
     if valid_px.size < 100:
         return np.zeros_like(feat)
@@ -347,7 +293,7 @@ def _normalize_feature(feat: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     normed[~valid_mask] = 0
     return normed
 
-def _watershed_split(binary: np.ndarray, patch_bgr: np.ndarray, min_distance: int) -> np.ndarray:
+def _watershed_split(binary, patch_bgr, min_distance):
     """
     Marker-controlled watershed to separate touching nodules.
     Only applied to connected components large enough to plausibly contain multiple nodules.
@@ -358,7 +304,6 @@ def _watershed_split(binary: np.ndarray, patch_bgr: np.ndarray, min_distance: in
     min_single_area = max(50, int(np.pi * min_distance ** 2))
     min_split_area = min_single_area * 4  # must be ~4x a single nodule
 
-    # Label all connected components
     n_cc, cc_labels = cv2.connectedComponents(binary)
     result = binary.copy()
 
@@ -366,15 +311,12 @@ def _watershed_split(binary: np.ndarray, patch_bgr: np.ndarray, min_distance: in
         cc_mask = (cc_labels == label_id).astype(np.uint8) * 255
         cc_area = np.sum(cc_mask > 0)
 
-        # Skip small components — no need to split
         if cc_area < min_split_area:
             continue
 
-        # Distance transform on this component only
         dist = cv2.distanceTransform(cc_mask, cv2.DIST_L2, 5)
         max_dist = float(dist.max())
 
-        # If the blob is thin (max distance < min_distance), don't split
         if max_dist < min_distance:
             continue
 
@@ -385,18 +327,16 @@ def _watershed_split(binary: np.ndarray, patch_bgr: np.ndarray, min_distance: in
         dist_dilated = cv2.dilate(
             dist, np.ones((peak_kernel, peak_kernel), np.uint8),
         )
-        # Peaks: local maxima with meaningful distance from background
         local_max = (
             (dist == dist_dilated) & (dist > max(2.0, max_dist * 0.3))
         ).astype(np.uint8)
 
         n_peaks, peak_labels = cv2.connectedComponents(local_max)
-        # Need at least 2 peaks to warrant splitting
         if n_peaks <= 2:
             continue
 
         # Set up watershed markers
-        markers = peak_labels + 1  # shift so background can be 0
+        markers = peak_labels + 1 
         markers[cc_mask == 0] = 0
 
         ws_input = (
@@ -413,22 +353,16 @@ def _watershed_split(binary: np.ndarray, patch_bgr: np.ndarray, min_distance: in
 
     return result
 
-
 # ACTUAL CREATION OF PROXY LABEL
-def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: dict) -> Tuple[np.ndarray, List[Tuple[str, np.ndarray]], Dict]:
-    """
-    Generate a binary nodule mask using multi-feature blob detection.
+def generate_proxy_label(patch_bgr, params: TunedParams, proxy_cfg):
+    # Generate a binary nodule mask using multi-feature blob detection.
 
-    Uses top-hat (compact dark blob detector) gated by local contrast ratio
-    (must actually be darker than surroundings) instead of the old diffuse
-    darkness-score approach which picked up gray sediment patches.
-    """
     steps: List[Tuple[str, np.ndarray]] = []
 
     def _log(name: str, img: np.ndarray):
         steps.append((name, img.copy()))
 
-    def _heatmap(feat: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    def _heatmap(feat, valid):
         fv = feat[valid]
         vmax = float(np.percentile(fv, 99.5)) if fv.size > 0 else 1.0
         viz = np.clip(feat / max(vmax, 1e-6) * 255, 0, 255).astype(np.uint8)
@@ -459,10 +393,6 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
         }
 
     # ── 02 Multi-scale black top-hat ─────────────────────────────────────
-    # Fires on compact dark features smaller than the structuring element.
-    # Gray sediment patches are larger than the SE → zero response.
-    # RAW values (no per-patch normalization) so absolute magnitude is
-    # preserved — patches with no real nodules produce weak scores.
     tophat_radii = proxy_cfg.get("tophat_radii", [1, 2, 4, 8, 12])
     texture_sigma = proxy_cfg.get("texture_sigma", 2.0)
     texture_threshold = proxy_cfg.get("texture_threshold", 18.0)
@@ -470,27 +400,16 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
     _log("02_tophat_response", _heatmap(tophat, valid_mask))
 
     # ── 03 Local contrast ratio ──────────────────────────────────────────
-    # How dark each pixel is relative to its local background (0–1 range).
-    # Gates the top-hat so only genuinely darker-than-surroundings blobs pass.
     lcr_sigma = proxy_cfg.get("lcr_bg_sigma", 30.0)
     lcr = _feature_local_contrast_ratio(gray_f, lcr_sigma, valid_mask)
     _log("03_local_contrast", _heatmap(lcr, valid_mask))
 
     # ── 04 Combined score ────────────────────────────────────────────────
-    # Raw tophat (0–255) × raw LCR (0–1) = absolute-magnitude score.
-    # Real nodules: tophat≈30-60 × LCR≈0.3-0.7 → score 9-42.
-    # Noise/artifacts: tophat≈1-5 × LCR≈0.05-0.2 → score 0.05-1.0.
-    # Patches with no nodules stay well below the absolute threshold.
     score = tophat * lcr
     score[~valid_mask] = 0
     _log("04_combined_score", _heatmap(score, valid_mask))
 
     # ── 05 Threshold (density-adaptive, two-pass) ─────────────────────
-    # Pass 1: count detections at the default absolute threshold.
-    # Pass 2: if dense, lower the effective threshold and fade out the
-    #          percentile gate so more real nodules survive.
-    # Sparse patches are unchanged — the abs floor + strict percentile
-    # still reject noise.
     abs_threshold = proxy_cfg.get("score_threshold", 5.0)
     pct_lo, pct_hi = proxy_cfg.get("score_percentile_range", (70, 90))
     dense_abs_min = proxy_cfg.get("dense_score_threshold_min", 3.0)
@@ -502,10 +421,6 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
         # Density: fraction of valid pixels exceeding the absolute threshold
         frac_above = float(np.sum(valid_scores > abs_threshold)) / n_valid
         density_t = np.clip(frac_above / dense_frac, 0.0, 1.0)
-
-        # Noise-aware density: suppress the dense path for noisy patches.
-        # Grain noise fires the tophat everywhere, faking high density.
-        # noise < 4 → no suppression; noise > 8 → full suppression.
         noise_suppress = np.clip((params.noise_estimate - 4.0) / 4.0, 0.0, 1.0)
         density_t = density_t * (1.0 - noise_suppress)
 
@@ -516,8 +431,6 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
         adaptive_pct = float(pct_hi - density_t * (pct_hi - pct_lo))
         pct_threshold = float(np.percentile(pos, adaptive_pct))
 
-        # Blend: sparse → max(pct, abs) as before;
-        #         dense → effective_abs only (percentile gate faded out)
         threshold = effective_abs + (1.0 - density_t) * max(0.0, pct_threshold - effective_abs)
     else:
         pct_threshold = abs_threshold
@@ -565,8 +478,7 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
             reject_counts["area_too_large"] += 1
             continue
 
-        # Mean combined score inside this contour (computed before area
-        # check so high-confidence tiny contours can use a relaxed floor)
+        # Mean combined score inside this contour (computed before area check so high-confidence tiny contours can use a relaxed floor)
         contour_mask_tmp = np.zeros(gray.shape, dtype=np.uint8)
         cv2.drawContours(contour_mask_tmp, [c], 0, 255, cv2.FILLED)
         contour_scores = score[contour_mask_tmp > 0]
@@ -583,7 +495,6 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
         skip_shape = area < 20 or high_confidence
 
         if not skip_shape:
-            # Solidity
             hull_area = cv2.contourArea(cv2.convexHull(c))
             solidity = area / hull_area if hull_area > 0 else 0
             if solidity < params.min_solidity:
@@ -630,13 +541,11 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
         cv2.drawContours(mask, filtered_contours, -1, 255, thickness=cv2.FILLED)
     _log("07_proxy_mask", mask)
 
-    # Overlay for visual verification
     overlay = patch_bgr.copy()
     overlay[mask > 0] = [0, 255, 0]
     blended = cv2.addWeighted(patch_bgr, 0.6, overlay, 0.4, 0)
     _log("08_overlay", blended)
 
-    # Stats
     stats = {
         "candidates_before_filter": len(contours_raw),
         "nodules_after_filter": len(filtered_contours),
@@ -647,9 +556,7 @@ def generate_proxy_label(patch_bgr: np.ndarray, params: TunedParams, proxy_cfg: 
 
     return mask, steps, stats
 
-
 # FILTER PIPELINE
-
 _FILTER_REGISTRY = {
     "gray_world_white_balance": gray_world_white_balance,
     "illumination_normalize":   illumination_normalize,
@@ -661,11 +568,11 @@ _FILTER_REGISTRY = {
 }
 
 class FilterPipeline:
-    def __init__(self, preprocess_cfg: dict):
+    def __init__(self, preprocess_cfg):
         self.cfg = preprocess_cfg
         self.chain = preprocess_cfg.get("filter_chain", list(_FILTER_REGISTRY.keys()))
 
-    def run(self, patch_bgr: np.ndarray, params: TunedParams) -> Tuple[np.ndarray, List[Tuple[str, np.ndarray]]]:
+    def run(self, patch_bgr, params: TunedParams):
         steps: List[Tuple[str, np.ndarray]] = []
         steps.append(("00_original", patch_bgr.copy()))
 
@@ -677,11 +584,8 @@ class FilterPipeline:
                 logger.warning(f"Unknown filter step '{step_name}' — skipping")
                 continue
 
-            # Call the filter with the right signature
             if step_name in (
-                "illumination_normalize", "multi_scale_retinex",
-                "sediment_fade", "unsharp_mask",
-            ):
+                "illumination_normalize", "multi_scale_retinex", "sediment_fade", "unsharp_mask"):
                 image = fn(image, params, self.cfg)
             else:
                 image = fn(image, params)
@@ -691,11 +595,7 @@ class FilterPipeline:
         return image, steps
 
     @staticmethod
-    def save_step_images(steps: List[Tuple[str, np.ndarray]],output_dir: Path, prefix: str = "patch") -> Path:
-        """
-        Persist each intermediate step as a numbered PNG.
-        Also generates a single composite grid image for quick comparison.
-        """
+    def save_step_images(steps,output_dir, prefix: str = "patch"):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -704,23 +604,18 @@ class FilterPipeline:
         for name, img in steps:
             fname = f"{prefix}__{name}.png"
             cv2.imwrite(str(output_dir / fname), img)
-
-            # Convert grayscale → BGR for the grid
             if img.ndim == 2:
                 img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             else:
                 img_bgr = img
             images_for_grid.append((name, img_bgr))
 
-        # Build composite grid
         composite_path = output_dir / f"{prefix}__composite.png"
         _build_composite(images_for_grid, composite_path)
 
         return composite_path
 
-def _build_composite(named_images: List[Tuple[str, np.ndarray]], output_path: Path, thumb_size: int = 384, cols: int = 4, padding: int = 4,
-    label_height: int = 28) -> None:
-    """Create a labelled thumbnail grid of all intermediate steps."""
+def _build_composite(named_images, output_path, thumb_size: int = 384, cols: int = 4, padding: int = 4, label_height: int = 28):
     n = len(named_images)
     if n == 0:
         return
@@ -735,27 +630,21 @@ def _build_composite(named_images: List[Tuple[str, np.ndarray]], output_path: Pa
 
     for idx, (name, img) in enumerate(named_images):
         r, c = divmod(idx, cols)
-        # Resize to thumbnail
         h, w = img.shape[:2]
         scale = thumb_size / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)
         thumb = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        # Paste into cell
         x0 = c * cell_w + padding
         y0 = r * cell_h + padding
-
-        # Center the thumbnail
         dx = (thumb_size - new_w) // 2
         dy = (thumb_size - new_h) // 2
         canvas[y0 + dy : y0 + dy + new_h, x0 + dx : x0 + dx + new_w] = thumb
 
-        # Label
         label_y = y0 + thumb_size + 2
         cv2.putText(
             canvas, name, (x0 + 4, label_y + 18),
             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA,
         )
-
     cv2.imwrite(str(output_path), canvas)
     logger.debug(f"Saved composite grid: {output_path}")

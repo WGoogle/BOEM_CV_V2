@@ -2,11 +2,7 @@
 Per-Patch Adaptive Parameter Calculation
 
 Essentially, a single set of preprocessing parameters cannot work across an entire seafloor mosaic.
-
-This script should ideally analyze each patch independently and computes "good" parameters for that specific region.  
-
-Signals used (More precise definitions left as comments under the functions, respectively).
--------------
+So I use these four signal below to customzie parmaters of each patch: 
 1. Contrast ratio: (inter-quartile range of L-channel) alters CLAHE clip limit.
 
 2. Noise estimate: (median absolute deviation of Laplacian) alters bilateral filter sigmas.
@@ -16,7 +12,6 @@ Signals used (More precise definitions left as comments under the functions, res
 4. Illumination uniformity (std of large-scale blur) alters whether to apply local normalisation before thresholding.
 """
 from __future__ import annotations
-
 import logging
 import cv2
 import numpy as np
@@ -27,53 +22,42 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TunedParams:
-    """Parameters computed for a single patch."""
+    # Parameters computed for a single patch
      
-    # MSR
     msr_blend: float = 1.0  # 0 = keep original L, 1 = full retinex
 
-    # CLAHE
     clahe_clip_limit: float = 2.0
     clahe_blend: float = 1.0 # 0 = keep original, 1 = full CLAHE
     clahe_tile_grid: Tuple[int, int] = (8, 8)
 
-    # Bilateral filter
     bilateral_d: int = 7
     bilateral_sigma_color: float = 50.0
     bilateral_sigma_space: float = 50.0
 
-    # Adaptive threshold (proxy-label stage)
     adaptive_block_size: int = 31
     adaptive_c_offset: float = 8.0
 
-    # Morphological kernels
     morph_open_k: int = 5
     morph_close_k: int = 9
 
-    # Unsharp mask
-    unsharp_strength: float = 0.5 # adaptive — low-contrast patches get less sharpening
+    unsharp_strength: float = 0.5 
 
-    # Contour filters (adaptive — driven by noise_estimate in PatchAutoTuner.analyse)
     min_contour_area: int = 5
     max_contour_area: int = 5000
     max_eccentricity: float = 0.85
     min_solidity: float = 0.50
     min_circularity: float = 0.30
 
-    # Diagnostics
     contrast_ratio: float = 0.0
     noise_estimate: float = 0.0
     brightness_skew: float = 0.0
     illumination_uniformity: float = 0.0
 
-    def as_dict(self) -> Dict:
-        """Serialisable snapshot for the pipeline manifest."""
+    def as_dict(self):
         return {k: v for k, v in self.__dict__.items()}
 
 class PatchAutoTuner:
-    """
-    Compute per-patch preprocessing parameters from image statistics.
-    """
+    # Compute per-patch preprocessing parameters from image statistics.
 
     def __init__(self, config: dict):
         self.cfg = config
@@ -81,13 +65,7 @@ class PatchAutoTuner:
     # Pixels below this threshold are treated as black border / no-data and excluded from all diagnostic calculations.
     _BORDER_THRESHOLD = 10
 
-    def analyse(self, patch_bgr: np.ndarray) -> TunedParams:
-        """
-        1. Extracts the L channel (perceptual lightness).
-        2. Builds a valid-pixel mask (excluding black mosaic borders).
-        3. Computes four diagnostic signals on valid pixels only.
-        4. Maps each signal to parameter ranges defined in config.
-        """
+    def analyse(self, patch_bgr):
         # Extract L channel from LAB
         lab = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB)
         L = lab[:, :, 0].astype(np.float32)
@@ -107,23 +85,11 @@ class PatchAutoTuner:
         avg_variance = np.median(variance)
         std_dev = np.sqrt(avg_variance)
 
-        # Map the signals to the parameters in config
         params = TunedParams()
-
-        # Shared contrast factor: how much enhancement this patch needs.
         t = np.clip(contrast / 40.0, 0.0, 1.0)
-
-        # Normalized noise factor for contour shape filters.
-        # noise_estimate (MAD of Laplacian) typically 0–20; map to [0,1].
         n = np.clip(noise / 20.0, 0.0, 1.0)
-
-        # MSR blend — low-contrast patches get less retinex enhancement
         msr_lo, msr_hi = self.cfg.get("msr_blend_range", (0.3, 1.0))
         params.msr_blend = float(msr_lo + t * (msr_hi - msr_lo))
-
-        # CLAHE clip limit & blend factor (scaled by contrast ratio)
-        # Noise-aware: high noise → reduce clip & blend to avoid
-        # amplifying grain texture into false nodule detections.
         cmin, cmax = self.cfg["clahe_clip_range"]
         base_clip = float(cmin + t * (cmax - cmin))
         bmin, bmax = self.cfg.get("clahe_blend_range", (0.3, 1.0))
@@ -132,10 +98,6 @@ class PatchAutoTuner:
         params.clahe_clip_limit = float(base_clip * (1.0 - 0.6 * noise_penalty))
         params.clahe_blend = float(base_blend * (1.0 - 0.5 * noise_penalty))
         params.clahe_tile_grid = tuple(self.cfg["clahe_tile_grid"])
-
-        # Bilateral sigmas  (proportional to noise)
-        # Noise-aware: extend grid search range for noisy patches so the
-        # bilateral filter can smooth grain more aggressively.
         min_d = 5
         max_d = 15
         max_v = np.percentile(variance, 90)
@@ -149,7 +111,7 @@ class PatchAutoTuner:
 
         sc_lo, sc_hi = self.cfg.get("bilateral_sigma_color_range", (30, 60))
         ss_lo, ss_hi = self.cfg.get("bilateral_sigma_space_range", (30, 60))
-        # Extend range for noisy patches (up to 1.5× at max noise)
+
         noise_extend = 1.0 + 0.5 * noise_penalty
         sc_hi_eff = int(sc_hi * noise_extend)
         ss_hi_eff = int(ss_hi * noise_extend)
@@ -170,7 +132,6 @@ class PatchAutoTuner:
                 params.bilateral_sigma_color = combinations[i]['sigma_color']
                 params.bilateral_sigma_space = combinations[i]['sigma_space']
 
-        # Adaptive threshold block size & C-offset (from skewness)
         bmin, bmax = self.cfg["block_size_range"]
         coff_min, coff_max = self.cfg["c_offset_range"]
         # Normalise skewness into [0, 1] — typical range -1 to +1
@@ -179,7 +140,6 @@ class PatchAutoTuner:
         params.adaptive_block_size = raw_block if raw_block % 2 == 1 else raw_block + 1
         params.adaptive_c_offset = float(coff_min + s * (coff_max - coff_min))
 
-        # Morphological kernels  (from uniformity)
         mo_min, mo_max = self.cfg["morph_open_range"]
         mc_min, mc_max = self.cfg["morph_close_range"]
         u = np.clip((uniformity - 2.0) / 15.0, 0.0, 1.0)
@@ -188,11 +148,9 @@ class PatchAutoTuner:
         params.morph_open_k = raw_open if raw_open % 2 == 1 else raw_open + 1
         params.morph_close_k = raw_close if raw_close % 2 == 1 else raw_close + 1
 
-        # 6. Unsharp mask strength — low-contrast patches get less sharpening
         us_lo, us_hi = self.cfg.get("unsharp_strength_range", (0.1, 0.5))
         params.unsharp_strength = float(us_lo + t * (us_hi - us_lo))
 
-        # 7. Contour shape filters — driven by noise_estimate
         ca_lo, ca_hi = self.cfg["contour_area_min_range"]
         params.min_contour_area = int(round(ca_lo + n * (ca_hi - ca_lo)))
         params.max_contour_area = self.cfg["max_contour_area"]
@@ -200,14 +158,12 @@ class PatchAutoTuner:
         ecc_lo, ecc_hi = self.cfg["eccentricity_range"]
         params.max_eccentricity = float(ecc_lo + n * (ecc_hi - ecc_lo))
 
-        # Solidity and circularity: high noise → lower (more relaxed) threshold
         sol_lo, sol_hi = self.cfg["solidity_range"]
         params.min_solidity = float(sol_hi - n * (sol_hi - sol_lo))
 
         circ_lo, circ_hi = self.cfg["circularity_range"]
         params.min_circularity = float(circ_hi - n * (circ_hi - circ_lo))
 
-        # Store diagnostics
         params.contrast_ratio           = float(contrast)
         params.noise_estimate           = float(noise)
         params.brightness_skew          = float(skew)
@@ -227,16 +183,8 @@ class PatchAutoTuner:
         )
         return params
 
-    # All methods accept a valid_mask to exclude black mosaic borders.
-
     @staticmethod
-    def _contrast_ratio(L: np.ndarray, valid_mask: np.ndarray) -> float:
-        """
-        Inter-quartile range of L-channel valid pixels.
-
-        A high IQR means the patch already has good contrast between
-        nodules and sediment; a low IQR means everything looks flat.
-        """
+    def _contrast_ratio(L, valid_mask):
         valid_px = L[valid_mask]
         if valid_px.size < 100:
             return 0.0
@@ -244,12 +192,8 @@ class PatchAutoTuner:
         return float(q75 - q25)
 
     @staticmethod
-    def _noise_estimate(gray: np.ndarray, valid_mask: np.ndarray) -> float:
-        """
-        Estimate sensor noise using the Median Absolute Deviation of the Laplacian on valid pixels only.
-
-        Inspired from Immerkaer, "Fast noise variance estimation", CVIU 1996.
-        """
+    def _noise_estimate(gray, valid_mask):
+        # Inspired from Immerkaer, "Fast noise variance estimation", CVIU 1996.
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         valid_lap = np.abs(laplacian[valid_mask])
         if valid_lap.size < 100:
@@ -258,14 +202,7 @@ class PatchAutoTuner:
         return float(med * 1.4826)
 
     @staticmethod
-    def _brightness_skew(L: np.ndarray, valid_mask: np.ndarray) -> float:
-        """
-        Skewness of the L-channel histogram (valid pixels only).
-
-        Negative skew means dark patch (many dark pixels, few bright).
-        Positive skew means bright patch.
-        Near zero means balanced.
-        """
+    def _brightness_skew(L, valid_mask):
         valid_px = L[valid_mask]
         if valid_px.size < 100:
             return 0.0
@@ -276,13 +213,7 @@ class PatchAutoTuner:
         return float(np.mean(((valid_px - mean) / std) ** 3))
 
     @staticmethod
-    def _illumination_uniformity(L: np.ndarray, valid_mask: np.ndarray) -> float:
-        """
-        Std-dev of a heavily blurred version of L (valid pixels only).
-
-        High value means strong illumination gradient across the patch.
-        Low value means uniform lighting.
-        """
+    def _illumination_uniformity(L, valid_mask):
         # Fill black border regions with the valid-pixel mean so they don't create artificial gradients in the blur.
         L_filled = L.copy()
         valid_px = L[valid_mask]

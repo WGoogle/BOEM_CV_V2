@@ -1,10 +1,8 @@
 """
-patcher.py description:
-
-Splits seafloor .TIF strips into smaller patches and can recombine them later (for inference). 
+This script is to ...
+Split the seafloor .TIF strips into smaller patches and can recombine them later (for inference). 
 """
 from __future__ import annotations
-
 import cv2
 import numpy as np
 import logging
@@ -14,42 +12,22 @@ from typing import List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class PatchInfo:
-    """Metadata for a single extracted patch."""
+    # Metadata for a single extracted patch.
     patch_index: int
-    row: int                        # grid row
-    col: int                        # grid column
-    y: int                          # top-left y in the full mosaic
-    x: int                          # top-left x in the full mosaic
+    row: int                       
+    col: int                      
+    y: int                         
+    x: int                    
     height: int
     width: int
-    is_valid: bool = True           # False → rejected by quality gate
+    is_valid: bool = True        
     rejection_reason: str = ""
 
-
 class MosaicPatcher:
-    """
-    Split then recombine large seafloor mosaics.
-
-    Non Self-Explanatory Parameters:
-    min_std, min_mean, max_black_fraction :
-        Quality-gate thresholds.  Patches that fail are still tracked
-        w/ (is_valid=False) so the grid can be reconstructed, but they
-        are excluded from preprocessing as these patches are deemed to have no seafloor image.
-
-    """
-
-    def __init__(
-        self,
-        patch_size: int = 256,
-        overlap: int = 32,
-        min_std: float = 3.0,
-        min_mean: float = 10.0,
-        max_black_fraction: float = 0.25,
-        max_noise: float = 0,
-    ):
+    def __init__(self,patch_size: int = 256, overlap: int = 32, min_std: float = 3.0, min_mean: float = 10.0, 
+        max_black_fraction: float = 0.25, max_noise: float = 0):
         self.patch_size = patch_size
         self.overlap = overlap
         self.stride = patch_size - overlap
@@ -58,21 +36,16 @@ class MosaicPatcher:
         self.max_black_fraction = max_black_fraction
         self.max_noise = max_noise
 
-
-    def load_mosaic(self, filepath: Path) -> np.ndarray:
-        """Load a mosaic from disk.  Can use TIF, PNG, JPG.
-
-        For TIF files greather than 2 GB, I got a failsafe to "tifffile."
-        """
+    def load_mosaic(self, filepath):
+        # For TIF files greather than 2 GB, I got a failsafe to "tifffile."
+        
         filepath = Path(filepath)
         image = cv2.imread(str(filepath), cv2.IMREAD_UNCHANGED)
 
         if image is None:
-            # Fallback: try tifffile for huge TIFs
             try:
                 import tifffile
                 image = tifffile.imread(str(filepath))
-                # tifffile returns RGB; convert to BGR for OpenCV
                 if image.ndim == 3 and image.shape[2] >= 3:
                     image = cv2.cvtColor(image[:, :, :3], cv2.COLOR_RGB2BGR)
                 logger.info(f"Loaded via tifffile: {filepath.name}")
@@ -102,16 +75,12 @@ class MosaicPatcher:
         )
         return image
 
-    def extract_patches(self, mosaic: np.ndarray) -> Tuple[List[np.ndarray], List[PatchInfo]]:
-        """
-        Divide mosaic into overlapping patches.
-
-        Returns patches (that pass quality gate) in list array and metadata for all patches for restructuring grid in future.
-        """
+    def extract_patches(self, mosaic):
+        # Divide mosaic into overlapping patches and return patches that only pass quality gate
+        # Returns list array and metadata for all patches for restructuring grid in future.
+    
         H, W = mosaic.shape[:2]
         ps, stride = self.patch_size, self.stride
-
-        # Compute grid positions, ensuring edge coverage
         y_starts = self._grid_positions(H, ps, stride)
         x_starts = self._grid_positions(W, ps, stride)
 
@@ -121,7 +90,7 @@ class MosaicPatcher:
 
         for ri, y in enumerate(y_starts):
             for ci, x in enumerate(x_starts):
-                # Clamp to image bounds (handles edges)
+                # Ensures only patches within mosaic bounds 
                 y_end = min(y + ps, H)
                 x_end = min(x + ps, W)
                 patch = mosaic[y:y_end, x:x_end]
@@ -156,12 +125,9 @@ class MosaicPatcher:
         )
         return patches, infos
 
-    def reassemble(self, patch_outputs: List[np.ndarray], infos: List[PatchInfo], mosaic_shape: Tuple[int, int], dtype=np.float32) -> np.ndarray:
-        """
-        Recombine patches into a full-mosaic map.
+    def reassemble(self, patch_outputs, infos, mosaic_shape, dtype=np.float32):
+        # Recombine patches into a full-mosaic map.
        
-        mosaic_shape is just the dimensions of original mosaic loaded before patching.
-        """
         H, W = mosaic_shape
         accum = np.zeros((H, W), dtype=np.float64)
         count = np.zeros((H, W), dtype=np.float64)
@@ -182,10 +148,9 @@ class MosaicPatcher:
         count[count == 0] = 1.0
         return (accum / count).astype(dtype)
     
-
     @staticmethod
-    def _grid_positions(length: int, patch_size: int, stride: int) -> List[int]:
-        """Generate start positions that cover the full length."""
+    def _grid_positions(length, patch_size, stride):
+        # Generate start positions that cover the full length.
         if length <= patch_size:
             return [0]
         positions = list(range(0, length - patch_size + 1, stride))
@@ -194,8 +159,8 @@ class MosaicPatcher:
             positions.append(length - patch_size)
         return sorted(set(positions))
 
-    def _quality_check(self, patch: np.ndarray) -> Tuple[bool, str]:
-        """Return (is_valid, rejection_reason)."""
+    def _quality_check(self, patch):
+        # Return (is_valid, rejection_reason).
         gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
 
         # Black-border check
@@ -212,7 +177,6 @@ class MosaicPatcher:
         if mean < self.min_mean:
             return False, f"mean={mean:.1f}"
 
-        # Excessive noise / grain check — MAD of Laplacian.
         # Extremely grainy patches produce only false detections downstream.
         if self.max_noise > 0:
             lap = cv2.Laplacian(gray, cv2.CV_64F)
