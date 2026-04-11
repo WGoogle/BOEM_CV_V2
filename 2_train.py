@@ -1,14 +1,12 @@
-#!/usr/bin/env python3
 """
 Step 2 — Train Nodule Segmentation Model
-==========================================
 This script handles ONLY:
   - CLI argument parsing
   - Logging setup (file + console)
   - Pipeline manifest tracking (CoralNet-inspired idempotency)
   - Progress reporting and summary statistics
 
-All training logic lives in the ``training/`` package:
+All training logic lives in the "training/" package:
   - training/dataset.py   — Dataset + augmentations
   - training/model.py     — U-Net factory + combined BCE+Dice loss
   - training/splits.py    — Stratified train/val/test splitting
@@ -22,7 +20,6 @@ Helpful Shortcuts:
     python 2_train.py --no-augmentation   # disable augmentation (ablation)
 """
 from __future__ import annotations
-
 import argparse
 import json
 import logging
@@ -30,7 +27,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
 import torch
 from torch.utils.data import DataLoader
 
@@ -48,9 +44,7 @@ from training import (
     get_val_augmentations,
 )
 
-
-# ── Logging ──────────────────────────────────────────────────────────────
-
+# Logging 
 def _setup_logging() -> None:
     """Configure root logger to write to console + log file."""
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,31 +67,23 @@ def _setup_logging() -> None:
     root.setLevel(logging.DEBUG)
     root.addHandler(file_handler)
     root.addHandler(console_handler)
-
-
 logger = logging.getLogger(__name__)
 
-
-# ── Pipeline Manifest ────────────────────────────────────────────────────
+# Pipeline Manifest
 
 MANIFEST_PATH = config.OUTPUT_DIR / "pipeline_manifest.json"
-
-
 def _load_manifest() -> dict:
     if MANIFEST_PATH.exists():
         with open(MANIFEST_PATH) as f:
             return json.load(f)
     return {"version": "2.0", "mosaics": {}}
 
-
 def _save_manifest(manifest: dict) -> None:
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
 
-
-# ── Data Loading ─────────────────────────────────────────────────────────
-
+# Data Loading
 def _collect_patch_records() -> list[dict]:
     """Gather all patch records from every mosaic's patch_manifest.json."""
     records = []
@@ -117,9 +103,7 @@ def _collect_patch_records() -> list[dict]:
         records.extend(valid)
     return records
 
-
-# ── Epoch Logging Callback ───────────────────────────────────────────────
-
+# Epoch Logging Callback
 def _make_epoch_callback(history_path: Path):
     """Return a callback that logs each epoch and appends to a JSON history."""
     history = []
@@ -148,9 +132,7 @@ def _make_epoch_callback(history_path: Path):
 
     return callback
 
-
-# ── CLI Entry Point ──────────────────────────────────────────────────────
-
+# CLI Entry Point
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Step 2: Train U-Net segmentation model on preprocessed patches",
@@ -176,10 +158,9 @@ def main() -> None:
         help="Disable training augmentations (for ablation studies)",
     )
     args = parser.parse_args()
-
     _setup_logging()
 
-    # ── Device selection ─────────────────────────────────────────────
+    # Device selection
     if torch.cuda.is_available():
         device = "cuda"
         gpu_name = torch.cuda.get_device_name(0)
@@ -192,7 +173,7 @@ def main() -> None:
         device = "cpu"
         logger.info("  Device: CPU (training will be slow)")
 
-    # ── Build effective config (CLI overrides) ───────────────────────
+    # Build effective config (CLI overrides)
     train_cfg = dict(config.TRAINING)  # copy
     if args.epochs is not None:
         train_cfg["num_epochs"] = args.epochs
@@ -203,7 +184,7 @@ def main() -> None:
     if args.no_augmentation:
         train_cfg["augmentation"] = False
 
-    # ── Banner ───────────────────────────────────────────────────────
+    # Banner
     logger.info("=" * 70)
     logger.info("BOEM CV  —  Step 2: Train Segmentation Model")
     logger.info("=" * 70)
@@ -218,7 +199,7 @@ def main() -> None:
     logger.info(f"  Device          : {device}")
     logger.info(f"  Resume          : {args.resume}")
 
-    # ── Collect patches from Step 1 ──────────────────────────────────
+    # Collect patches from Step 1
     logger.info("─" * 70)
     logger.info("Loading patch records from Step 1 ...")
     records = _collect_patch_records()
@@ -230,7 +211,7 @@ def main() -> None:
         sys.exit(1)
     logger.info(f"  Total patches: {len(records)}")
 
-    # ── Split dataset ────────────────────────────────────────────────
+    # Split dataset
     logger.info("Splitting dataset (stratified by nodule density) ...")
     train_recs, val_recs, test_recs = split_dataset(
         records,
@@ -239,18 +220,23 @@ def main() -> None:
         test_frac=train_cfg["test_split"],
         seed=train_cfg["random_seed"],
     )
-
     # Save split composition for reproducibility
     split_path = config.CHECKPOINTS_DIR / "split_info.json"
     save_split_info(train_recs, val_recs, test_recs, split_path, train_cfg["random_seed"])
 
-    # ── Build datasets and loaders ───────────────────────────────────
+    # Build datasets and loaders
     logger.info("Building datasets and data loaders ...")
     patch_size = config.PATCHING["patch_size"]
     use_aug = train_cfg.get("augmentation", True)
+    input_mode = config.MODEL.get("input_mode", "rgb")
+    logger.info(f"  Input mode      : {input_mode}")
 
-    train_transform = get_train_augmentations(patch_size) if use_aug else get_val_augmentations()
-    val_transform   = get_val_augmentations()
+    train_transform = (
+        get_train_augmentations(patch_size, input_mode=input_mode)
+        if use_aug
+        else get_val_augmentations(input_mode=input_mode)
+    )
+    val_transform = get_val_augmentations(input_mode=input_mode)
 
     # Use manually corrected masks when available (from Step 4)
     corrected_dir = str(config.CORRECTED_MASKS_DIR) if config.CORRECTED_MASKS_DIR.exists() else None
@@ -259,11 +245,14 @@ def main() -> None:
         logger.info(f"  Found {n_corrected} manually corrected masks — will prefer over proxy labels")
 
     train_ds = NoduleSegmentationDataset(train_recs, transform=train_transform,
-                                         corrected_masks_dir=corrected_dir)
+                                         corrected_masks_dir=corrected_dir,
+                                         input_mode=input_mode)
     val_ds   = NoduleSegmentationDataset(val_recs,   transform=val_transform,
-                                         corrected_masks_dir=corrected_dir)
+                                         corrected_masks_dir=corrected_dir,
+                                         input_mode=input_mode)
     test_ds  = NoduleSegmentationDataset(test_recs,  transform=val_transform,
-                                         corrected_masks_dir=corrected_dir)
+                                         corrected_masks_dir=corrected_dir,
+                                         input_mode=input_mode)
 
     num_workers = train_cfg.get("num_workers", 4)
     pin_memory  = (device == "cuda")
@@ -296,18 +285,32 @@ def main() -> None:
         f"Val: {len(val_ds)} patches  │  Test: {len(test_ds)} patches"
     )
 
-    # ── Build model + loss ───────────────────────────────────────────
+    # Build model + loss
     logger.info("Building model ...")
-    model = build_model(config.MODEL)
+    model = build_model(config.MODEL, patch_size=patch_size)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     logger.info(f"  Parameters: {n_params:.1f}M")
 
     criterion = CombinedLoss(
-        bce_weight=train_cfg.get("bce_weight", 0.5),
-        dice_weight=train_cfg.get("dice_weight", 0.5),
+        bce_weight=train_cfg.get("bce_weight", 0.3),
+        tversky_weight=train_cfg.get("tversky_weight", 0.7),
+        alpha=train_cfg.get("tversky_alpha", 0.7),
+        beta=train_cfg.get("tversky_beta", 0.3),
+        gamma=train_cfg.get("tversky_gamma", 4.0 / 3.0),
+        bce_pos_weight=train_cfg.get("bce_pos_weight", None),
+        # Back-compat: honour old `dice_weight` key if present
+        dice_weight=train_cfg.get("dice_weight", None),
+    )
+    logger.info(
+        f"  Loss: BCE({train_cfg.get('bce_weight', 0.3)}) + "
+        f"FocalTversky("
+        f"α={train_cfg.get('tversky_alpha', 0.7)}, "
+        f"β={train_cfg.get('tversky_beta', 0.3)}, "
+        f"γ={train_cfg.get('tversky_gamma', 4.0/3.0):.3f}) "
+        f"× {train_cfg.get('tversky_weight', 0.7)}"
     )
 
-    # ── Build trainer ────────────────────────────────────────────────
+    # Build trainer
     trainer = Trainer(
         model=model,
         criterion=criterion,
@@ -315,7 +318,6 @@ def main() -> None:
         checkpoint_dir=config.CHECKPOINTS_DIR,
         device=device,
     )
-
     # Resume if requested
     start_epoch = 0
     if args.resume:
@@ -325,7 +327,7 @@ def main() -> None:
         else:
             logger.warning("  No checkpoint found to resume from — starting fresh")
 
-    # ── Train ────────────────────────────────────────────────────────
+    # Train
     logger.info("─" * 70)
     logger.info("Starting training ...")
     logger.info(
@@ -347,7 +349,7 @@ def main() -> None:
     )
     elapsed = time.time() - t0
 
-    # ── Evaluate on test set ─────────────────────────────────────────
+    # Evaluate on test set
     logger.info("─" * 70)
     logger.info("Evaluating best model on test set ...")
     best_ckpt = Path(result.best_checkpoint_path)
@@ -356,7 +358,7 @@ def main() -> None:
     test_loss, test_iou, test_dice = trainer._validate(test_loader)
     logger.info(f"  Test loss: {test_loss:.4f}  │  Test Dice: {test_dice:.4f}  │  Test IoU: {test_iou:.4f}")
 
-    # ── Update pipeline manifest ─────────────────────────────────────
+    # Update pipeline manifest
     manifest = _load_manifest()
     manifest.setdefault("training", {}).update({
         "model":                config.MODEL,
@@ -384,7 +386,6 @@ def main() -> None:
         "elapsed_seconds":      round(elapsed, 1),
     })
     _save_manifest(manifest)
-
     # ── Final Summary ────────────────────────────────────────────────
     logger.info("=" * 70)
     logger.info("TRAINING COMPLETE")
@@ -400,7 +401,5 @@ def main() -> None:
     logger.info(f"  Manifest          : {MANIFEST_PATH}")
     logger.info("")
     logger.info("Next step: python 3_inference.py")
-
-
 if __name__ == "__main__":
     main()
