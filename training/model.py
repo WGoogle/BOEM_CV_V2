@@ -289,6 +289,7 @@ class CombinedLoss(nn.Module):
         beta: float = 0.3,
         gamma: float = 4.0 / 3.0,
         bce_pos_weight: float | None = None,
+        label_smoothing: float = 0.0,
         # Legacy kwarg — accepted for backwards compat with old configs
         # that still pass ``dice_weight``. Maps onto tversky_weight.
         dice_weight: float | None = None,
@@ -308,8 +309,29 @@ class CombinedLoss(nn.Module):
         self.bce_weight     = bce_weight
         self.tversky_weight = tversky_weight
 
+        # Label smoothing — symmetric two-sided, shrinks hard targets toward 0.5
+        # so the network stops chasing obviously-wrong pixels to logit infinity.
+        # Cheapest possible robustness against proxy-label noise (Reed et al.
+        # 2015 bootstrapping; Müller et al. NeurIPS 2019 "When does label
+        # smoothing help?"). Applied uniformly to both BCE and Tversky paths
+        # so the two terms stay consistent.
+        #   t_smooth = t * (1 − 2ε) + ε      ⇒   1 → 1 − ε,  0 → ε
+        # ε ≈ 0.05–0.10 is standard for segmentation.
+        if not 0.0 <= label_smoothing < 0.5:
+            raise ValueError(
+                f"label_smoothing must be in [0, 0.5), got {label_smoothing}"
+            )
+        self.label_smoothing = float(label_smoothing)
+
+    def _smooth(self, targets: torch.Tensor) -> torch.Tensor:
+        eps = self.label_smoothing
+        if eps == 0.0:
+            return targets
+        return targets * (1.0 - 2.0 * eps) + eps
+
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        t = self._smooth(targets)
         return (
-            self.bce_weight     * self.bce(logits, targets)
-            + self.tversky_weight * self.tversky(logits, targets)
+            self.bce_weight     * self.bce(logits, t)
+            + self.tversky_weight * self.tversky(logits, t)
         )

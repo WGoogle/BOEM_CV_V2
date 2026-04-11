@@ -9,9 +9,14 @@ Public API re-exported here so callers can do::
     )
 """
 
-from .dataset import NoduleSegmentationDataset, get_train_augmentations, get_val_augmentations
+from .dataset import (
+    NoduleSegmentationDataset,
+    CopyPasteAugmentation,
+    get_train_augmentations,
+    get_val_augmentations,
+)
 from .model import build_model, CombinedLoss, DiceLoss, FocalTverskyLoss
-from .splits import split_dataset, save_split_info
+from .splits import split_dataset, save_split_info, compute_sampler_weights
 from .trainer import Trainer, TrainingResult, EpochLog
 from .confident_learning import (
     ConfidentLabelAuditor,
@@ -22,6 +27,7 @@ from .confident_learning import (
 
 __all__ = [
     "NoduleSegmentationDataset",
+    "CopyPasteAugmentation",
     "get_train_augmentations",
     "get_val_augmentations",
     "build_model",
@@ -30,6 +36,7 @@ __all__ = [
     "FocalTverskyLoss",
     "split_dataset",
     "save_split_info",
+    "compute_sampler_weights",
     "Trainer",
     "TrainingResult",
     "EpochLog",

@@ -128,6 +128,52 @@ def split_dataset(
     return train_records, val_records, test_records
 
 
+def compute_sampler_weights(
+    records: list[dict],
+    dense_multiplier: float = 5.0,
+) -> np.ndarray:
+    """Per-record weights for a :class:`torch.utils.data.WeightedRandomSampler`.
+
+    Addresses the train-loop-level class imbalance that the stratified
+    split does not solve: even after splitting, the vast majority of
+    train patches have zero or near-zero nodule coverage, so uniform
+    shuffling buries the dense-bin examples the network actually needs
+    to learn the foreground signal.
+
+    Strategy: assign each record a weight that grows linearly from 1.0
+    (empty patches, bin 0) to ``dense_multiplier`` (dense patches,
+    top bin). With ``dense_multiplier=5.0`` a dense patch is drawn ~5×
+    more often per epoch than an empty one. The sampler then draws
+    ``len(records)`` examples per epoch with replacement, so the
+    effective epoch still sees roughly the same number of steps but
+    with a foreground-enriched mix.
+
+    Parameters
+    ----------
+    records : list[dict]
+        Training patch records (passed straight from ``split_dataset``).
+    dense_multiplier : float
+        Weight assigned to the densest coverage bin. Values in the
+        range 3.0–5.0 are the sweet spot per MODEL_IMPROVEMENTS.md §3;
+        higher values over-fit the dense patches.
+
+    Returns
+    -------
+    np.ndarray
+        float64 weight per record, shape ``(len(records),)``.
+    """
+    if dense_multiplier < 1.0:
+        raise ValueError(
+            f"dense_multiplier must be ≥ 1.0 (got {dense_multiplier})"
+        )
+
+    n_bins = 5
+    bins = np.array([_coverage_bin(r, n_bins=n_bins) for r in records])
+    # Linear ramp from 1.0 (bin 0) to dense_multiplier (top bin).
+    weights = 1.0 + (bins / (n_bins - 1)) * (dense_multiplier - 1.0)
+    return weights.astype(np.float64)
+
+
 def save_split_info(
     train_records: list[dict],
     val_records: list[dict],

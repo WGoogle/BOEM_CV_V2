@@ -28,16 +28,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 sys.path.insert(0, str(Path(__file__).parent))
 import config
 from training import (
     NoduleSegmentationDataset,
+    CopyPasteAugmentation,
     build_model,
     CombinedLoss,
     split_dataset,
     save_split_info,
+    compute_sampler_weights,
     Trainer,
     EpochLog,
     get_train_augmentations,
@@ -244,9 +246,34 @@ def main() -> None:
         n_corrected = len(list(config.CORRECTED_MASKS_DIR.glob("*.png")))
         logger.info(f"  Found {n_corrected} manually corrected masks — will prefer over proxy labels")
 
+    # Copy-Paste augmentation — mines nodules from high-coverage source
+    # patches and pastes them into the current patch. Training-only.
+    copy_paste = None
+    if train_cfg.get("copy_paste", False) and use_aug:
+        cp = CopyPasteAugmentation(
+            source_records=train_recs,
+            corrected_masks_dir=corrected_dir,
+            p=train_cfg.get("copy_paste_p", 0.5),
+            max_objects=train_cfg.get("copy_paste_max_objects", 3),
+            min_source_coverage=train_cfg.get("copy_paste_min_coverage", 5.0),
+        )
+        if cp:
+            copy_paste = cp
+            logger.info(
+                f"  Copy-Paste aug : enabled "
+                f"(p={cp.p}, max_obj={cp.max_objects}, "
+                f"{len(cp.sources)} source patches)"
+            )
+        else:
+            logger.warning(
+                "  Copy-Paste aug : requested but no source patches met "
+                f"min_source_coverage={train_cfg.get('copy_paste_min_coverage', 5.0)} — disabled"
+            )
+
     train_ds = NoduleSegmentationDataset(train_recs, transform=train_transform,
                                          corrected_masks_dir=corrected_dir,
-                                         input_mode=input_mode)
+                                         input_mode=input_mode,
+                                         copy_paste=copy_paste)
     val_ds   = NoduleSegmentationDataset(val_recs,   transform=val_transform,
                                          corrected_masks_dir=corrected_dir,
                                          input_mode=input_mode)
@@ -256,14 +283,39 @@ def main() -> None:
 
     num_workers = train_cfg.get("num_workers", 4)
     pin_memory  = (device == "cuda")
+    # Hygiene: keep workers alive across epochs and pre-fetch more batches.
+    # Kills per-epoch worker respawn overhead. Only valid when num_workers > 0.
+    persistent_workers = num_workers > 0
+    prefetch_factor    = 4 if num_workers > 0 else None
+
+    # WeightedRandomSampler — upweights dense-coverage bins so the
+    # network sees more foreground per epoch. Mutually exclusive with
+    # DataLoader's shuffle=True.
+    train_sampler = None
+    if train_cfg.get("use_weighted_sampler", False):
+        mult = train_cfg.get("weighted_sampler_multiplier", 5.0)
+        sample_weights = compute_sampler_weights(train_recs, dense_multiplier=mult)
+        train_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(train_recs),
+            replacement=True,
+        )
+        logger.info(
+            f"  Sampler        : WeightedRandomSampler "
+            f"(dense_multiplier={mult}, "
+            f"weight range [{sample_weights.min():.2f}, {sample_weights.max():.2f}])"
+        )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg["batch_size"],
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     val_loader = DataLoader(
         val_ds,
@@ -271,6 +323,8 @@ def main() -> None:
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     test_loader = DataLoader(
         test_ds,
@@ -278,6 +332,8 @@ def main() -> None:
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     logger.info(
@@ -298,6 +354,7 @@ def main() -> None:
         beta=train_cfg.get("tversky_beta", 0.3),
         gamma=train_cfg.get("tversky_gamma", 4.0 / 3.0),
         bce_pos_weight=train_cfg.get("bce_pos_weight", None),
+        label_smoothing=train_cfg.get("label_smoothing", 0.0),
         # Back-compat: honour old `dice_weight` key if present
         dice_weight=train_cfg.get("dice_weight", None),
     )
@@ -307,16 +364,18 @@ def main() -> None:
         f"α={train_cfg.get('tversky_alpha', 0.7)}, "
         f"β={train_cfg.get('tversky_beta', 0.3)}, "
         f"γ={train_cfg.get('tversky_gamma', 4.0/3.0):.3f}) "
-        f"× {train_cfg.get('tversky_weight', 0.7)}"
+        f"× {train_cfg.get('tversky_weight', 0.7)}  │  "
+        f"label_smoothing={train_cfg.get('label_smoothing', 0.0)}"
     )
 
-    # Build trainer
+    # Build trainer — OneCycleLR needs steps_per_epoch to compute total_steps
     trainer = Trainer(
         model=model,
         criterion=criterion,
         train_cfg=train_cfg,
         checkpoint_dir=config.CHECKPOINTS_DIR,
         device=device,
+        steps_per_epoch=len(train_loader),
     )
     # Resume if requested
     start_epoch = 0
@@ -349,14 +408,20 @@ def main() -> None:
     )
     elapsed = time.time() - t0
 
-    # Evaluate on test set
+    # Evaluate on test set — reuse the val-selected threshold (no leakage).
     logger.info("─" * 70)
     logger.info("Evaluating best model on test set ...")
     best_ckpt = Path(result.best_checkpoint_path)
     if best_ckpt.exists():
         trainer.load_checkpoint(best_ckpt)
-    test_loss, test_iou, test_dice = trainer._validate(test_loader)
-    logger.info(f"  Test loss: {test_loss:.4f}  │  Test Dice: {test_dice:.4f}  │  Test IoU: {test_iou:.4f}")
+    test_loss, test_iou, test_dice = trainer._validate(
+        test_loader, sweep_thresholds=False,
+    )
+    logger.info(
+        f"  Test loss: {test_loss:.4f}  │  "
+        f"Test Dice: {test_dice:.4f}  │  Test IoU: {test_iou:.4f}  │  "
+        f"thr={trainer.best_threshold:.2f}"
+    )
 
     # Update pipeline manifest
     manifest = _load_manifest()
@@ -373,6 +438,7 @@ def main() -> None:
         "epochs_run":           result.epochs_run,
         "best_epoch":           result.best_epoch,
         "best_val_dice":        round(result.best_val_dice, 6),
+        "best_threshold":       round(result.best_threshold, 4),
         "test_metrics": {
             "loss":  round(test_loss, 6),
             "dice":  round(test_dice, 6),
@@ -393,6 +459,7 @@ def main() -> None:
     logger.info(f"  Epochs run        : {result.epochs_run}")
     logger.info(f"  Best epoch        : {result.best_epoch}")
     logger.info(f"  Best val Dice     : {result.best_val_dice:.4f}")
+    logger.info(f"  Best threshold    : {result.best_threshold:.2f}")
     logger.info(f"  Test Dice         : {test_dice:.4f}")
     logger.info(f"  Test IoU          : {test_iou:.4f}")
     logger.info(f"  Total time        : {elapsed:.1f}s")

@@ -264,6 +264,178 @@ def get_val_augmentations(input_mode: str = "rgb") -> A.Compose:
     ])
 
 
+class CopyPasteAugmentation:
+    """Simple Copy-Paste augmentation (Ghiasi et al. CVPR 2021).
+
+    For sparse-positive segmentation this is typically the single
+    highest-ROI augmentation possible: crop real nodules from
+    high-coverage "source" patches and paste them into whichever patch
+    the dataset is currently returning, updating both image and mask.
+
+    Source selection
+    ----------------
+    Sources are pre-filtered from the supplied records by
+    ``label_stats.coverage_pct`` — only patches with coverage above
+    ``min_source_coverage`` percent are considered clean enough to mine
+    nodules from. If a ``corrected_masks_dir`` is supplied, corrected
+    masks are preferred over proxy labels for source patches too (they
+    are the ground truth).
+
+    Pasting
+    -------
+    Each call:
+      1. Rolls probability ``p``; returns the original on a miss.
+      2. Samples one source record, loads image + mask.
+      3. Finds connected components in the source mask.
+      4. Picks up to ``max_objects`` random components.
+      5. For each, crops the nodule by its bounding box and pastes
+         it into a random location on the current patch. The current
+         mask is updated with a pixel-wise OR so overlapping nodules
+         combine cleanly.
+
+    Runs **before** the mode-specific channel transform so the
+    engineered channels (Sobel / LCR) are recomputed on the composite
+    image — otherwise pasted nodules would be invisible to the network
+    in ``engineered`` mode.
+
+    Notes on noise
+    --------------
+    This uses the raw bounding-box crop rather than any kind of blend,
+    matching the Ghiasi "simple" protocol: the paper showed that
+    elaborate blending (Gaussian feathering, Poisson) does not help.
+    The resulting seam is a mild noise source that the augmentation
+    pipeline downstream (Gaussian blur, noise, brightness jitter)
+    further absorbs.
+    """
+
+    def __init__(
+        self,
+        source_records: list[dict],
+        corrected_masks_dir: str | Path | None = None,
+        p: float = 0.5,
+        max_objects: int = 3,
+        min_source_coverage: float = 5.0,
+        max_object_area_frac: float = 0.25,
+    ) -> None:
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"p must be in [0, 1], got {p}")
+        if max_objects < 1:
+            raise ValueError(f"max_objects must be ≥ 1, got {max_objects}")
+
+        self.p = p
+        self.max_objects = max_objects
+        self.max_object_area_frac = max_object_area_frac
+        self.corrected_masks_dir = (
+            Path(corrected_masks_dir) if corrected_masks_dir else None
+        )
+
+        # Pre-filter sources by coverage so we only mine from clean patches.
+        self.sources: list[dict] = [
+            r for r in source_records
+            if r.get("label_stats", {}).get("coverage_pct", 0.0) >= min_source_coverage
+        ]
+
+    def __bool__(self) -> bool:
+        return bool(self.sources)
+
+    def _resolve_mask_path(self, rec: dict) -> str:
+        """Prefer a corrected mask over the proxy label when available."""
+        if self.corrected_masks_dir is not None:
+            patch_id = rec.get("patch_id", "")
+            corrected = self.corrected_masks_dir / f"{patch_id}.png"
+            if corrected.exists():
+                return str(corrected)
+        return rec["mask_path"]
+
+    def __call__(
+        self,
+        bgr: np.ndarray,
+        mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply copy-paste in-place-safe fashion.
+
+        Parameters
+        ----------
+        bgr : np.ndarray
+            (H, W, 3) uint8, BGR — as returned by ``cv2.imread``.
+        mask : np.ndarray
+            (H, W) float32 in {0.0, 1.0}.
+
+        Returns
+        -------
+        (bgr_out, mask_out) : tuple[np.ndarray, np.ndarray]
+            New arrays with pasted nodules. Falls back to the originals
+            if sources are empty, the roll misses, or the sampled
+            source cannot be loaded.
+        """
+        if not self.sources or np.random.random() > self.p:
+            return bgr, mask
+
+        src = self.sources[int(np.random.randint(len(self.sources)))]
+        src_img = cv2.imread(src["image_path"], cv2.IMREAD_COLOR)
+        if src_img is None:
+            return bgr, mask
+
+        src_mask_path = self._resolve_mask_path(src)
+        src_mask = cv2.imread(src_mask_path, cv2.IMREAD_GRAYSCALE)
+        if src_mask is None:
+            return bgr, mask
+        src_mask_bin = (src_mask > 127).astype(np.uint8)
+
+        # Connected-component analysis (8-connectivity). Label 0 is background.
+        n_cc, labels, stats, _ = cv2.connectedComponentsWithStats(
+            src_mask_bin, connectivity=8,
+        )
+        if n_cc <= 1:
+            return bgr, mask
+
+        H, W = mask.shape[:2]
+        max_obj_area = int(self.max_object_area_frac * H * W)
+
+        # Shuffle component indices (skip the background label 0).
+        cc_indices = np.arange(1, n_cc)
+        np.random.shuffle(cc_indices)
+
+        out_bgr  = bgr.copy()
+        out_mask = mask.copy()
+
+        n_pasted = 0
+        for ci in cc_indices:
+            if n_pasted >= self.max_objects:
+                break
+            x, y, w, h, area = stats[ci]
+            # Skip pathological components: tiny fragments, anything that
+            # wouldn't fit in the target patch, or objects so large they
+            # would dominate the patch.
+            if area < 4 or w >= W or h >= H or area > max_obj_area:
+                continue
+
+            # Ensure the crop is in-bounds (defensive — should always be true).
+            x2, y2 = x + w, y + h
+            if x2 > src_img.shape[1] or y2 > src_img.shape[0]:
+                continue
+
+            src_crop     = src_img[y:y2, x:x2]
+            src_crop_cc  = (labels[y:y2, x:x2] == ci).astype(np.uint8)
+
+            # Random paste location within the target patch.
+            px = int(np.random.randint(0, W - w + 1))
+            py = int(np.random.randint(0, H - h + 1))
+
+            # Update image: copy pasted pixels only where the CC mask is 1.
+            mask3 = src_crop_cc[:, :, None]  # (h, w, 1)
+            roi_img = out_bgr[py:py + h, px:px + w]
+            roi_img[:] = roi_img * (1 - mask3) + src_crop * mask3
+
+            # Update mask: union with the pasted component.
+            roi_mask = out_mask[py:py + h, px:px + w]
+            np.maximum(roi_mask, src_crop_cc.astype(np.float32), out=roi_mask)
+
+            n_pasted += 1
+
+        return out_bgr, out_mask
+
+
 class NoduleSegmentationDataset(Dataset):
     """PyTorch dataset for paired image + binary mask patches.
 
@@ -294,12 +466,17 @@ class NoduleSegmentationDataset(Dataset):
         transform: A.Compose | None = None,
         corrected_masks_dir: str | None = None,
         input_mode: str = "rgb",
+        copy_paste: CopyPasteAugmentation | None = None,
     ) -> None:
         _validate_input_mode(input_mode)
         self.records = records
         self.input_mode = input_mode
         self.transform = transform or get_val_augmentations(input_mode=input_mode)
         self.corrected_masks_dir = Path(corrected_masks_dir) if corrected_masks_dir else None
+        # Copy-paste augmentation — only used when non-None (train split).
+        # Runs before the channel transform so engineered channels reflect
+        # the composite image. Pass None from val/test datasets.
+        self.copy_paste = copy_paste
 
     def __len__(self) -> int:
         return len(self.records)
@@ -311,9 +488,6 @@ class NoduleSegmentationDataset(Dataset):
         bgr = cv2.imread(rec["image_path"], cv2.IMREAD_COLOR)
         if bgr is None:
             raise FileNotFoundError(f"Image not found: {rec['image_path']}")
-
-        # Mode-specific channel transform (RGB / grayscale-3× / engineered)
-        image = _prepare_image(bgr, self.input_mode)
 
         # Load mask: prefer corrected mask over proxy label
         mask_path = rec["mask_path"]
@@ -327,6 +501,16 @@ class NoduleSegmentationDataset(Dataset):
         if mask is None:
             raise FileNotFoundError(f"Mask not found: {mask_path}")
         mask = (mask > 127).astype(np.float32)
+
+        # Copy-paste augmentation (train only) — mines nodules from
+        # high-coverage source patches. Applied on BGR so the channel
+        # transform below sees the composite image and (in engineered
+        # mode) recomputes Sobel/LCR on the pasted nodules.
+        if self.copy_paste is not None:
+            bgr, mask = self.copy_paste(bgr, mask)
+
+        # Mode-specific channel transform (RGB / grayscale-3× / engineered)
+        image = _prepare_image(bgr, self.input_mode)
 
         # Apply augmentation (jointly to image + mask)
         augmented = self.transform(image=image, mask=mask)
