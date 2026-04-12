@@ -1,10 +1,7 @@
 """
-Builds a segmentation model via segmentation_models_pytorch and provides a combined BCE + Dice loss optimised 
-for binary segmentation of sparse targets like polymetallic nodules.
-
-Supported architectures (via config.MODEL presets in config.py):
-  - "Segformer" + "mit_b0".."mit_b5" — hierarchical transformer (default, SegFormer-B2). Xie et al., NeurIPS 2021.
-  - "Unet" + "tu-convnext_tiny" — CNN failsafe, Liu et al., CVPR 2022.
+Builds a UNet ResNet34 segmentation model via segmentation_models_pytorch
+and provides a combined BCE + Dice loss for binary segmentation of sparse
+targets like polymetallic nodules.
 """
 from __future__ import annotations
 import logging
@@ -13,17 +10,10 @@ import torch.nn as nn
 import segmentation_models_pytorch as smp
 
 logger = logging.getLogger(__name__)
-_STRIDE32_ARCHS = {"segformer"}
 
-def _assert_patch_divisibility(arch, patch_size):
-    if arch.lower() in _STRIDE32_ARCHS and patch_size % 32 != 0:
-        raise ValueError(
-            f"{arch} requires input spatial dims divisible by 32, "
-            f"got patch_size={patch_size}. Adjust config.PATCHING['patch_size']."
-        )
 
-def _create_smp(model_cfg):
-    return smp.create_model(
+def build_model(model_cfg, **_kw):
+    model = smp.create_model(
         arch=model_cfg["architecture"],
         encoder_name=model_cfg["encoder_name"],
         encoder_weights=model_cfg.get("encoder_weights", "imagenet"),
@@ -31,89 +21,57 @@ def _create_smp(model_cfg):
         classes=model_cfg.get("classes", 1),
         activation=None,  # raw logits — sigmoid applied in loss / inference
     )
-
-def build_model(
-    model_cfg,
-    patch_size = None,
-    failsafe_cfg = None,
-):
-    if failsafe_cfg is None:
-        try:
-            import config  # type: ignore
-            failsafe_cfg = getattr(config, "FAILSAFE_MODEL", None)
-        except Exception:  # noqa: BLE001
-            failsafe_cfg = None
-
-    arch = model_cfg["architecture"]
-    if patch_size is not None:
-        _assert_patch_divisibility(arch, patch_size)
-
-    # Try the primary preset first.
-    try:
-        model = _create_smp(model_cfg)
-        active_cfg = model_cfg
-        used_failsafe = False
-    except Exception as exc: 
-        if failsafe_cfg is None:
-            raise
-        logger.warning(
-            "  Failed to build primary model %s + %s (%s). "
-            "Falling back to failsafe preset %s + %s.",
-            arch, model_cfg.get("encoder_name"), exc,
-            failsafe_cfg["architecture"], failsafe_cfg["encoder_name"],
-        )
-        if patch_size is not None:
-            _assert_patch_divisibility(failsafe_cfg["architecture"], patch_size)
-        model = _create_smp(failsafe_cfg)
-        active_cfg = failsafe_cfg
-        used_failsafe = True
-
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    tag = "FAILSAFE" if used_failsafe else "primary"
     logger.info(
-        "  Model [%s]: %s + %s  (weights=%s, in=%d, classes=%d, params=%.1fM)",
-        tag,
-        active_cfg["architecture"],
-        active_cfg["encoder_name"],
-        active_cfg.get("encoder_weights", "imagenet"),
-        active_cfg.get("in_channels", 3),
-        active_cfg.get("classes", 1),
+        "  Model: %s + %s  (weights=%s, in=%d, classes=%d, params=%.1fM)",
+        model_cfg["architecture"],
+        model_cfg["encoder_name"],
+        model_cfg.get("encoder_weights", "imagenet"),
+        model_cfg.get("in_channels", 3),
+        model_cfg.get("classes", 1),
         n_params,
     )
     return model
 
+
 class DiceLoss(nn.Module):
-    # Soft Dice loss for binary segmentation.
-    def __init__(self, smooth = 1e-6):
+    def __init__(self, smooth=1.0):
         super().__init__()
         self.smooth = smooth
 
     def forward(self, logits, targets):
         probs = torch.sigmoid(logits)
-        probs_flat   = probs.view(probs.size(0), -1)
-        targets_flat = targets.view(targets.size(0), -1)
+        p = probs.view(probs.size(0), -1)
+        t = targets.view(targets.size(0), -1)
 
-        intersection = (probs_flat * targets_flat).sum(dim=1)
-        denom        = probs_flat.sum(dim=1) + targets_flat.sum(dim=1)
+        intersection = (p * t).sum(dim=1)
+        denom = p.sum(dim=1) + t.sum(dim=1)
 
         dice = (2.0 * intersection + self.smooth) / (denom + self.smooth)
         return 1.0 - dice.mean()
 
+
 class FocalTverskyLoss(nn.Module):
-    # Focal Tversky loss — precision-biased region loss.
-    # The Tversky index generalises the Dice coefficient by allowing asymmetric weighting of FP and FN
-    def __init__(
-        self,
-        alpha = 0.7,
-        beta = 0.3,
-        gamma = 4.0 / 3.0,
-        smooth = 1e-6,
-    ):
+    """Focal Tversky Loss (Abraham & Khan, 2019).
+
+    Tversky index generalises Dice by weighting FP and FN independently.
+    Setting alpha < beta penalises false negatives more heavily — exactly
+    what sparse small-object segmentation needs (missing a nodule is worse
+    than a spurious detection).
+
+    The focal modulation (1 - TI)^gamma further down-weights easy, well-
+    segmented samples so the gradient is dominated by hard examples.
+
+    Defaults:
+        alpha = 0.3  (FP weight — lenient on false positives)
+        beta  = 0.7  (FN weight — harsh on missed nodules)
+        gamma = 4/3  (focal exponent — mild focus on hard samples)
+    """
+
+    def __init__(self, alpha=0.3, beta=0.7, gamma=4 / 3, smooth=1e-6):
         super().__init__()
-        if alpha <= 0 or beta <= 0:
-            raise ValueError(f"alpha and beta must be positive; got {alpha=}, {beta=}")
         self.alpha = alpha
-        self.beta  = beta
+        self.beta = beta
         self.gamma = gamma
         self.smooth = smooth
 
@@ -129,56 +87,53 @@ class FocalTverskyLoss(nn.Module):
         tversky = (tp + self.smooth) / (
             tp + self.alpha * fp + self.beta * fn + self.smooth
         )
-        loss = torch.pow(torch.clamp(1.0 - tversky, min=0.0), self.gamma)
-        return loss.mean()
+        focal_tversky = (1.0 - tversky).pow(self.gamma)
+        return focal_tversky.mean()
+
 
 class CombinedLoss(nn.Module):
-    # BCE + Focal-Tversky — the active training loss.
+    # BCE + Dice (legacy baseline)
+
+    def __init__(self, bce_weight=0.5, dice_weight=0.5, **_kw):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.dice = DiceLoss()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+
+    def forward(self, logits, targets):
+        return (
+            self.bce_weight * self.bce(logits, targets)
+            + self.dice_weight * self.dice(logits, targets)
+        )
+
+
+class FocalTverskyCombinedLoss(nn.Module):
+    """BCE + Focal Tversky — drop-in replacement for CombinedLoss.
+
+    BCE stabilises early training (per-pixel cross-entropy provides dense,
+    well-behaved gradients even when predictions are random).  Focal
+    Tversky drives the model toward recall on sparse small objects once
+    the predictions become meaningful.
+    """
 
     def __init__(
         self,
-        bce_weight = 0.3,
-        tversky_weight = 0.7,
-        alpha = 0.7,
-        beta = 0.3,
-        gamma = 4.0 / 3.0,
-        bce_pos_weight = None,
-        label_smoothing = 0.0,
-        dice_weight = None,
+        bce_weight=0.3,
+        ftl_weight=0.7,
+        alpha=0.3,
+        beta=0.7,
+        gamma=4 / 3,
+        **_kw,
     ):
         super().__init__()
-        if dice_weight is not None:
-            tversky_weight = dice_weight
-
-        if bce_pos_weight is not None:
-            self.bce = nn.BCEWithLogitsLoss(
-                pos_weight=torch.tensor(float(bce_pos_weight))
-            )
-        else:
-            self.bce = nn.BCEWithLogitsLoss()
-
-        self.tversky        = FocalTverskyLoss(alpha=alpha, beta=beta, gamma=gamma)
-        self.bce_weight     = bce_weight
-        self.tversky_weight = tversky_weight
-
-        # Label smoothing — symmetric two-sided, shrinks hard targets toward 0.5 so the network stops chasing 
-        # obviously-wrong pixels to logit infinity. Cheapest possible robustness against proxy-label noise 
-        # (Reed et al. 2015 bootstrapping; Müller et al. NeurIPS 2019 "When does label smoothing help?").
-        if not 0.0 <= label_smoothing < 0.5:
-            raise ValueError(
-                f"label_smoothing must be in [0, 0.5), got {label_smoothing}"
-            )
-        self.label_smoothing = float(label_smoothing)
-
-    def _smooth(self, targets):
-        eps = self.label_smoothing
-        if eps == 0.0:
-            return targets
-        return targets * (1.0 - 2.0 * eps) + eps
+        self.bce = nn.BCEWithLogitsLoss()
+        self.ftl = FocalTverskyLoss(alpha=alpha, beta=beta, gamma=gamma)
+        self.bce_weight = bce_weight
+        self.ftl_weight = ftl_weight
 
     def forward(self, logits, targets):
-        t = self._smooth(targets)
         return (
-            self.bce_weight     * self.bce(logits, t)
-            + self.tversky_weight * self.tversky(logits, t)
+            self.bce_weight * self.bce(logits, targets)
+            + self.ftl_weight * self.ftl(logits, targets)
         )

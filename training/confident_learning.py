@@ -146,19 +146,19 @@ class ConfidentLabelAuditor:
 
     def __init__(
         self,
-        model: nn.Module,
-        device: str = "cuda",
+        model,
+        device = "cuda",
         *,
-        low_thresh: float = 0.15,
-        high_thresh: float = 0.85,
-        w_fp: float = 0.6,
-        w_fn: float = 0.3,
-        w_dd: float = 0.1,
-        adaptive_thresholds: bool = False,
-        batch_size: int = 16,
-        num_workers: int = 4,
-        input_mode: str = "rgb",
-    ) -> None:
+        low_thresh = 0.15,
+        high_thresh = 0.85,
+        w_fp = 0.6,
+        w_fn = 0.3,
+        w_dd = 0.1,
+        adaptive_thresholds = False,
+        batch_size = 16,
+        num_workers = 4,
+        input_mode = "rgb",
+    ):
         self.model = model.to(device).eval()
         self.device = device
         self.low_thresh  = low_thresh
@@ -178,9 +178,9 @@ class ConfidentLabelAuditor:
 
     def score(
         self,
-        records: list[dict],
-        corrected_masks_dir: Path | str | None = None,
-    ) -> list[PatchAuditScore]:
+        records,
+        corrected_masks_dir = None,
+    ):
         """Score all proxy-labelled patches in ``records``.
 
         Records whose ``patch_id`` already has a corrected mask are
@@ -216,7 +216,7 @@ class ConfidentLabelAuditor:
     # ── Single forward pass over the dataset ────────────────────────
 
     @torch.no_grad()
-    def _single_pass(self, records: list[dict]) -> list[PatchAuditScore]:
+    def _single_pass(self, records):
         """Forward every patch once and compute disagreement stats."""
         dataset = NoduleSegmentationDataset(
             records,
@@ -252,10 +252,10 @@ class ConfidentLabelAuditor:
 
     def _score_batch(
         self,
-        probs: torch.Tensor,
-        targets: torch.Tensor,
-        batch_records: list[dict],
-    ) -> list[PatchAuditScore]:
+        probs,
+        targets,
+        batch_records,
+    ):
         """Compute per-patch audit scores for one batch."""
         # Shapes: probs (B,1,H,W), targets (B,1,H,W)
         p = probs.squeeze(1)                 # (B, H, W)
@@ -316,8 +316,8 @@ class ConfidentLabelAuditor:
 
     def _compute_adaptive_thresholds(
         self,
-        scores: list[PatchAuditScore],
-    ) -> tuple[float, float]:
+        scores,
+    ):
         """Northcutt-style self-confidence thresholds.
 
         t_0 = mean model-probability over all pixels labelled 0 in the proxy.
@@ -349,9 +349,9 @@ class ConfidentLabelAuditor:
 
     @staticmethod
     def _filter_uncorrected(
-        records: list[dict],
-        corrected_masks_dir: Path | str | None,
-    ) -> list[dict]:
+        records,
+        corrected_masks_dir,
+    ):
         """Drop records whose patch_id already has a corrected mask."""
         if corrected_masks_dir is None:
             return list(records)
@@ -365,11 +365,11 @@ class ConfidentLabelAuditor:
 # ── Export to annotation inbox ──────────────────────────────────────────
 
 def export_audit_queue(
-    scores: list[PatchAuditScore],
-    output_dir: Path | str,
-    top_k: int | None = 200,
-    save_visualizations: bool = True,
-) -> Path:
+    scores,
+    output_dir,
+    top_k = 200,
+    save_visualizations = True,
+):
     """Write the top-K disagreements to the annotation inbox.
 
     Produces:
@@ -429,9 +429,9 @@ def export_audit_queue(
 
 
 def _render_audit_visualizations(
-    scores: Iterable[PatchAuditScore],
-    out_dir: Path,
-) -> None:
+    scores,
+    out_dir,
+):
     """Save a side-by-side (image | proxy overlay | disagreement) panel
     for each queued patch. This is the annotator's at-a-glance view.
 
@@ -484,11 +484,11 @@ def _render_audit_visualizations(
 # ── Convenience loader for checkpoints ──────────────────────────────────
 
 def load_model_from_checkpoint(
-    checkpoint_path: Path | str,
-    model_cfg: dict,
-    device: str,
-    patch_size: int | None = None,
-) -> nn.Module:
+    checkpoint_path,
+    model_cfg,
+    device,
+    patch_size = None,
+):
     """Rebuild a model from a config preset and load its weights.
 
     Separate from ``training.model.build_model`` so callers can use the

@@ -13,9 +13,113 @@ from torch.utils.data import Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# ImageNet normalisation
+# ImageNet normalisation (for RGB / grayscale modes)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+import json as _json
+import logging as _logging
+
+_norm_logger = _logging.getLogger(__name__)
+
+
+def compute_channel_stats(records, input_mode):
+    """Compute per-channel (mean, std) over all patches for a given input mode.
+
+    Uses Welford-style online accumulation so only one patch is in memory at
+    a time.  Returns ((mean_c0, mean_c1, mean_c2), (std_c0, std_c1, std_c2)).
+    """
+    n = 0
+    ch_sum = np.zeros(3, dtype=np.float64)
+    ch_sq  = np.zeros(3, dtype=np.float64)
+
+    for rec in records:
+        bgr = cv2.imread(rec["image_path"], cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        img = _prepare_image(bgr, input_mode).astype(np.float64) / 255.0
+        pixels = img.shape[0] * img.shape[1]
+        for c in range(3):
+            ch = img[:, :, c]
+            ch_sum[c] += ch.sum()
+            ch_sq[c]  += (ch ** 2).sum()
+        n += pixels
+
+    mean = ch_sum / n
+    std  = np.sqrt(ch_sq / n - mean ** 2)
+    return tuple(np.round(mean, 4).tolist()), tuple(np.round(std, 4).tolist())
+
+
+def get_normalization_stats(input_mode, records=None, cache_dir=None):
+    """Return (mean, std) tuples appropriate for the given input mode.
+
+    For ``"rgb"`` and ``"grayscale"`` this always returns ImageNet stats
+    (the pretrained encoder expects them).
+
+    For ``"engineered"`` the stats are computed from the actual patches
+    the first time, then cached to ``<cache_dir>/engineered_norm_stats.json``.
+    The cache auto-invalidates when the patch count changes.  If no
+    *records* are provided (e.g. at inference time), the cache is read
+    as-is — if it doesn't exist the function falls back to ImageNet stats
+    with a warning.
+    """
+    if input_mode != "engineered":
+        return IMAGENET_MEAN, IMAGENET_STD
+
+    # Resolve cache path
+    if cache_dir is None:
+        try:
+            import config as _cfg  # type: ignore[import]
+            cache_dir = _cfg.CHECKPOINTS_DIR
+        except Exception:
+            cache_dir = None
+
+    cache_file = Path(cache_dir) / "engineered_norm_stats.json" if cache_dir else None
+
+    # Try to load from cache
+    if cache_file is not None and cache_file.exists():
+        with open(cache_file) as f:
+            cached = _json.load(f)
+        cached_n = cached.get("num_patches", -1)
+        current_n = len(records) if records is not None else cached_n
+        if cached_n == current_n:
+            _norm_logger.debug("  Engineered norm stats loaded from cache (%d patches)", cached_n)
+            return tuple(cached["mean"]), tuple(cached["std"])
+        _norm_logger.info(
+            "  Patch count changed (%d → %d) — recomputing engineered norm stats",
+            cached_n, current_n,
+        )
+
+    # Compute from scratch (requires records)
+    if records is None:
+        # Inference path — no records available, cache missing or stale
+        if cache_file is not None and cache_file.exists():
+            with open(cache_file) as f:
+                cached = _json.load(f)
+            _norm_logger.warning(
+                "  No records supplied; using stale engineered norm cache (%d patches)",
+                cached.get("num_patches", -1),
+            )
+            return tuple(cached["mean"]), tuple(cached["std"])
+        _norm_logger.warning(
+            "  No engineered norm cache found and no records supplied — "
+            "falling back to ImageNet stats (results will be suboptimal)"
+        )
+        return IMAGENET_MEAN, IMAGENET_STD
+
+    _norm_logger.info("  Computing engineered channel stats over %d patches ...", len(records))
+    mean, std = compute_channel_stats(records, "engineered")
+    _norm_logger.info("  Engineered mean=%s  std=%s", mean, std)
+
+    # Write cache
+    if cache_file is not None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, "w") as f:
+            _json.dump({"mean": list(mean), "std": list(std),
+                        "num_patches": len(records)}, f, indent=2)
+        _norm_logger.info("  Cached → %s", cache_file)
+
+    return mean, std
 
 # Input-mode literals 
 InputMode = Literal["rgb", "grayscale", "engineered"]
@@ -67,83 +171,67 @@ def _prepare_image(bgr, input_mode):
         return np.stack([gray, gray, gray], axis=-1)
     return compute_engineered_channels(bgr)
 
-def get_train_augmentations(patch_size = 256, input_mode = "rgb"):
+def get_train_augmentations(patch_size = 256, input_mode = "rgb", norm_stats = None):
     """
     Augmentation pipeline for training split.
     Tuned for deep-sea AUV mosaics (low-contrast, near-grayscale, rigid
     geological targets, already heavily preprocessed by Step 1).
 
+    Parameters
+    ----------
+    norm_stats : tuple[tuple, tuple] | None
+        Pre-computed (mean, std) from ``get_normalization_stats``.  When
+        ``None`` the function calls ``get_normalization_stats`` itself
+        (fine for rgb/grayscale, but for engineered mode the caller
+        should pass pre-computed stats so the cache is used).
+
     Contains Flips + 90 degree rotations, Affine jitter, GridDistortion, ElasticTransform,
     RandomBrightnessContrast, CLAHE (RGB/grayscale only), GaussianBlur, ISONoise (RGB only), and CoarseDropout
     """
     _validate_input_mode(input_mode)
-    is_rgb_like = input_mode == "rgb"
+    if norm_stats is not None:
+        norm_mean, norm_std = norm_stats
+    else:
+        norm_mean, norm_std = get_normalization_stats(input_mode)
 
     return A.Compose([
+        # ── Geometric ────────────────────────────────────────────────
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        A.Affine(
-            translate_percent=(-0.05, 0.05),
-            scale=(0.90, 1.10),
-            rotate=(-15, 15),
-            border_mode=cv2.BORDER_REFLECT_101,
-            p=0.4,
-        ),
-        A.GridDistortion(
-            num_steps=5,
-            distort_limit=0.2,
-            border_mode=cv2.BORDER_REFLECT_101,
-            p=0.2,
+        A.ShiftScaleRotate(
+            shift_limit=0.05, scale_limit=0.10, rotate_limit=15,
+            border_mode=cv2.BORDER_REFLECT_101, p=0.4,
         ),
         A.ElasticTransform(
-            alpha=20,
-            sigma=5,
-            border_mode=cv2.BORDER_REFLECT_101,
-            p=0.1,  # rigid targets → keep this low
+            alpha=30, sigma=120 * 0.05,
+            border_mode=cv2.BORDER_REFLECT_101, p=0.2,
         ),
 
-        # Intensity (image only)
+        # ── Intensity ────────────────────────────────────────────────
         A.RandomBrightnessContrast(
             brightness_limit=0.15, contrast_limit=0.15, p=0.4,
         ),
-        *(
-            [A.CLAHE(
-                clip_limit=(1.0, 2.0),  
-                tile_grid_size=(8, 8),   
-                p=0.3,
-            )] if is_rgb_like else []
+        A.HueSaturationValue(
+            hue_shift_limit=8, sat_shift_limit=15, val_shift_limit=15, p=0.3,
         ),
         A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-        *(
-            [A.ISONoise(
-                color_shift=(0.005, 0.015),  
-                intensity=(0.10, 0.30),
-                p=0.25,
-            )]
-            if is_rgb_like
-            else [A.GaussNoise(std_range=(0.01, 0.05), p=0.25)]
-        ),
+        A.GaussNoise(std_range=(0.01, 0.03), p=0.2),
 
-        # Occlusion
-        A.CoarseDropout(
-            num_holes_range=(2, 8),
-            hole_height_range=(8, 16),
-            hole_width_range=(8, 16),
-            fill=0,
-            p=0.25,
-        ),
-
-        # Final normalisation 
-        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        # ── Final normalisation — mode-aware ─────────────────────────
+        A.Normalize(mean=norm_mean, std=norm_std),
         ToTensorV2(),
     ])
 
-def get_val_augmentations(input_mode = "rgb"):
+def get_val_augmentations(input_mode = "rgb", norm_stats = None):
     # Deterministic normalisation only — no random transforms.
     _validate_input_mode(input_mode)
+    if norm_stats is not None:
+        norm_mean, norm_std = norm_stats
+    else:
+        norm_mean, norm_std = get_normalization_stats(input_mode)
     return A.Compose([
-        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        A.Normalize(mean=norm_mean, std=norm_std),
         ToTensorV2(),
     ])
 

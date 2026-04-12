@@ -44,6 +44,7 @@ from training import (
     EpochLog,
     get_train_augmentations,
     get_val_augmentations,
+    get_normalization_stats,
 )
 
 # Logging 
@@ -173,7 +174,9 @@ def main():
         logger.info("  Device: CPU (training will be slow)")
 
     # Build effective config (CLI overrides)
-    train_cfg = dict(config.TRAINING) 
+    train_cfg = dict(config.TRAINING)
+    # Pass input_mode so the trainer can auto-select encoder_lr_multiplier
+    train_cfg["_input_mode"] = config.MODEL.get("input_mode", "rgb")
     if args.epochs is not None:
         train_cfg["num_epochs"] = args.epochs
     if args.batch_size is not None:
@@ -228,12 +231,19 @@ def main():
     input_mode = config.MODEL.get("input_mode", "rgb")
     logger.info(f"  Input mode      : {input_mode}")
 
-    train_transform = (
-        get_train_augmentations(patch_size, input_mode=input_mode)
-        if use_aug
-        else get_val_augmentations(input_mode=input_mode)
+    # Compute normalization stats (auto-cached; recomputes when patch count changes)
+    norm_stats = get_normalization_stats(
+        input_mode, records=records, cache_dir=config.CHECKPOINTS_DIR,
     )
-    val_transform = get_val_augmentations(input_mode=input_mode)
+    logger.info(f"  Norm mean       : {norm_stats[0]}")
+    logger.info(f"  Norm std        : {norm_stats[1]}")
+
+    train_transform = (
+        get_train_augmentations(patch_size, input_mode=input_mode, norm_stats=norm_stats)
+        if use_aug
+        else get_val_augmentations(input_mode=input_mode, norm_stats=norm_stats)
+    )
+    val_transform = get_val_augmentations(input_mode=input_mode, norm_stats=norm_stats)
 
     # Use manually corrected masks when available (from Step annotation phase)
     corrected_dir = str(config.CORRECTED_MASKS_DIR) if config.CORRECTED_MASKS_DIR.exists() else None
@@ -344,40 +354,25 @@ def main():
 
     # Build model + loss
     logger.info("Building model ...")
-    effective_input_size = patch_size + 2 * mirror_pad
-    model = build_model(config.MODEL, patch_size=effective_input_size)
+    model = build_model(config.MODEL)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     logger.info(f"  Parameters: {n_params:.1f}M")
 
     criterion = CombinedLoss(
-        bce_weight=train_cfg.get("bce_weight", 0.3),
-        tversky_weight=train_cfg.get("tversky_weight", 0.7),
-        alpha=train_cfg.get("tversky_alpha", 0.7),
-        beta=train_cfg.get("tversky_beta", 0.3),
-        gamma=train_cfg.get("tversky_gamma", 4.0 / 3.0),
-        bce_pos_weight=train_cfg.get("bce_pos_weight", None),
-        label_smoothing=train_cfg.get("label_smoothing", 0.0),
-        # Back-compat: honour old `dice_weight` key if present
-        dice_weight=train_cfg.get("dice_weight", None),
+        bce_weight=train_cfg.get("bce_weight", 0.5),
+        dice_weight=train_cfg.get("dice_weight", 0.5),
     )
     logger.info(
-        f"  Loss: BCE({train_cfg.get('bce_weight', 0.3)}) + "
-        f"FocalTversky("
-        f"α={train_cfg.get('tversky_alpha', 0.7)}, "
-        f"β={train_cfg.get('tversky_beta', 0.3)}, "
-        f"γ={train_cfg.get('tversky_gamma', 4.0/3.0):.3f}) "
-        f"× {train_cfg.get('tversky_weight', 0.7)}  │  "
-        f"label_smoothing={train_cfg.get('label_smoothing', 0.0)}"
+        f"  Loss: BCE({train_cfg.get('bce_weight', 0.5)}) + "
+        f"Dice({train_cfg.get('dice_weight', 0.5)})"
     )
 
-    # Build trainer — OneCycleLR needs steps_per_epoch to compute total_steps
     trainer = Trainer(
         model=model,
         criterion=criterion,
         train_cfg=train_cfg,
         checkpoint_dir=config.CHECKPOINTS_DIR,
         device=device,
-        steps_per_epoch=len(train_loader),
     )
     start_epoch = 0
     if args.resume:
@@ -409,20 +404,34 @@ def main():
     )
     elapsed = time.time() - t0
 
-    # Evaluate on test set 
+    # Evaluate on test set
     logger.info("─" * 70)
     logger.info("Evaluating best model on test set ...")
     best_ckpt = Path(result.best_checkpoint_path)
     if best_ckpt.exists():
         trainer.load_checkpoint(best_ckpt)
-    test_loss, test_iou, test_dice = trainer._validate(
-        test_loader, sweep_thresholds=False,
-    )
+    test_loss, test_iou, test_dice = trainer._validate(test_loader)
     logger.info(
         f"  Test loss: {test_loss:.4f}  │  "
-        f"Test Dice: {test_dice:.4f}  │  Test IoU: {test_iou:.4f}  │  "
-        f"thr={trainer.best_threshold:.2f}"
+        f"Test Dice: {test_dice:.4f}  │  Test IoU: {test_iou:.4f}"
     )
+
+    # Threshold optimisation — sweep val set to find best operating point
+    logger.info("─" * 70)
+    logger.info("Optimising probability threshold on validation set ...")
+    best_threshold, threshold_dice = trainer.find_best_threshold(val_loader)
+    logger.info(
+        f"  Best threshold: {best_threshold:.3f}  │  "
+        f"Val Dice @ threshold: {threshold_dice:.4f}  │  "
+        f"(default 0.5 Dice: {result.best_val_dice:.4f})"
+    )
+
+    # Re-save best checkpoint with threshold embedded
+    trainer._save_checkpoint(
+        result.best_epoch, result.best_val_dice, "best",
+        best_threshold=best_threshold,
+    )
+    logger.info(f"  Re-saved best checkpoint with best_threshold={best_threshold:.3f}")
 
     # Update pipeline manifest
     manifest = _load_manifest()
@@ -439,7 +448,7 @@ def main():
         "epochs_run":           result.epochs_run,
         "best_epoch":           result.best_epoch,
         "best_val_dice":        round(result.best_val_dice, 6),
-        "best_threshold":       round(result.best_threshold, 4),
+        "best_threshold":        best_threshold,
         "test_metrics": {
             "loss":  round(test_loss, 6),
             "dice":  round(test_dice, 6),
@@ -461,9 +470,9 @@ def main():
     logger.info(f"  Epochs run        : {result.epochs_run}")
     logger.info(f"  Best epoch        : {result.best_epoch}")
     logger.info(f"  Best val Dice     : {result.best_val_dice:.4f}")
-    logger.info(f"  Best threshold    : {result.best_threshold:.2f}")
     logger.info(f"  Test Dice         : {test_dice:.4f}")
     logger.info(f"  Test IoU          : {test_iou:.4f}")
+    logger.info(f"  Best threshold    : {best_threshold:.3f}")
     logger.info(f"  Total time        : {elapsed:.1f}s")
     logger.info(f"  Best checkpoint   : {result.best_checkpoint_path}")
     logger.info(f"  Training history  : {history_path}")
