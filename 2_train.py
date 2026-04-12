@@ -1,6 +1,6 @@
 """
 Step 2 — Train Nodule Segmentation Model
-This script handles ONLY:
+This script handles:
   - CLI argument parsing
   - Logging setup (file + console)
   - Pipeline manifest tracking (CoralNet-inspired idempotency)
@@ -47,8 +47,7 @@ from training import (
 )
 
 # Logging 
-def _setup_logging() -> None:
-    """Configure root logger to write to console + log file."""
+def _setup_logging():
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = config.LOGS_DIR / "train.log"
 
@@ -74,25 +73,24 @@ logger = logging.getLogger(__name__)
 # Pipeline Manifest
 
 MANIFEST_PATH = config.OUTPUT_DIR / "pipeline_manifest.json"
-def _load_manifest() -> dict:
+def _load_manifest():
     if MANIFEST_PATH.exists():
         with open(MANIFEST_PATH) as f:
             return json.load(f)
     return {"version": "2.0", "mosaics": {}}
 
-def _save_manifest(manifest: dict) -> None:
+def _save_manifest(manifest):
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
 
 # Data Loading
-def _collect_patch_records() -> list[dict]:
-    """Gather all patch records from every mosaic's patch_manifest.json."""
+def _collect_patch_records():
+    # Gathers all patch records from every mosaic's patch_manifest.json
     records = []
     for manifest_file in sorted(config.PATCHES_DIR.glob("*/patch_manifest.json")):
         with open(manifest_file) as f:
             mosaic_records = json.load(f)
-        # Validate paths exist
         valid = [
             r for r in mosaic_records
             if Path(r["image_path"]).exists() and Path(r["mask_path"]).exists()
@@ -106,11 +104,11 @@ def _collect_patch_records() -> list[dict]:
     return records
 
 # Epoch Logging Callback
-def _make_epoch_callback(history_path: Path):
+def _make_epoch_callback(history_path):
     """Return a callback that logs each epoch and appends to a JSON history."""
     history = []
 
-    def callback(log: EpochLog) -> None:
+    def callback(log):
         logger.info(
             f"  Epoch {log.epoch:3d}  │  "
             f"loss {log.train_loss:.4f} / {log.val_loss:.4f}  │  "
@@ -128,14 +126,13 @@ def _make_epoch_callback(history_path: Path):
             "val_iou":    round(log.val_iou, 6),
             "lr":         log.lr,
         })
-        # Write after every epoch so progress is never lost
         with open(history_path, "w") as f:
             json.dump(history, f, indent=2)
 
     return callback
 
 # CLI Entry Point
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
         description="Step 2: Train U-Net segmentation model on preprocessed patches",
     )
@@ -176,7 +173,7 @@ def main() -> None:
         logger.info("  Device: CPU (training will be slow)")
 
     # Build effective config (CLI overrides)
-    train_cfg = dict(config.TRAINING)  # copy
+    train_cfg = dict(config.TRAINING) 
     if args.epochs is not None:
         train_cfg["num_epochs"] = args.epochs
     if args.batch_size is not None:
@@ -186,7 +183,6 @@ def main() -> None:
     if args.no_augmentation:
         train_cfg["augmentation"] = False
 
-    # Banner
     logger.info("=" * 70)
     logger.info("BOEM CV  —  Step 2: Train Segmentation Model")
     logger.info("=" * 70)
@@ -222,7 +218,6 @@ def main() -> None:
         test_frac=train_cfg["test_split"],
         seed=train_cfg["random_seed"],
     )
-    # Save split composition for reproducibility
     split_path = config.CHECKPOINTS_DIR / "split_info.json"
     save_split_info(train_recs, val_recs, test_recs, split_path, train_cfg["random_seed"])
 
@@ -240,14 +235,13 @@ def main() -> None:
     )
     val_transform = get_val_augmentations(input_mode=input_mode)
 
-    # Use manually corrected masks when available (from Step 4)
+    # Use manually corrected masks when available (from Step annotation phase)
     corrected_dir = str(config.CORRECTED_MASKS_DIR) if config.CORRECTED_MASKS_DIR.exists() else None
     if corrected_dir:
         n_corrected = len(list(config.CORRECTED_MASKS_DIR.glob("*.png")))
         logger.info(f"  Found {n_corrected} manually corrected masks — will prefer over proxy labels")
 
-    # Copy-Paste augmentation — mines nodules from high-coverage source
-    # patches and pastes them into the current patch. Training-only.
+    # Copy-Paste augmentation — mines nodules from high-coverage source (Inspired by Ghiasi 2021)
     copy_paste = None
     if train_cfg.get("copy_paste", False) and use_aug:
         cp = CopyPasteAugmentation(
@@ -270,27 +264,34 @@ def main() -> None:
                 f"min_source_coverage={train_cfg.get('copy_paste_min_coverage', 5.0)} — disabled"
             )
 
+    # Mirror-padded training context for edge pixels (16 pixels)
+    mirror_pad = int(train_cfg.get("mirror_pad", 0))
+    if mirror_pad > 0:
+        logger.info(
+            f"  Mirror-pad     : {mirror_pad}px each side  → "
+            f"input {patch_size + 2 * mirror_pad}px, "
+            f"loss on centre {patch_size}px"
+        )
+
     train_ds = NoduleSegmentationDataset(train_recs, transform=train_transform,
                                          corrected_masks_dir=corrected_dir,
                                          input_mode=input_mode,
-                                         copy_paste=copy_paste)
+                                         copy_paste=copy_paste,
+                                         mirror_pad=mirror_pad)
     val_ds   = NoduleSegmentationDataset(val_recs,   transform=val_transform,
                                          corrected_masks_dir=corrected_dir,
-                                         input_mode=input_mode)
+                                         input_mode=input_mode,
+                                         mirror_pad=mirror_pad)
     test_ds  = NoduleSegmentationDataset(test_recs,  transform=val_transform,
                                          corrected_masks_dir=corrected_dir,
-                                         input_mode=input_mode)
+                                         input_mode=input_mode,
+                                         mirror_pad=mirror_pad)
 
     num_workers = train_cfg.get("num_workers", 4)
     pin_memory  = (device == "cuda")
-    # Hygiene: keep workers alive across epochs and pre-fetch more batches.
-    # Kills per-epoch worker respawn overhead. Only valid when num_workers > 0.
     persistent_workers = num_workers > 0
     prefetch_factor    = 4 if num_workers > 0 else None
 
-    # WeightedRandomSampler — upweights dense-coverage bins so the
-    # network sees more foreground per epoch. Mutually exclusive with
-    # DataLoader's shuffle=True.
     train_sampler = None
     if train_cfg.get("use_weighted_sampler", False):
         mult = train_cfg.get("weighted_sampler_multiplier", 5.0)
@@ -343,7 +344,8 @@ def main() -> None:
 
     # Build model + loss
     logger.info("Building model ...")
-    model = build_model(config.MODEL, patch_size=patch_size)
+    effective_input_size = patch_size + 2 * mirror_pad
+    model = build_model(config.MODEL, patch_size=effective_input_size)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     logger.info(f"  Parameters: {n_params:.1f}M")
 
@@ -377,7 +379,6 @@ def main() -> None:
         device=device,
         steps_per_epoch=len(train_loader),
     )
-    # Resume if requested
     start_epoch = 0
     if args.resume:
         last_ckpt = config.CHECKPOINTS_DIR / "checkpoint_last.pt"
@@ -408,7 +409,7 @@ def main() -> None:
     )
     elapsed = time.time() - t0
 
-    # Evaluate on test set — reuse the val-selected threshold (no leakage).
+    # Evaluate on test set 
     logger.info("─" * 70)
     logger.info("Evaluating best model on test set ...")
     best_ckpt = Path(result.best_checkpoint_path)
@@ -452,7 +453,8 @@ def main() -> None:
         "elapsed_seconds":      round(elapsed, 1),
     })
     _save_manifest(manifest)
-    # ── Final Summary ────────────────────────────────────────────────
+    
+    # Final Summary Log
     logger.info("=" * 70)
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 70)
