@@ -11,10 +11,8 @@ from __future__ import annotations
 import logging
 import math
 import struct
-
 from pathlib import Path
 from typing import Optional
-
 logger = logging.getLogger(__name__)
 
 def extract_meters_per_pixel(filepath, fallback):
@@ -92,7 +90,6 @@ def _unpack_doubles(tag_entry, n):
     bo, dtype, count, data = tag_entry
     return [struct.unpack(bo + "d", data[i * 8 : (i + 1) * 8])[0] for i in range(n)]
 
-
 def _unpack_shorts(tag_entry, n):
     bo, dtype, count, data = tag_entry
     return [struct.unpack(bo + "H", data[i * 2 : (i + 1) * 2])[0] for i in range(n)]
@@ -116,7 +113,6 @@ def _get_latitude(tags):
 
     return None
 
-
 def _is_geographic_crs(tags):
     if 34735 not in tags:
         return True  # assume geographic if we can't tell
@@ -128,7 +124,6 @@ def _is_geographic_crs(tags):
             value = shorts[i + 3] if i + 3 < len(shorts) else 0
             return value == 2 
     return True 
-
 
 def _mpp_from_transformation_tag(tags, name):
     # Compute m/px from the 4×4 ModelTransformationTag

@@ -1,5 +1,5 @@
 """
-This script is to ...
+This script is to 
 Split the seafloor .TIF strips into smaller patches and can recombine them later (for inference). 
 """
 from __future__ import annotations
@@ -26,8 +26,8 @@ class PatchInfo:
     rejection_reason: str = ""
 
 class MosaicPatcher:
-    def __init__(self,patch_size: int = 256, overlap: int = 32, min_std: float = 3.0, min_mean: float = 10.0, 
-        max_black_fraction: float = 0.25, max_noise: float = 0):
+    def __init__(self,patch_size = 256, overlap = 32, min_std = 3.0, min_mean = 10.0, 
+        max_black_fraction = 0.25, max_noise = 0):
         self.patch_size = patch_size
         self.overlap = overlap
         self.stride = patch_size - overlap
@@ -95,7 +95,6 @@ class MosaicPatcher:
                 x_end = min(x + ps, W)
                 patch = mosaic[y:y_end, x:x_end]
 
-                # Pad if the patch is smaller than patch_size (edge case)
                 if patch.shape[0] < ps or patch.shape[1] < ps:
                     padded = np.zeros((ps, ps, mosaic.shape[2]), dtype=mosaic.dtype)
                     padded[: patch.shape[0], : patch.shape[1]] = patch
@@ -154,13 +153,11 @@ class MosaicPatcher:
         if length <= patch_size:
             return [0]
         positions = list(range(0, length - patch_size + 1, stride))
-        # Ensure the very last pixel is covered
         if positions[-1] + patch_size < length:
             positions.append(length - patch_size)
         return sorted(set(positions))
 
     def _quality_check(self, patch):
-        # Return (is_valid, rejection_reason).
         gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
 
         # Black-border check
@@ -168,7 +165,7 @@ class MosaicPatcher:
         if black_frac > self.max_black_fraction:
             return False, f"black_fraction={black_frac:.2f}"
 
-        # Uniform / featureless check
+        # Uniform check
         std = float(np.std(gray))
         if std < self.min_std:
             return False, f"std={std:.1f}"
@@ -177,7 +174,6 @@ class MosaicPatcher:
         if mean < self.min_mean:
             return False, f"mean={mean:.1f}"
 
-        # Extremely grainy patches produce only false detections downstream.
         if self.max_noise > 0:
             lap = cv2.Laplacian(gray, cv2.CV_64F)
             noise = float(np.median(np.abs(lap)))

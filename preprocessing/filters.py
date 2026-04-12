@@ -13,7 +13,7 @@ from .auto_tuner import TunedParams
 
 logger = logging.getLogger(__name__)
 
-def gray_world_white_balance(image, params: TunedParams):
+def gray_world_white_balance(image, params):
    # Gray-world white balance to compensate AUV/ROV lighting bias.
 
     img = image.astype(np.float32)
@@ -28,7 +28,7 @@ def gray_world_white_balance(image, params: TunedParams):
     balanced = np.clip(img * scale[np.newaxis, np.newaxis, :], 0, 255)
     return balanced.astype(np.uint8)
 
-def illumination_normalize(image, params: TunedParams, preprocess_cfg):
+def illumination_normalize(image, params, preprocess_cfg):
     # Flatten the AUV light-cone gradient by dividing out low-frequency illumination.
     sigma = preprocess_cfg.get("illum_norm_sigma", 51.0)
 
@@ -52,12 +52,12 @@ def illumination_normalize(image, params: TunedParams, preprocess_cfg):
     illum = np.clip(illum, 1.0, None) 
 
     l_norm = (l_f / illum) * valid_mean
-    l_norm[~valid_mask] = 0  # restore black borders
+    l_norm[~valid_mask] = 0  
     l_norm = np.clip(l_norm, 0, 255).astype(np.uint8)
 
     return cv2.cvtColor(cv2.merge([l_norm, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
-def clahe_lab(image, params: TunedParams):
+def clahe_lab(image, params):
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_orig = lab[:, :, 0].copy()
     clahe = cv2.createCLAHE(
@@ -69,7 +69,7 @@ def clahe_lab(image, params: TunedParams):
     lab[:, :, 0] = cv2.addWeighted(l_clahe, alpha, l_orig, 1.0 - alpha, 0)
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-def bilateral_denoise(image, params: TunedParams):
+def bilateral_denoise(image, params):
     return cv2.bilateralFilter(
         image,
         d=params.bilateral_d,
@@ -77,7 +77,7 @@ def bilateral_denoise(image, params: TunedParams):
         sigmaSpace=params.bilateral_sigma_space,
     )
 
-def multi_scale_retinex(image, params: TunedParams, preprocess_cfg):
+def multi_scale_retinex(image, params, preprocess_cfg):
     """
     Multi-Scale Retinex on the L channel — reflectance/illumination separation.
     This intrinsically suppresses:
@@ -103,9 +103,7 @@ def multi_scale_retinex(image, params: TunedParams, preprocess_cfg):
     # Fill borders with valid mean to prevent edge artifacts in blurs
     l_filled = l_f.copy()
     l_filled[~valid_mask] = valid_mean
-
-    # Avoid log(0) — clamp to small positive value
-    l_log = np.log1p(l_filled)  # log(1 + L), so 0 maps to 0
+    l_log = np.log1p(l_filled)  
 
     # Multi-scale Retinex: average of (log(L) - log(blur(L))) across scales
     retinex = np.zeros_like(l_log)
@@ -132,7 +130,6 @@ def multi_scale_retinex(image, params: TunedParams, preprocess_cfg):
         l_retinex = (l_retinex - lr_mean) * gain + lr_mean
 
     # Match the original valid-pixel mean and std so downstream filters
-    # (sediment fade, proxy label thresholds) remain calibrated.
     lr_valid = l_retinex[valid_mask]
     lr_mean = float(np.mean(lr_valid))
     lr_std = float(np.std(lr_valid))
@@ -151,7 +148,7 @@ def multi_scale_retinex(image, params: TunedParams, preprocess_cfg):
     return cv2.cvtColor(cv2.merge([l_retinex, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
 
-def sediment_fade(image, params: TunedParams, preprocess_cfg):
+def sediment_fade(image, params, preprocess_cfg):
     # Fade bright sediment toward a smooth background without touching nodules.
     fade_sigma = preprocess_cfg.get("sediment_fade_blur_sigma", 15.0)
     fade_strength = preprocess_cfg.get("sediment_fade_strength", 0.6)
@@ -178,7 +175,7 @@ def sediment_fade(image, params: TunedParams, preprocess_cfg):
 
     return cv2.cvtColor(cv2.merge([l_faded, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
-def unsharp_mask(image, params: TunedParams, preprocess_cfg):
+def unsharp_mask(image, params, preprocess_cfg):
     # enhances contrast
     sigma = preprocess_cfg.get("unsharp_sigma", 2.0)
     strength = params.unsharp_strength
@@ -228,8 +225,6 @@ def _feature_tophat(blurred, radii, texture_sigma, texture_threshold):
 
 def _feature_local_contrast_ratio(gray_f, bg_sigma, valid_mask):
     # Local contrast ratio — how dark each pixel is relative to its local background.
-    # Estimate local background brightness with a large-kernel blur
-    # Fill invalid (border) pixels with valid mean to avoid edge artifacts
     gray_filled = gray_f.copy()
     valid_px = gray_f[valid_mask]
     if valid_px.size > 0:
@@ -246,8 +241,6 @@ def _feature_dog(gray_f, sigma_pairs):
     """
     Difference of Gaussians (DoG) blob detection — scale-normalized.
     DoG approximates the Laplacian of Gaussian (LoG), the theoretically optimal blob detector.  
-    By using multiple sigma pairs we detect nodules across a range of sizes. 
-    Only negative responses (dark blobs on bright background) are kept.
     """
     combined = np.zeros_like(gray_f)
     for s_small, s_large in sigma_pairs:
@@ -262,12 +255,7 @@ def _feature_dog(gray_f, sigma_pairs):
 
 
 def _feature_smoothness(gray_f, inner_sigma, outer_sigma, valid_mask):
-    """
-    Smoothness score — nodules have smooth surfaces vs. grainy sediment.
-    Computes the ratio of local variance at two scales:
-    - inner_sigma (fine): captures sediment grain texture
-    - outer_sigma (coarse): captures broader intensity variation
-    """
+    # Smoothness score — nodules have smooth surfaces vs. grainy sediment.
     mean_fine = cv2.GaussianBlur(gray_f, (0, 0), inner_sigma)
     sq_fine = cv2.GaussianBlur(gray_f ** 2, (0, 0), inner_sigma)
     var_fine = np.clip(sq_fine - mean_fine ** 2, 0, None)
@@ -294,10 +282,7 @@ def _normalize_feature(feat, valid_mask):
     return normed
 
 def _watershed_split(binary, patch_bgr, min_distance):
-    """
-    Marker-controlled watershed to separate touching nodules.
-    Only applied to connected components large enough to plausibly contain multiple nodules.
-    """
+    # Only for large wack nodule looking things
     if np.sum(binary > 0) < 10:
         return binary
 
@@ -320,7 +305,6 @@ def _watershed_split(binary, patch_bgr, min_distance):
         if max_dist < min_distance:
             continue
 
-        # Find peaks with adequate separation. Use a dilation kernel proportional to min_distance
         peak_kernel = max(min_distance * 2 + 1, 7)
         if peak_kernel % 2 == 0:
             peak_kernel += 1
@@ -335,7 +319,6 @@ def _watershed_split(binary, patch_bgr, min_distance):
         if n_peaks <= 2:
             continue
 
-        # Set up watershed markers
         markers = peak_labels + 1 
         markers[cc_mask == 0] = 0
 
@@ -347,19 +330,17 @@ def _watershed_split(binary, patch_bgr, min_distance):
         markers_ws = markers.astype(np.int32)
         cv2.watershed(ws_input, markers_ws)
 
-        # Replace this component: keep split regions, remove boundaries
         result[cc_labels == label_id] = 0
         result[(markers_ws > 1) & (cc_labels == label_id)] = 255
 
     return result
 
+
 # ACTUAL CREATION OF PROXY LABEL
-def generate_proxy_label(patch_bgr, params: TunedParams, proxy_cfg):
+def generate_proxy_label(patch_bgr, params, proxy_cfg):
     # Generate a binary nodule mask using multi-feature blob detection.
-
     steps: List[Tuple[str, np.ndarray]] = []
-
-    def _log(name: str, img: np.ndarray):
+    def _log(name, img):
         steps.append((name, img.copy()))
 
     def _heatmap(feat, valid):
@@ -418,19 +399,13 @@ def generate_proxy_label(patch_bgr, params: TunedParams, proxy_cfg):
     valid_scores = score[valid_mask]
     pos = valid_scores[valid_scores > 0]
     if pos.size > 100:
-        # Density: fraction of valid pixels exceeding the absolute threshold
         frac_above = float(np.sum(valid_scores > abs_threshold)) / n_valid
         density_t = np.clip(frac_above / dense_frac, 0.0, 1.0)
         noise_suppress = np.clip((params.noise_estimate - 4.0) / 4.0, 0.0, 1.0)
         density_t = density_t * (1.0 - noise_suppress)
-
-        # Dense patches get a lowered absolute threshold
         effective_abs = float(abs_threshold - density_t * (abs_threshold - dense_abs_min))
-
-        # Percentile gate (strict for sparse, relaxed for dense)
         adaptive_pct = float(pct_hi - density_t * (pct_hi - pct_lo))
         pct_threshold = float(np.percentile(pos, adaptive_pct))
-
         threshold = effective_abs + (1.0 - density_t) * max(0.0, pct_threshold - effective_abs)
     else:
         pct_threshold = abs_threshold
@@ -462,13 +437,11 @@ def generate_proxy_label(patch_bgr, params: TunedParams, proxy_cfg):
     }
     filtered_contours = []
 
-    # Local background for per-contour contrast verification
     gray_filled = gray_f.copy()
     gray_filled[~valid_mask] = float(np.mean(gray_f[valid_mask]))
     local_bg_map = cv2.GaussianBlur(gray_filled, (0, 0), lcr_sigma)
 
     min_local_contrast = proxy_cfg.get("min_local_contrast", 0.02)
-    # Score-gate: contours whose mean combined score exceeds this multiple of the threshold
     shape_bypass_mult = proxy_cfg.get("shape_bypass_score_mult", 2.0)
     shape_bypass_threshold = threshold * shape_bypass_mult
 
@@ -477,23 +450,18 @@ def generate_proxy_label(patch_bgr, params: TunedParams, proxy_cfg):
         if area > params.max_contour_area:
             reject_counts["area_too_large"] += 1
             continue
-
-        # Mean combined score inside this contour (computed before area check so high-confidence tiny contours can use a relaxed floor)
         contour_mask_tmp = np.zeros(gray.shape, dtype=np.uint8)
         cv2.drawContours(contour_mask_tmp, [c], 0, 255, cv2.FILLED)
         contour_scores = score[contour_mask_tmp > 0]
         mean_score = float(np.mean(contour_scores)) if contour_scores.size > 0 else 0.0
         high_confidence = mean_score >= shape_bypass_threshold
 
-        # Area check: high-confidence contours get a relaxed floor (1px²)
         area_floor = 1 if high_confidence else params.min_contour_area
         if area < area_floor:
             reject_counts["area_too_small"] += 1
             continue
 
-        # Size-aware shape filtering
         skip_shape = area < 20 or high_confidence
-
         if not skip_shape:
             hull_area = cv2.contourArea(cv2.convexHull(c))
             solidity = area / hull_area if hull_area > 0 else 0
@@ -501,7 +469,6 @@ def generate_proxy_label(patch_bgr, params: TunedParams, proxy_cfg):
                 reject_counts["low_solidity"] += 1
                 continue
 
-            # Eccentricity
             if len(c) >= 5:
                 try:
                     _, (MA, ma), _ = cv2.fitEllipse(c)
@@ -515,14 +482,12 @@ def generate_proxy_label(patch_bgr, params: TunedParams, proxy_cfg):
                 reject_counts["eccentricity"] += 1
                 continue
 
-            # Circularity
             perimeter = cv2.arcLength(c, True)
             circularity = (4.0 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
             if circularity < params.min_circularity:
                 reject_counts["low_circularity"] += 1
                 continue
 
-        # Per-contour local contrast check (always applied)
         interior = gray_f[contour_mask_tmp > 0]
         bg_vals = local_bg_map[contour_mask_tmp > 0]
         if interior.size > 0 and bg_vals.size > 0:
@@ -572,7 +537,7 @@ class FilterPipeline:
         self.cfg = preprocess_cfg
         self.chain = preprocess_cfg.get("filter_chain", list(_FILTER_REGISTRY.keys()))
 
-    def run(self, patch_bgr, params: TunedParams):
+    def run(self, patch_bgr, params):
         steps: List[Tuple[str, np.ndarray]] = []
         steps.append(("00_original", patch_bgr.copy()))
 
@@ -595,7 +560,7 @@ class FilterPipeline:
         return image, steps
 
     @staticmethod
-    def save_step_images(steps,output_dir, prefix: str = "patch"):
+    def save_step_images(steps,output_dir, prefix = "patch"):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -615,7 +580,7 @@ class FilterPipeline:
 
         return composite_path
 
-def _build_composite(named_images, output_path, thumb_size: int = 384, cols: int = 4, padding: int = 4, label_height: int = 28):
+def _build_composite(named_images, output_path, thumb_size = 384, cols = 4, padding = 4, label_height = 28):
     n = len(named_images)
     if n == 0:
         return
@@ -626,7 +591,7 @@ def _build_composite(named_images, output_path, thumb_size: int = 384, cols: int
     canvas_w = cols * cell_w + padding
     canvas_h = rows * cell_h + padding
 
-    canvas = np.full((canvas_h, canvas_w, 3), 40, dtype=np.uint8)   # dark gray bg
+    canvas = np.full((canvas_h, canvas_w, 3), 40, dtype=np.uint8)  
 
     for idx, (name, img) in enumerate(named_images):
         r, c = divmod(idx, cols)

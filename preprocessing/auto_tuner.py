@@ -1,5 +1,5 @@
 """
-Per-Patch Adaptive Parameter Calculation
+Per-Patch Adaptive Parameters
 
 Essentially, a single set of preprocessing parameters cannot work across an entire seafloor mosaic.
 So I use these four signal below to customzie parmaters of each patch: 
@@ -59,7 +59,7 @@ class TunedParams:
 class PatchAutoTuner:
     # Compute per-patch preprocessing parameters from image statistics.
 
-    def __init__(self, config: dict):
+    def __init__(self, config):
         self.cfg = config
 
     # Pixels below this threshold are treated as black border / no-data and excluded from all diagnostic calculations.

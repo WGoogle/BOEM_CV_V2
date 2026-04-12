@@ -30,7 +30,7 @@ from preprocessing.auto_tuner import PatchAutoTuner
 from preprocessing.filters import FilterPipeline, generate_proxy_label
 from preprocessing.geo_resolution import extract_meters_per_pixel
 
-def _setup_logging() -> None:
+def _setup_logging():
     """Configure root logger to write to console + rotating log file."""
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = config.LOGS_DIR / "preprocess.log"
@@ -58,18 +58,18 @@ logger = logging.getLogger(__name__)
 # Inspired by CoralNet pattern: audit trail per file
 MANIFEST_PATH = config.OUTPUT_DIR / "pipeline_manifest.json"
 
-def _load_manifest() -> dict:
+def _load_manifest():
     if MANIFEST_PATH.exists():
         with open(MANIFEST_PATH) as f:
             return json.load(f)
     return {"version": "2.0", "mosaics": {}}
 
-def _save_manifest(manifest: dict) -> None:
+def _save_manifest(manifest):
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
 
-def _find_mosaics(single: str | None = None) -> list[Path]:
+def _find_mosaics(single = None):
     """Return sorted list of raw mosaic files."""
     if single:
         p = Path(single)
@@ -87,7 +87,7 @@ def _find_mosaics(single: str | None = None) -> list[Path]:
     return sorted(set(files))
 
 # CORE PIPELINE
-def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) -> dict:
+def process_mosaic(mosaic_path, manifest, *, force = False):
     """
     Full Step-1 pipeline for a single mosaic.
 
@@ -161,16 +161,15 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
 
     # Per-patch processing
     patch_records = []
+    preprocessed_patches: list[np.ndarray] = []   
     total_nodules = 0
-    valid_idx = 0  # tracks position in the patches list
+    valid_idx = 0 
 
     # Pick a random subset of patches to log step-by-step images for
     import random
     max_step_logs = config.LOGGING.get("max_step_log_patches", 5)
     valid_indices = [i for i, inf in enumerate(infos) if inf.is_valid]
     logged_set = set(random.sample(valid_indices, min(max_step_logs, len(valid_indices))))
-    # Always log specific patches for debugging
-    logged_set.update({80, 298, 303, 443, 473, 501, 573})
 
     for info in infos:
         if not info.is_valid:
@@ -180,20 +179,13 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
         valid_idx += 1
         pid = f"{key}_patch_{info.patch_index:04d}"
 
-        # (a) Auto-tune
+        # All steps here
         params = tuner.analyse(patch_bgr)
-
-        # (b) Run filter chain
         preprocessed, filter_steps = pipeline.run(patch_bgr, params)
-
-        # (c) Generate proxy label
         proxy_mask, label_steps, label_stats = generate_proxy_label(
             preprocessed, params, config.PROXY_LABEL,
         )
-
         total_nodules += label_stats["nodules_after_filter"]
-
-        # (d) Save intermediate step-by-step images (random subset)
         should_log = (
             config.LOGGING["save_intermediate_steps"]
             and info.patch_index in logged_set
@@ -207,11 +199,13 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
                 prefix=pid,
             )
 
-        # (e) Save final outputs
         img_path = mosaic_patches_img_dir / f"{pid}.png"
         msk_path = mosaic_patches_msk_dir / f"{pid}.png"
         cv2.imwrite(str(img_path), preprocessed)
         cv2.imwrite(str(msk_path), proxy_mask)
+
+        # Stash the preprocessed BGR patch for full-mosaic reassembly below
+        preprocessed_patches.append(preprocessed)
 
         patch_records.append({
             "patch_id":         pid,
@@ -232,7 +226,6 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
                 f"({total_nodules} nodules detected so far)"
             )
 
-    # Reassemble full-mosaic proxy mask for visualisation
     patch_masks = []
     vi = 0
     for info in infos:
@@ -248,7 +241,6 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
     full_mask = patcher.reassemble(
         patch_masks, infos, (mosaic_h, mosaic_w), dtype=np.float32,
     )
-    # Threshold the averaged overlapping regions
     full_mask_binary = (full_mask > 127).astype(np.uint8) * 255
 
     full_mask_path = mosaic_proxy_dir / f"{key}_full_proxy_mask.png"
@@ -260,6 +252,34 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
     blended = cv2.addWeighted(mosaic, 0.6, overlay, 0.4, 0)
     overlay_path = mosaic_proxy_dir / f"{key}_overlay.png"
     cv2.imwrite(str(overlay_path), blended)
+
+    # For the deploy/ folder, preprocessing mosaic code here
+    accum_bgr = np.zeros((mosaic_h, mosaic_w, 3), dtype=np.float64)
+    count_bgr = np.zeros((mosaic_h, mosaic_w),    dtype=np.float64)
+    pi = 0
+    for info in infos:
+        if not info.is_valid:
+            continue
+        patch = preprocessed_patches[pi]
+        pi += 1
+        y, x = info.y, info.x
+        ph = min(info.height, mosaic_h - y)
+        pw = min(info.width,  mosaic_w - x)
+        accum_bgr[y:y + ph, x:x + pw] += patch[:ph, :pw].astype(np.float64)
+        count_bgr[y:y + ph, x:x + pw] += 1.0
+
+    covered = count_bgr > 0
+    full_preproc = mosaic.copy()
+    full_preproc[covered] = (
+        accum_bgr[covered] / count_bgr[covered, None]
+    ).clip(0, 255).astype(np.uint8)
+
+    full_preproc_path = mosaic_preproc_dir / "preprocessed.png"
+    cv2.imwrite(str(full_preproc_path), full_preproc)
+    logger.info(
+        f"  Saved full preprocessed mosaic → {full_preproc_path}  "
+        f"(coverage {100.0 * covered.mean():.1f}%; rejected tiles filled from raw)"
+    )
 
     # Save patch manifest
     patch_manifest_path = config.PATCHES_DIR / key / "patch_manifest.json"
@@ -277,6 +297,7 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
         "valid_patches":    n_valid,
         "total_nodules":    total_nodules,
         "full_proxy_mask":  str(full_mask_path),
+        "preprocessed_mosaic": str(full_preproc_path),
         "overlay":          str(overlay_path),
         "patch_manifest":   str(patch_manifest_path),
         "completed":        True,
@@ -291,9 +312,8 @@ def process_mosaic(mosaic_path: Path, manifest: dict, *, force: bool = False) ->
     )
     return entry
 
-
 # CLI ENTRY POINT
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
         description="Step 1: Preprocess seafloor mosaics + generate proxy labels",
     )
