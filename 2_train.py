@@ -1,23 +1,10 @@
 """
 Step 2 — Train Nodule Segmentation Model
-This script handles:
-  - CLI argument parsing
-  - Logging setup (file + console)
-  - Pipeline manifest tracking (CoralNet-inspired idempotency)
-  - Progress reporting and summary statistics
 
-All training logic lives in the "training/" package:
-  - training/dataset.py   — Dataset + augmentations
-  - training/model.py     — U-Net factory + combined BCE+Dice loss
-  - training/splits.py    — Stratified train/val/test splitting
-  - training/trainer.py   — Training loop (AMP, early stopping, checkpoints)
-
-Helpful Shortcuts:
+Helpful Shortcuts I use:
     python 2_train.py                     # train on all preprocessed patches
-    python 2_train.py --resume            # resume from last checkpoint
     python 2_train.py --epochs 50         # override epoch count
     python 2_train.py --batch-size 8      # override batch size (for small GPUs)
-    python 2_train.py --no-augmentation   # disable augmentation (ablation)
 """
 from __future__ import annotations
 import argparse
@@ -28,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).parent))
 import config
@@ -39,7 +26,6 @@ from training import (
     CombinedLoss,
     split_dataset,
     save_split_info,
-    compute_sampler_weights,
     Trainer,
     EpochLog,
     get_train_augmentations,
@@ -72,7 +58,6 @@ def _setup_logging():
 logger = logging.getLogger(__name__)
 
 # Pipeline Manifest
-
 MANIFEST_PATH = config.OUTPUT_DIR / "pipeline_manifest.json"
 def _load_manifest():
     if MANIFEST_PATH.exists():
@@ -87,7 +72,6 @@ def _save_manifest(manifest):
 
 # Data Loading
 def _collect_patch_records():
-    # Gathers all patch records from every mosaic's patch_manifest.json
     records = []
     for manifest_file in sorted(config.PATCHES_DIR.glob("*/patch_manifest.json")):
         with open(manifest_file) as f:
@@ -132,14 +116,9 @@ def _make_epoch_callback(history_path):
 
     return callback
 
-# CLI Entry Point
 def main():
     parser = argparse.ArgumentParser(
         description="Step 2: Train U-Net segmentation model on preprocessed patches",
-    )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="Resume training from the last checkpoint",
     )
     parser.add_argument(
         "--epochs", type=int, default=None,
@@ -148,14 +127,6 @@ def main():
     parser.add_argument(
         "--batch-size", type=int, default=None,
         help="Override batch size",
-    )
-    parser.add_argument(
-        "--lr", type=float, default=None,
-        help="Override learning rate",
-    )
-    parser.add_argument(
-        "--no-augmentation", action="store_true",
-        help="Disable training augmentations (for ablation studies)",
     )
     args = parser.parse_args()
     _setup_logging()
@@ -172,20 +143,11 @@ def main():
     else:
         device = "cpu"
         logger.info("  Device: CPU (training will be slow)")
-
-    # Build effective config (CLI overrides)
     train_cfg = dict(config.TRAINING)
-    # Pass input_mode so the trainer can auto-select encoder_lr_multiplier
-    train_cfg["_input_mode"] = config.MODEL.get("input_mode", "rgb")
     if args.epochs is not None:
         train_cfg["num_epochs"] = args.epochs
     if args.batch_size is not None:
         train_cfg["batch_size"] = args.batch_size
-    if args.lr is not None:
-        train_cfg["learning_rate"] = args.lr
-    if args.no_augmentation:
-        train_cfg["augmentation"] = False
-
     logger.info("=" * 70)
     logger.info("BOEM CV  —  Step 2: Train Segmentation Model")
     logger.info("=" * 70)
@@ -198,7 +160,6 @@ def main():
     logger.info(f"  Early stopping  : {train_cfg['early_stopping_patience']} epochs")
     logger.info(f"  Augmentation    : {train_cfg.get('augmentation', True)}")
     logger.info(f"  Device          : {device}")
-    logger.info(f"  Resume          : {args.resume}")
 
     # Collect patches from Step 1
     logger.info("─" * 70)
@@ -274,54 +235,26 @@ def main():
                 f"min_source_coverage={train_cfg.get('copy_paste_min_coverage', 5.0)} — disabled"
             )
 
-    # Mirror-padded training context for edge pixels (16 pixels)
-    mirror_pad = int(train_cfg.get("mirror_pad", 0))
-    if mirror_pad > 0:
-        logger.info(
-            f"  Mirror-pad     : {mirror_pad}px each side  → "
-            f"input {patch_size + 2 * mirror_pad}px, "
-            f"loss on centre {patch_size}px"
-        )
-
     train_ds = NoduleSegmentationDataset(train_recs, transform=train_transform,
                                          corrected_masks_dir=corrected_dir,
                                          input_mode=input_mode,
-                                         copy_paste=copy_paste,
-                                         mirror_pad=mirror_pad)
+                                         copy_paste=copy_paste)
     val_ds   = NoduleSegmentationDataset(val_recs,   transform=val_transform,
                                          corrected_masks_dir=corrected_dir,
-                                         input_mode=input_mode,
-                                         mirror_pad=mirror_pad)
+                                         input_mode=input_mode)
     test_ds  = NoduleSegmentationDataset(test_recs,  transform=val_transform,
                                          corrected_masks_dir=corrected_dir,
-                                         input_mode=input_mode,
-                                         mirror_pad=mirror_pad)
+                                         input_mode=input_mode)
 
     num_workers = train_cfg.get("num_workers", 4)
     pin_memory  = (device == "cuda")
     persistent_workers = num_workers > 0
     prefetch_factor    = 4 if num_workers > 0 else None
 
-    train_sampler = None
-    if train_cfg.get("use_weighted_sampler", False):
-        mult = train_cfg.get("weighted_sampler_multiplier", 5.0)
-        sample_weights = compute_sampler_weights(train_recs, dense_multiplier=mult)
-        train_sampler = WeightedRandomSampler(
-            weights=torch.as_tensor(sample_weights, dtype=torch.double),
-            num_samples=len(train_recs),
-            replacement=True,
-        )
-        logger.info(
-            f"  Sampler        : WeightedRandomSampler "
-            f"(dense_multiplier={mult}, "
-            f"weight range [{sample_weights.min():.2f}, {sample_weights.max():.2f}])"
-        )
-
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg["batch_size"],
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
@@ -375,12 +308,6 @@ def main():
         device=device,
     )
     start_epoch = 0
-    if args.resume:
-        last_ckpt = config.CHECKPOINTS_DIR / "checkpoint_last.pt"
-        if last_ckpt.exists():
-            start_epoch = trainer.load_checkpoint(last_ckpt)
-        else:
-            logger.warning("  No checkpoint found to resume from — starting fresh")
 
     # Train
     logger.info("─" * 70)
@@ -391,7 +318,6 @@ def main():
         f"{'Train IoU / Val IoU':^23}  │  LR"
     )
     logger.info("  " + "─" * 100)
-
     history_path = config.CHECKPOINTS_DIR / "training_history.json"
     epoch_callback = _make_epoch_callback(history_path)
 
@@ -419,7 +345,7 @@ def main():
     # Threshold optimisation — sweep val set to find best operating point
     logger.info("─" * 70)
     logger.info("Optimising probability threshold on validation set ...")
-    best_threshold, threshold_dice = trainer.find_best_threshold(val_loader)
+    best_threshold, threshold_dice = trainer.find_best_threshold(val_loader, 0.3, 0.7, 41)
     logger.info(
         f"  Best threshold: {best_threshold:.3f}  │  "
         f"Val Dice @ threshold: {threshold_dice:.4f}  │  "

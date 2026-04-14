@@ -1,42 +1,21 @@
 """
-training.trainer — Training Loop Engine
-========================================
-Self-contained training loop with:
-  - Mixed-precision training (PyTorch AMP) for GPU memory efficiency
-  - Early stopping on validation Dice score
-  - ReduceLROnPlateau scheduler
-  - Checkpoint saving (best + last) with full state for resume
-  - Per-epoch IoU and Dice metric computation
-
-The Trainer owns the optimisation loop.  All logging, manifest updates,
-and progress reporting happen in 2_train.py so this module stays
-focused on the numerical work.
+The Trainer owns the optimisation loop. 
 """
 from __future__ import annotations
-
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-
 import torch
-import torch.nn as nn
 from torch.amp import GradScaler
-from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
-
-# ── Metrics ──────────────────────────────────────────────────────────────
-
-def _compute_metrics(
-    logits: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5
-) -> dict[str, float]:
-    """Compute IoU and Dice from raw logits + binary targets."""
+# Metrics 
+def _compute_metrics(logits, targets, threshold):
+    # Compute IoU and Dice from raw logits + binary targets
     with torch.no_grad():
         probs = torch.sigmoid(logits)
         preds = (probs > threshold).float()
-
-        # Flatten spatial dims, keep batch
         preds_flat   = preds.view(preds.size(0), -1)
         targets_flat = targets.view(targets.size(0), -1)
 
@@ -51,12 +30,9 @@ def _compute_metrics(
 
     return {"iou": iou.mean().item(), "dice": dice.mean().item()}
 
-
-# ── Epoch history record ─────────────────────────────────────────────────
-
 @dataclass
 class EpochLog:
-    """Metrics for a single training epoch."""
+    # Metrics for a single training epoch
     epoch: int
     train_loss: float
     val_loss: float
@@ -66,10 +42,9 @@ class EpochLog:
     val_dice: float
     lr: float
 
-
 @dataclass
 class TrainingResult:
-    """Final outcome returned by Trainer.fit()."""
+    # Final outcome returned by Trainer.fit().
     best_epoch: int
     best_val_dice: float
     best_checkpoint_path: str
@@ -78,36 +53,11 @@ class TrainingResult:
     history: list[EpochLog] = field(default_factory=list)
 
 
-# ── Trainer ──────────────────────────────────────────────────────────────
-
+# Trainer 
 class Trainer:
-    """Manages the full training loop for a segmentation model.
+    # Manages the full training loop for a segmentation model.
 
-    Parameters
-    ----------
-    model : nn.Module
-        Segmentation model (returns raw logits).
-    criterion : nn.Module
-        Loss function operating on logits.
-    train_cfg : dict
-        From config.TRAINING.  Keys: learning_rate, weight_decay,
-        num_epochs, early_stopping_patience, scheduler_patience,
-        scheduler_factor.
-    checkpoint_dir : Path
-        Where to save best/last checkpoints.
-    device : str
-        "cuda", "mps", or "cpu".
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        criterion: nn.Module,
-        train_cfg: dict,
-        checkpoint_dir: Path,
-        device: str = "cuda",
-        **_kw,
-    ) -> None:
+    def __init__(self, model, criterion, train_cfg, checkpoint_dir, device, **_kw):
         self.model = model.to(device)
         self.criterion = criterion
         self.device = device
@@ -124,7 +74,7 @@ class Trainer:
         # Scheduler: reduce LR when val Dice plateaus
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            mode="max",                                    # maximise Dice
+            mode="max",                                
             factor=train_cfg.get("scheduler_factor", 0.5),
             patience=train_cfg.get("scheduler_patience", 7),
             min_lr=1e-7,
@@ -137,9 +87,7 @@ class Trainer:
         self.use_amp = (device == "cuda")
         self.scaler  = GradScaler("cuda", enabled=self.use_amp)
 
-    # ── Single epoch ─────────────────────────────────────────────────
-
-    def _train_one_epoch(self, loader: DataLoader) -> tuple[float, float, float]:
+    def _train_one_epoch(self, loader):
         """Run one training epoch.  Returns (loss, iou, dice)."""
         self.model.train()
         running_loss = 0.0
@@ -161,7 +109,7 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            metrics = _compute_metrics(logits, masks)
+            metrics = _compute_metrics(logits, masks, 0.5)
             running_loss += loss.item()
             running_iou  += metrics["iou"]
             running_dice += metrics["dice"]
@@ -174,8 +122,8 @@ class Trainer:
         )
 
     @torch.no_grad()
-    def _validate(self, loader: DataLoader) -> tuple[float, float, float]:
-        """Run validation.  Returns (loss, iou, dice)."""
+    def _validate(self, loader):
+        # Run validation.  Returns (loss, iou, dice)
         self.model.eval()
         running_loss = 0.0
         running_iou  = 0.0
@@ -190,7 +138,7 @@ class Trainer:
                 logits = self.model(images)
                 loss   = self.criterion(logits, masks)
 
-            metrics = _compute_metrics(logits, masks)
+            metrics = _compute_metrics(logits, masks, 0.5)
             running_loss += loss.item()
             running_iou  += metrics["iou"]
             running_dice += metrics["dice"]
@@ -202,17 +150,10 @@ class Trainer:
             running_dice / n_batches,
         )
 
-    # ── Threshold optimisation ───────────────────────────────────────
-
+    # Threshold optimisation 
     @torch.no_grad()
-    def find_best_threshold(
-        self, loader: DataLoader, low: float = 0.3, high: float = 0.7, steps: int = 41,
-    ) -> tuple[float, float]:
-        """Sweep thresholds on a loader and return (best_threshold, best_dice).
-
-        Collects all predictions in one pass, then evaluates each threshold
-        on the full set — much faster than running the model N times.
-        """
+    def find_best_threshold(self, loader, low, high, steps):
+        # Sweep thresholds on a loader and return (best_threshold, best_dice).
         self.model.eval()
         all_probs = []
         all_targets = []
@@ -224,9 +165,8 @@ class Trainer:
             all_probs.append(torch.sigmoid(logits).cpu())
             all_targets.append(masks.cpu())
 
-        probs = torch.cat(all_probs, dim=0)     # (N, 1, H, W)
-        targets = torch.cat(all_targets, dim=0)  # (N, 1, H, W)
-
+        probs = torch.cat(all_probs, dim=0)     
+        targets = torch.cat(all_targets, dim=0)  
         best_thr = 0.5
         best_dice = 0.0
         smooth = 1e-6
@@ -244,10 +184,8 @@ class Trainer:
 
         return best_thr, best_dice
 
-    # ── Checkpointing ────────────────────────────────────────────────
-
-    def _save_checkpoint(self, epoch: int, val_dice: float, tag: str,
-                         best_threshold: float | None = None) -> Path:
+    # Checkpointing 
+    def _save_checkpoint(self, epoch, val_dice, tag, best_threshold):
         path = self.checkpoint_dir / f"checkpoint_{tag}.pt"
         data = {
             "epoch":            epoch,
@@ -262,8 +200,7 @@ class Trainer:
         torch.save(data, path)
         return path
 
-    def load_checkpoint(self, path: Path) -> int:
-        """Resume from a checkpoint.  Returns the epoch to start from."""
+    def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -276,37 +213,14 @@ class Trainer:
         )
         return ckpt["epoch"] + 1
 
-    # ── Main training loop ───────────────────────────────────────────
+    # Main training loop
+    def fit(self, train_loader, val_loader, *, start_epoch, epoch_callback):
+        # Train the model for up to ``num_epochs`` with early stopping.
 
-    def fit(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        *,
-        start_epoch: int = 0,
-        epoch_callback=None,
-    ) -> TrainingResult:
-        """Train the model for up to ``num_epochs`` with early stopping.
-
-        Parameters
-        ----------
-        train_loader, val_loader : DataLoader
-            Training and validation data loaders.
-        start_epoch : int
-            Epoch index to resume from (0-based).
-        epoch_callback : callable | None
-            Called after each epoch with (epoch_log: EpochLog).
-            Used by 2_train.py for logging / progress bars.
-
-        Returns
-        -------
-        TrainingResult
-        """
         best_dice  = 0.0
         best_epoch = 0
         no_improve = 0
         history: list[EpochLog] = []
-
         best_ckpt_path = ""
         last_ckpt_path = ""
 

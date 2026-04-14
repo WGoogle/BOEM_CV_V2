@@ -4,31 +4,24 @@ Applies train-time augmentations via Albumentations.
 """
 from __future__ import annotations
 from pathlib import Path
-from typing import Literal
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-# ImageNet normalisation (for RGB / grayscale modes)
+# ImageNet normalisation (for RGB mode and as a fallback for engineered mode) -- we will use engineered mode
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 import json as _json
 import logging as _logging
-
 _norm_logger = _logging.getLogger(__name__)
 
-
 def compute_channel_stats(records, input_mode):
-    """Compute per-channel (mean, std) over all patches for a given input mode.
+    # Compute per-channel (mean, std) over all patches for a given input mode.
 
-    Uses Welford-style online accumulation so only one patch is in memory at
-    a time.  Returns ((mean_c0, mean_c1, mean_c2), (std_c0, std_c1, std_c2)).
-    """
     n = 0
     ch_sum = np.zeros(3, dtype=np.float64)
     ch_sq  = np.zeros(3, dtype=np.float64)
@@ -51,29 +44,16 @@ def compute_channel_stats(records, input_mode):
 
 
 def get_normalization_stats(input_mode, records=None, cache_dir=None):
-    """Return (mean, std) tuples appropriate for the given input mode.
+    # Return (mean, std) tuples appropriate for the given input mode.
 
-    For ``"rgb"`` and ``"grayscale"`` this always returns ImageNet stats
-    (the pretrained encoder expects them).
-
-    For ``"engineered"`` the stats are computed from the actual patches
-    the first time, then cached to ``<cache_dir>/engineered_norm_stats.json``.
-    The cache auto-invalidates when the patch count changes.  If no
-    *records* are provided (e.g. at inference time), the cache is read
-    as-is — if it doesn't exist the function falls back to ImageNet stats
-    with a warning.
-    """
     if input_mode != "engineered":
         return IMAGENET_MEAN, IMAGENET_STD
-
-    # Resolve cache path
     if cache_dir is None:
         try:
-            import config as _cfg  # type: ignore[import]
+            import config as _cfg 
             cache_dir = _cfg.CHECKPOINTS_DIR
         except Exception:
             cache_dir = None
-
     cache_file = Path(cache_dir) / "engineered_norm_stats.json" if cache_dir else None
 
     # Try to load from cache
@@ -121,9 +101,7 @@ def get_normalization_stats(input_mode, records=None, cache_dir=None):
 
     return mean, std
 
-# Input-mode literals 
-InputMode = Literal["rgb", "grayscale", "engineered"]
-_VALID_MODES: tuple[str, ...] = ("rgb", "grayscale", "engineered")
+_VALID_MODES: tuple[str, ...] = ("rgb", "engineered")
 
 # For local contrast ratio
 _LCR_BG_SIGMA = 30.0
@@ -162,31 +140,16 @@ def compute_engineered_channels(
 
 def _prepare_image(bgr, input_mode):
     # Apply the mode-specific channel transform to a BGR patch
-
     _validate_input_mode(input_mode)
     if input_mode == "rgb":
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    if input_mode == "grayscale":
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        return np.stack([gray, gray, gray], axis=-1)
     return compute_engineered_channels(bgr)
 
 def get_train_augmentations(patch_size = 256, input_mode = "rgb", norm_stats = None):
     """
     Augmentation pipeline for training split.
-    Tuned for deep-sea AUV mosaics (low-contrast, near-grayscale, rigid
-    geological targets, already heavily preprocessed by Step 1).
-
-    Parameters
-    ----------
-    norm_stats : tuple[tuple, tuple] | None
-        Pre-computed (mean, std) from ``get_normalization_stats``.  When
-        ``None`` the function calls ``get_normalization_stats`` itself
-        (fine for rgb/grayscale, but for engineered mode the caller
-        should pass pre-computed stats so the cache is used).
-
-    Contains Flips + 90 degree rotations, Affine jitter, GridDistortion, ElasticTransform,
-    RandomBrightnessContrast, CLAHE (RGB/grayscale only), GaussianBlur, ISONoise (RGB only), and CoarseDropout
+    Contains Flips + 90 degree rotations, Affine jitter, ElasticTransform,
+    RandomBrightnessContrast, GaussianBlur, and GaussNoise.
     """
     _validate_input_mode(input_mode)
     if norm_stats is not None:
@@ -195,7 +158,7 @@ def get_train_augmentations(patch_size = 256, input_mode = "rgb", norm_stats = N
         norm_mean, norm_std = get_normalization_stats(input_mode)
 
     return A.Compose([
-        # ── Geometric ────────────────────────────────────────────────
+        # Geometric
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
@@ -208,23 +171,20 @@ def get_train_augmentations(patch_size = 256, input_mode = "rgb", norm_stats = N
             border_mode=cv2.BORDER_REFLECT_101, p=0.2,
         ),
 
-        # ── Intensity ────────────────────────────────────────────────
+        # Intensity
         A.RandomBrightnessContrast(
             brightness_limit=0.15, contrast_limit=0.15, p=0.4,
-        ),
-        A.HueSaturationValue(
-            hue_shift_limit=8, sat_shift_limit=15, val_shift_limit=15, p=0.3,
         ),
         A.GaussianBlur(blur_limit=(3, 5), p=0.2),
         A.GaussNoise(std_range=(0.01, 0.03), p=0.2),
 
-        # ── Final normalisation — mode-aware ─────────────────────────
+        # Final normalisation
         A.Normalize(mean=norm_mean, std=norm_std),
         ToTensorV2(),
     ])
 
 def get_val_augmentations(input_mode = "rgb", norm_stats = None):
-    # Deterministic normalisation only — no random transforms.
+    # Deterministic normalisation only
     _validate_input_mode(input_mode)
     if norm_stats is not None:
         norm_mean, norm_std = norm_stats
@@ -350,18 +310,14 @@ class NoduleSegmentationDataset(Dataset):
         corrected_masks_dir = None,
         input_mode = "rgb",
         copy_paste = None,
-        mirror_pad = 0,
     ):
         _validate_input_mode(input_mode)
-        if mirror_pad < 0:
-            raise ValueError(f"mirror_pad must be ≥ 0, got {mirror_pad}")
         self.records = records
         self.input_mode = input_mode
         self.transform = transform or get_val_augmentations(input_mode=input_mode)
         self.corrected_masks_dir = Path(corrected_masks_dir) if corrected_masks_dir else None
 
         self.copy_paste = copy_paste
-        self.mirror_pad = mirror_pad
 
     def __len__(self):
         return len(self.records)
@@ -390,13 +346,7 @@ class NoduleSegmentationDataset(Dataset):
 
         image = _prepare_image(bgr, self.input_mode)
         augmented = self.transform(image=image, mask=mask)
-        image_t = augmented["image"]                       
-        mask_t  = augmented["mask"].unsqueeze(0).float()  
-
-        if self.mirror_pad > 0:
-            p = self.mirror_pad
-            image_t = F.pad(
-                image_t.unsqueeze(0), (p, p, p, p), mode="reflect",
-            ).squeeze(0)
+        image_t = augmented["image"]
+        mask_t  = augmented["mask"].unsqueeze(0).float()
 
         return image_t, mask_t

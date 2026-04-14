@@ -1,14 +1,6 @@
 """
-training — Polymetallic Nodule Training Module
-================================================
-Public API re-exported here so callers can do::
-
-    from training import (
-        NoduleSegmentationDataset, build_model, CombinedLoss,
-        split_dataset, Trainer,
-    )
+training — Polymetallic Nodule Training
 """
-
 from .dataset import (
     NoduleSegmentationDataset,
     CopyPasteAugmentation,
@@ -16,8 +8,8 @@ from .dataset import (
     get_val_augmentations,
     get_normalization_stats,
 )
-from .model import build_model, CombinedLoss, DiceLoss
-from .splits import split_dataset, save_split_info, compute_sampler_weights
+from .model import build_model, CombinedLoss
+from .splits import split_dataset, save_split_info
 from .trainer import Trainer, TrainingResult, EpochLog
 from .confident_learning import (
     ConfidentLabelAuditor,
@@ -34,10 +26,8 @@ __all__ = [
     "get_normalization_stats",
     "build_model",
     "CombinedLoss",
-    "DiceLoss",
     "split_dataset",
     "save_split_info",
-    "compute_sampler_weights",
     "Trainer",
     "TrainingResult",
     "EpochLog",

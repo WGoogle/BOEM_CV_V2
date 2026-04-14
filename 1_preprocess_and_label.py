@@ -61,17 +61,8 @@ def _save_manifest(manifest):
     with open(MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
 
-def _find_mosaics(single = None):
+def _find_mosaics():
     """Return sorted list of raw mosaic files."""
-    if single:
-        p = Path(single)
-        if not p.exists():
-            p = config.RAW_MOSAICS_DIR / single
-        if not p.exists():
-            logger.error(f"File not found: {single}")
-            return []
-        return [p]
-
     exts = ["*.tif", "*.tiff", "*.TIF", "*.TIFF", "*.png", "*.PNG"]
     files = []
     for ext in exts:
@@ -307,10 +298,6 @@ def main():
         "--force", action="store_true",
         help="Re-process mosaics even if already completed",
     )
-    parser.add_argument(
-        "--mosaic", type=str, default=None,
-        help="Process a single mosaic file (name or full path)",
-    )
     args = parser.parse_args()
 
     _setup_logging()
@@ -325,7 +312,7 @@ def main():
     logger.info(f"  Filter chain    : {config.PREPROCESSING['filter_chain']}")
     logger.info(f"  Force re-run    : {args.force}")
 
-    mosaic_files = _find_mosaics(args.mosaic)
+    mosaic_files = _find_mosaics()
     if not mosaic_files:
         logger.error(
             f"No mosaic files found in {config.RAW_MOSAICS_DIR}\n"

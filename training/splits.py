@@ -63,7 +63,7 @@ def split_dataset(
     if rare_h:
         safe_h = unique_h[counts_h >= 2]
         if len(safe_h) == 0:
-            safe_h = unique_h  # fallback: no stratification possible
+            safe_h = unique_h  
         for i in range(len(holdout_strata)):
             if holdout_strata[i] in rare_h:
                 holdout_strata[i] = safe_h[np.argmin(np.abs(safe_h - holdout_strata[i]))]
