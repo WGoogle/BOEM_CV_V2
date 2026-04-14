@@ -1,9 +1,8 @@
 """
 Extract spatial resolution from GeoTIFF metadata
 
-Reads the ModelTransformationTag (tag 34264) or ModelPixelScaleTag
-(tag 33550) from a TIFF file and computes meters_per_pixel using the
-embedded coordinate reference system.
+Reads the ModelTransformationTag (tag 34264) or ModelPixelScaleTag (tag 33550) from a TIFF file 
+and computes meters_per_pixel using the embedded coordinate reference system.
 
 Fail safe is a hardcoded value for meters_per_pixel of .05 
 """

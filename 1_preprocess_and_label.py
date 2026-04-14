@@ -1,18 +1,11 @@
 """
-Step 1 — Preprocess and Label:
-  - CLI argument parsing
-  - Raw mosaic discovery
-  - Pipeline manifest (CoralNet-inspired idempotent state tracking)
-  - Progress bars and summary reporting
+Step 1 — Preprocess and Label
 
 Helpful Shortcuts I use: 
     python 1_preprocess_and_label.py                  # full run, for new data
     python 1_preprocess_and_label.py --force          # re-process everything, when debugging 
-    python 1_preprocess_and_label.py --mosaic FILE    # process a single file, when debugging
-    python 1_preprocess_and_label.py --log-patches 5  # log first 5 patches only, to save space
 """
 from __future__ import annotations
-
 import argparse
 import json
 import logging
@@ -31,7 +24,6 @@ from preprocessing.filters import FilterPipeline, generate_proxy_label
 from preprocessing.geo_resolution import extract_meters_per_pixel
 
 def _setup_logging():
-    """Configure root logger to write to console + rotating log file."""
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = config.LOGS_DIR / "preprocess.log"
 
@@ -100,8 +92,6 @@ def process_mosaic(mosaic_path, manifest, *, force = False):
        d. Save intermediate images      (filters.py)
     4. Save preprocessed patches + proxy masks to disk
     5. Update the manifest
-
-    Returns a summary dict.
     """
     key = mosaic_path.stem
     entry = manifest["mosaics"].setdefault(key, {})
@@ -204,9 +194,7 @@ def process_mosaic(mosaic_path, manifest, *, force = False):
         cv2.imwrite(str(img_path), preprocessed)
         cv2.imwrite(str(msk_path), proxy_mask)
 
-        # Stash the preprocessed BGR patch for full-mosaic reassembly below
         preprocessed_patches.append(preprocessed)
-
         patch_records.append({
             "patch_id":         pid,
             "image_path":       str(img_path),
@@ -281,12 +269,10 @@ def process_mosaic(mosaic_path, manifest, *, force = False):
         f"(coverage {100.0 * covered.mean():.1f}%; rejected tiles filled from raw)"
     )
 
-    # Save patch manifest
+    # Manifest stuff 
     patch_manifest_path = config.PATCHES_DIR / key / "patch_manifest.json"
     with open(patch_manifest_path, "w") as f:
         json.dump(patch_records, f, indent=2, default=str)
-
-    # Update pipeline manifest
     elapsed = time.time() - t0
     entry.update({
         "source":           str(mosaic_path),
@@ -368,11 +354,9 @@ def main():
     logger.info("=" * 70)
     logger.info("PIPELINE COMPLETE")
     logger.info("=" * 70)
-
     total_patches = sum(s.get("valid_patches", 0) for s in summaries)
     total_nodules = sum(s.get("total_nodules", 0) for s in summaries)
     total_time = sum(s.get("elapsed_seconds", 0) for s in summaries)
-
     logger.info(f"  Mosaics processed : {len(summaries)}")
     logger.info(f"  Total patches     : {total_patches}")
     logger.info(f"  Total nodules     : {total_nodules}")
