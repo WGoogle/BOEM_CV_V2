@@ -1,389 +1,181 @@
 ================================================================================
-  ANNOTATION GUIDE — Manual Mask Correction & Collaboration
+  ANNOTATION GUIDE
 ================================================================================
 
-TABLE OF CONTENTS
-  1. Quick Start (Solo Annotation)
-  2. Editor Controls
-  3. CLI Commands
-  4. Collaboration Workflow (Lead Annotator)
-  5. Collaborator Guide (Bob/Craig — Start Here)
-  6. Tips
+Two roles:
+  - Brian (lead)       : has the full repo, exports batches, imports corrections.
+  - Collaborator       : receives a .zip, edits masks, sends a .zip back.
 
-================================================================================
-1. QUICK START (SOLO ANNOTATION)
-================================================================================
+--------------------------------------------------------------------------------
+  EDITOR CONTROLS
+--------------------------------------------------------------------------------
 
-  # Open the editor on test patches
-  python 4_annotate.py edit --split test --annotator yourname
+  Mouse
+    Left-click drag    Paint nodule pixels
+    Right-click drag   Erase pixels
 
-  # Check your progress
-  python 4_annotate.py status
+  Navigate
+    + / -              Zoom in / out
+    Arrow keys         Pan
+    N / P              Next / previous patch (auto-saves)
 
-  # Retrain with your corrected masks (automatic, no extra flags)
-  python 2_train.py
+  View
+    SPACE (hold)       Peek raw image under overlay
+    C                  Toggle outline mode (contours only)
+    O                  Toggle overlay on/off
+    [ / ]              Decrease / increase overlay opacity
 
-================================================================================
-2. EDITOR CONTROLS
-================================================================================
+  Edit
+    Brush slider       Bottom of window. Use 1-3px for small nodules.
+    Z / Y              Undo / redo
+    R                  Reset mask to original
+    S                  Save
 
-  MOUSE
-  ──────────────────────────────────────────────────────────────────────────
-  Left-click + drag       Paint nodule pixels onto the mask
-  Right-click + drag      Erase pixels from the mask
+  Overlay colors
+    Green              Original proxy label
+    Cyan               Pixels you added
+    Red                Pixels you removed
 
-  NAVIGATION (KEYBOARD)
-  ──────────────────────────────────────────────────────────────────────────
-  +  /  -                 Zoom in / zoom out (clamped to image, no white
-                          space). View stays locked to the patch.
-  Arrow keys              Pan the view (up/down/left/right)
+--------------------------------------------------------------------------------
+  BRIAN'S WORKFLOW (LEAD)
+--------------------------------------------------------------------------------
 
-  VIEWING
-  ──────────────────────────────────────────────────────────────────────────
-  SPACE (hold)            Peek — temporarily hide overlay to see the raw
-                          image underneath. Release to bring overlay back.
-                          Use this to check if a green region is actually
-                          covering a nodule.
+  1. Export a batch per collaborator (split by mosaic to avoid overlap):
 
-  C                       Toggle outline mode — shows mask as contour
-                          edges only instead of filled color. Much easier
-                          to see the image through the mask boundaries.
+       python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 --output batch_for_kailash.zip --annotator Brian --notes "Kailash: D1 Node3 patches"
 
-  O                       Toggle overlay on/off completely
+  2. Send the .zip (Slack / Drive / email).
 
-  [ / ]                   Decrease / increase overlay opacity
-
-  EDITING
-  ──────────────────────────────────────────────────────────────────────────
-  Brush size              Use the slider at the bottom of the window.
-                          Use 1-3px for small grain nodules.
-
-  Z                       Undo (up to 50 steps)
-  Y                       Redo
-
-  R                       Reset mask to original proxy label
-
-  FILE
-  ──────────────────────────────────────────────────────────────────────────
-  S                       Save current mask
-  N                       Next patch (auto-saves if modified)
-  P                       Previous patch (auto-saves if modified)
-
-  OVERLAY COLORS
-  ──────────────────────────────────────────────────────────────────────────
-  Green                   Original proxy label (from Step 1)
-  Cyan                    Pixels you added
-  Red                     Pixels you removed from the original
-
-================================================================================
-3. CLI COMMANDS
-================================================================================
-
-  ── EDIT (open the annotation editor) ──────────────────────────────────
-
-  python 4_annotate.py edit --split test --annotator alice
-      Open editor on test split (101 patches).
-      Options for --split: train, val, test, all
-
-  python 4_annotate.py edit --mosaic CameraMosaic_D1_Node3_L8 --annotator alice
-      Open editor filtered to a specific mosaic.
-
-  python 4_annotate.py edit --worst 20 --annotator alice
-      Open editor on the 20 worst-performing patches.
-
-  python 4_annotate.py edit --unannotated --annotator alice
-      Open editor on only patches that haven't been corrected yet.
-
-  python 4_annotate.py edit --start 10 --annotator alice --split test
-      Start from patch index 10 (skip the first 10).
-
-  python 4_annotate.py edit --bundle some_bundle.zip --annotator bob
-      Open a .zip bundle directly. This is the command collaborators
-      use — see Section 5 below.
-
-  ── EXPORT (create a bundle to share with collaborators) ───────────────
-
-  python 4_annotate.py export --split test --output batch_for_bob.zip --annotator alice
-      Package test patches into a .zip for sharing.
-
-  python 4_annotate.py export --unannotated --output remaining.zip --annotator alice
-      Export only patches that haven't been corrected yet.
-
-  python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 --output node2.zip --annotator alice
-      Export patches from a specific mosaic.
-
-  python 4_annotate.py export --split test --max-patches 50 --output small_batch.zip --annotator alice
-      Limit the bundle to 50 patches.
-
-  python 4_annotate.py export --split test --output batch.zip --annotator alice \
-      --notes "Focus on small grain nodules near patch edges"
-      Attach instructions for the collaborator.
-
-  ── IMPORT (bring in corrections from a collaborator) ──────────────────
-
-  python 4_annotate.py import --bundle corrected_by_bob.zip
-      Import corrected masks from a single bundle.
-      Only patches the collaborator actually edited are imported.
-      Patches they didn't touch are ignored and remain available
-      for others to annotate.
-
-  python 4_annotate.py import --bundle corrected_by_bob.zip --strategy overwrite
-      Always overwrite existing corrections.
-      Options for --strategy: newest (default), overwrite, skip
-
-  ── IMPORT-ALL (batch import from the inbox folder) ────────────────────
-
-  python 4_annotate.py import-all
-      Import all .zip files from outputs/annotation_inbox/.
-      Only actually corrected patches are imported from each bundle.
-      Processed bundles are moved to annotation_inbox/imported/.
-
-  python 4_annotate.py import-all --strategy skip
-      Skip patches that already have corrections.
-
-  ── REPACK (collaborator sends corrections back) ──────────────────────
-
-  python 4_annotate.py repack --work-dir batch_for_bob_work --output corrected_by_bob.zip --annotator bob
-      Re-package a working directory into a .zip to send back.
-      The work directory is created automatically next to the .zip
-      when you open a bundle with "edit --bundle".
-
-      IMPORTANT: Only patches you actually edited are marked as
-      corrected. Patches you skipped are marked as untouched and
-      will NOT be imported by the lead annotator. They remain
-      available for someone else to annotate.
-
-  ── INSPECT (peek inside a bundle) ────────────────────────────────────
-
-  python 4_annotate.py inspect --bundle some_bundle.zip
-      Show bundle metadata: who created it, how many patches total,
-      how many were corrected vs untouched, and any notes.
-
-  ── STATUS (check progress) ───────────────────────────────────────────
-
-  python 4_annotate.py status
-      Show how many patches have been annotated, by whom,
-      and how many remain.
-
-================================================================================
-4. COLLABORATION WORKFLOW (LEAD ANNOTATOR)
-================================================================================
-
-  You have the full repo with TIF files and outputs.
-  Collaborators only need: the repo code + a .zip bundle you send them.
-
-  STEP-BY-STEP:
-
-  1. Export batches (split by mosaic to avoid overlap):
-
-       python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 --output batch_for_Kailash.zip --annotator Brian --notes "Kailash: D1 Node3 patches"
-
-       python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 --output batch_for_Thang.zip --annotator Brian --notes "Thang: Node2 patches"
-
-  2. Send the .zip files to Bob and Craig (Slack, email, Google Drive, etc.)
-
-  3. When they send back their corrected .zip files, drop them into:
+  3. When they return their corrected .zip (will explain that later), drop it into:
 
        outputs/annotation_inbox/
 
-  4. Import all at once:
+  4. Import every returned bundle at once:
 
        python 4_annotate.py import-all
-
-     Only patches they actually edited get imported. The rest are ignored.
 
   5. Check progress:
 
        python 4_annotate.py status
 
-  6. Export remaining unannotated patches for another round:
+  6. Export the next round of unannotated patches:
 
-       python 4_annotate.py export --unannotated --output round2.zip --annotator alice
+       python 4_annotate.py export --unannotated --output round2.zip --annotator Brian
 
-  7. When ready, retrain (automatic — uses corrected masks):
+  7. Retrain (picks up corrected masks automatically):
 
        python 2_train.py
 
-  AVOIDING OVERLAP:
+  Lead Annotator (Brian) can also annotate directly (no bundle):
 
-    Option A — Split by mosaic (cleanest, zero overlap):
-      Give each person a different mosaic. You have 3 mosaics:
-        CameraMosaic_D1_Node3_L8
-        CameraMosaic_Node2_CAM_L9
-        CameraMosaic_Node6_CAM_L1
+       python 4_annotate.py edit --split test --annotator Brian
+       python 4_annotate.py edit --worst 20 --annotator Brian
+       python 4_annotate.py edit --mosaic CameraMosaic_Node6_CAM_L1 --unannotated --annotator Brian
 
-    Option B — Use --unannotated (automatic):
-      After each import, --unannotated excludes already-corrected
-      patches, so the next export only contains what's left.
+  Tip for Lead Annotator:
+  When you are distributing out the zip files, ensure you do it by mosaic, so assign each person one mosaic, this helps avoid any overlap in annotations.
 
-    Option C — Use --max-patches for sequential chunks:
-      python 4_annotate.py export --split all --max-patches 50 --output batch1.zip ...
-      (import batch1, then export --unannotated for the next person)
+--------------------------------------------------------------------------------
+  COLLABORATOR WORKFLOW
+--------------------------------------------------------------------------------
 
-================================================================================
-5. COLLABORATOR GUIDE (BOB/CRAIG — START HERE)
-================================================================================
+  One-time setup:
+       git clone <repo>
+       cd BOEM_CV_V2
+       pip install -r requirements.txt
 
-  You received a .zip bundle from the lead annotator. Here's
-  everything you need to do, step by step.
+  1. Put the .zip Brian sent you anywhere (e.g. ~/Downloads/).
+      If it is not in Downloads, the next CLI commands will not work obviosuly. So either ensure its in Downloads OR replace "Downloads" in future commands with wherever you stored .zip file. 
 
-  PREREQUISITES
-  ──────────────────────────────────────────────────────────────────────────
-  You need:
-    - Python 3.9+
-    - The project repo cloned (ask the lead annotator for the repo URL)
-    - The .zip bundle file they sent you
+  2. Open it:
 
-  Install dependencies (one time only):
-    cd BOEM_CV_V2
-    pip install -r requirements.txt    # or: pip install matplotlib opencv-python
+       python 4_annotate.py edit --bundle ~/Downloads/batch_for_bob.zip --annotator bob
 
-  STEP 1: PUT THE ZIP ANYWHERE
-  ──────────────────────────────────────────────────────────────────────────
-  Place the .zip file wherever you like. Example locations:
+     This extracts a "_work/" folder next to the .zip and opens the GUI.
+     Re-running the same command resumes where you left off (remember each one you annotate is autosaved AND YOU CANNOT GO BACK to a patch you annotated AFTER YOU EXIT the tool)
 
-    ~/Downloads/batch_for_bob.zip           (your Downloads folder)
-    ~/Desktop/batch_for_bob.zip             (your Desktop)
-    BOEM_CV_V2/batch_for_bob.zip            (inside the repo)
+  3. Correct masks. You do NOT have to do every patch — skipped patches are released back to the pool for someone else.
 
-  It does not matter where. The tool accepts any path.
+  4. Close the window. The terminal prints your repack command. Run it ONLY AFTER YOU ARE FINISHED WITH ALL REQUIRED ANNOTATIONS:
 
-  STEP 2: OPEN THE EDITOR
-  ──────────────────────────────────────────────────────────────────────────
-  From the repo root, run:
+      python 4_annotate.py repack --work-dir ~/Downloads/batch_for_bob_work --output ~/Downloads/corrected_by_bob.zip --annotator bob
 
-    python 4_annotate.py edit --bundle ~/Downloads/batch_for_bob.zip --annotator bob (replace bob with whatever your name is / name assigned by Leader)
+  5. Send corrected_by_bob.zip back to Brian.
 
-  Replace "bob" with your name. Replace the path with wherever you
-  put the .zip file.
+--------------------------------------------------------------------------------
+  FULL EXAMPLE WORKFLOW
+--------------------------------------------------------------------------------
 
-  This will:
-    - Extract a working folder NEXT TO the .zip file:
-      ~/Downloads/batch_for_bob_work/
-    - Open the annotation GUI window
+  Scenario: Brian splits the three mosaics across himself, Kailash, and Thang.
 
-  STEP 3: ANNOTATE
-  ──────────────────────────────────────────────────────────────────────────
-  You'll see the patch image with the existing mask overlay (green).
+  ── Brian (lead) ─────────────────────────────────────────────────────────
 
-  Your job: correct the mask where the automated labelling got it wrong.
+    # Export one mosaic to each collaborator (In our example we used CameraMosaic_D1_Node3_L8, replace with whatever your mosaic is called)
+    python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 --output Kailash_d1.zip --annotator Brian --notes "Kailash: D1 Node3"
 
-    - See a nodule that's NOT highlighted?
-      Left-click to paint it in.
+    python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 --output batch_for_Thang.zip --annotator Brian --notes "Thang: Node2"
 
-    - See green over an area that's NOT a nodule?
-      Right-click to erase it.
+    # Brian takes Node6 himself
+    python 4_annotate.py edit --mosaic CameraMosaic_Node6_CAM_L1 --annotator Brian
 
-    - Can't tell if there's a nodule under the green?
-      Hold SPACE to peek at the raw image underneath.
-      Or press C to switch to outline mode (contour edges only).
+    # Send Kailash_d1.zip and batch_for_Thang.zip via Drive
 
-    - Zoom in for small nodules:
-      Press + to zoom in, - to zoom out.
-      Use arrow keys to pan around.
+  ── Kailash (collaborator) ───────────────────────────────────────────────
 
-    - Adjust brush size with the slider at the bottom.
-      Use 1-3px for tiny grain nodules.
-
-    - Press N to go to the next patch (auto-saves).
-      Press P to go back.
-
-    - You do NOT have to annotate every patch. Only correct the ones
-      you have time for. Patches you skip will NOT be counted as
-      annotated — they'll remain available for someone else.
-
-  When you're done for now, close the window. Your work is saved.
-
-  STEP 3b: COMING BACK LATER (RESUME)
-  ──────────────────────────────────────────────────────────────────────────
-  You do NOT have to finish everything in one sitting. To pick up
-  where you left off, just run the same command again:
-
-    python 4_annotate.py edit --bundle ~/Downloads/batch_for_bob.zip --annotator bob
-
-  It will:
-    - Detect your existing work folder (no re-extraction)
-    - Remember which patches you already corrected
-    - Auto-jump to the first patch you haven't annotated yet
-
-  You can close and reopen as many times as you want. Your saved
-  corrections are preserved in the _work/ folder until you repack.
-
-  STEP 4: REPACK YOUR CORRECTIONS
-  ──────────────────────────────────────────────────────────────────────────
-  After closing the editor, it will print the exact repack command.
-  It looks like this:
-
-    python 4_annotate.py repack \
-        --work-dir ~/Downloads/batch_for_bob_work \
-        --output corrected_by_bob.zip \
-        --annotator bob
-
-  Run that command. It creates corrected_by_bob.zip containing ONLY
-  the patches you actually edited (plus the untouched ones as reference,
-  but those are marked and won't be imported).
-
-  STEP 5: SEND IT BACK
-  ──────────────────────────────────────────────────────────────────────────
-  Send corrected_by_bob.zip back to the lead annotator via whatever
-  channel they sent you the original (Slack, email, Drive, etc.).
-
-  That's it! The lead annotator will import your corrections and
-  they'll be used in the next training run.
-
-  FULL EXAMPLE (copy-paste ready):
-  ──────────────────────────────────────────────────────────────────────────
-
-    # 1. cd into the repo
     cd ~/Desktop/BOEM_CV_V2
+    python 4_annotate.py edit --bundle ~/Downloads/Kailash_d1.zip --annotator Kailash
+    # ... annotate over weeks, remember u can close tool and come back as it auto saves and all the patches you annotated in previous session will no longer be present for you to edit...
+    
+    # ONCE Kailash is all done 
+    python 4_annotate.py repack --work-dir ~/Downloads/Kailash_d1_work --output ~/Downloads/corrected_by_Kailash.zip --annotator Kailash
+    # Send corrected_by_Kailash.zip back to Brian
 
-    # 2. Open the bundle (adjust path to wherever your .zip is)
-    python 4_annotate.py edit --bundle ~/Downloads/batch_for_bob.zip --annotator bob
+  ── Thang (collaborator) ─────────────────────────────────────────────────
 
-    # 3. Annotate in the GUI... then close the window when done.
+    Same as Kailash, using batch_for_Thang.zip.
 
-    # 4. Repack
-    python 4_annotate.py repack \
-        --work-dir ~/Downloads/batch_for_bob_work \
-        --output ~/Downloads/corrected_by_bob.zip \
-        --annotator bob
+  ── Brian (lead, after both return their zips) ───────────────────────────
 
-    # 5. Send ~/Downloads/corrected_by_bob.zip back to the lead annotator.
+    # Drop corrected_by_Kailash.zip and corrected_by_Thang.zip into:
+    #   outputs/annotation_inbox/
 
-================================================================================
-6. TIPS
-================================================================================
+    python 4_annotate.py import-all
+    python 4_annotate.py status
 
-  - Start with the worst patches from inference to get the biggest
-    improvement per annotation:
+    # Next round on whatever's left to annotate, if none skip this step
+    python 4_annotate.py export --unannotated --output round2.zip --annotator Brian
 
-      python 4_annotate.py edit --worst 20 --annotator yourname
+    # When done, retrain
+    python 2_train.py
 
-  - Use outline mode (C key) most of the time — it lets you see the
-    actual nodule texture under the mask boundary.
+--------------------------------------------------------------------------------
+  CLI REFERENCE
+--------------------------------------------------------------------------------
 
-  - Hold Space to peek at the raw image when you're unsure if a
-    region is a real nodule or an artifact.
+  edit         Open the editor.
+    --split {train,val,test,all}   Default: test
+    --mosaic NAME                  Filter to one mosaic
+    --worst N                      N worst-performing patches
+    --unannotated                  Skip already-corrected patches
+    --bundle FILE.zip              Open a collaborator bundle
+    --annotator NAME               Your name (required for tracking)
+    --start N                      Start at patch index N
 
-  - Zoom in (+) before annotating small grain nodules. Use arrow
-    keys to pan around. Use brush size 1-3px for these.
+  export       Package patches into a .zip.
+    --split / --mosaic / --unannotated / --max-patches / --notes
+    --output FILE.zip  --annotator NAME
 
-  - Masks auto-save when you press N/P to navigate between patches,
-    but press S to save explicitly if you want to be sure.
+  import       Import one returned bundle.
+    --bundle FILE.zip
+    --strategy {newest,overwrite,skip}   Default: newest
 
-  - You don't need to correct every patch. Even correcting 50-100
-    of the worst patches can meaningfully improve the model.
-    Patches you skip stay as "unannotated" for others to pick up.
+  import-all   Import every .zip in outputs/annotation_inbox/;
+               processed zips move to annotation_inbox/imported/.
 
-  - Split work across collaborators by mosaic:
+  repack       Package a _work/ directory back into a .zip.
+    --work-dir DIR  --output FILE.zip  --annotator NAME
 
-      python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 \
-          --output node3_for_bob.zip --annotator alice
-      python 4_annotate.py export --mosaic CameraMosaic_Node2_CAM_L9 \
-          --output node2_for_craig.zip --annotator alice
+  inspect      Show bundle metadata (creator, counts, notes).
+    --bundle FILE.zip
 
-  - After importing corrections, use --unannotated to see what's left:
-
-      python 4_annotate.py export --unannotated --output remaining.zip --annotator alice
-
-================================================================================
+  status       Show totals, per-annotator counts, % complete.

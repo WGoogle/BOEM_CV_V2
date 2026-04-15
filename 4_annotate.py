@@ -1,46 +1,14 @@
-#!/usr/bin/env python3
 """
 Step 4 — Manual Annotation & Collaboration
-============================================
-Correct proxy-label masks by hand, export batches for collaborators,
-and import their corrections back into the pipeline.
-
-Usage:
-    # ── Annotate (lead annotator, has full repo) ─────────────────
-    python 4_annotate.py edit --split test --annotator alice
-    python 4_annotate.py edit --worst 20 --annotator alice
-    python 4_annotate.py edit --unannotated --annotator alice
-    python 4_annotate.py edit --mosaic CameraMosaic_D1_Node3_L8 --annotator alice
-
-    # ── Annotate from bundle (collaborator, no full repo needed) ─
-    python 4_annotate.py edit --bundle batch_for_bob.zip --annotator bob
-
-    # ── Collaborate ──────────────────────────────────────────────
-    # Export patches for a collaborator
-    python 4_annotate.py export --split test --output batch_for_bob.zip --annotator alice
-
-    # Bob annotates, then repacks his corrections
-    python 4_annotate.py repack --work-dir batch_for_bob_work --output corrected_by_bob.zip --annotator bob
-
-    # Alice imports Bob's corrections
-    python 4_annotate.py import --bundle corrected_by_bob.zip
-
-    # Inspect a bundle without importing
-    python 4_annotate.py inspect --bundle corrected_by_bob.zip
-
-    # ── Status ───────────────────────────────────────────────────
-    python 4_annotate.py status
+Reference ANNOATIONS.txt for detailed instructions.
 """
 from __future__ import annotations
-
 import argparse
 import json
 import logging
 import sys
 from pathlib import Path
-
 import numpy as np
-
 import config
 from annotation.editor import AnnotationEditor
 from annotation.collaborate import (
@@ -49,25 +17,18 @@ from annotation.collaborate import (
 )
 from annotation.tracker import AnnotationTracker
 
-# ── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)-12s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# ── Paths ───────────────────────────────────────────────────────────────
 CORRECTED_MASKS_DIR = config.OUTPUT_DIR / "corrected_masks"
 TRACKER_PATH        = config.OUTPUT_DIR / "annotation_tracker.json"
 BUNDLES_DIR         = config.OUTPUT_DIR / "annotation_bundles"
 INBOX_DIR           = config.OUTPUT_DIR / "annotation_inbox"
 
-
-# ── Record loading ──────────────────────────────────────────────────────
-
-def load_all_records() -> list[dict]:
-    """Load all patch records from every mosaic's manifest."""
+def load_all_records():
     records = []
     for mosaic_dir in sorted(config.PATCHES_DIR.iterdir()):
         manifest = mosaic_dir / "patch_manifest.json"
@@ -77,9 +38,7 @@ def load_all_records() -> list[dict]:
             records.extend(json.load(f))
     return records
 
-
-def filter_by_split(records: list[dict], split: str) -> list[dict]:
-    """Filter records to a specific train/val/test split."""
+def filter_by_split(records, split):
     from training.splits import split_dataset
     train_rec, val_rec, test_rec = split_dataset(
         records,
@@ -90,22 +49,17 @@ def filter_by_split(records: list[dict], split: str) -> list[dict]:
     )
     return {"train": train_rec, "val": val_rec, "test": test_rec, "all": records}[split]
 
-
-def filter_by_mosaic(records: list[dict], mosaic_name: str) -> list[dict]:
-    """Filter records to a specific mosaic."""
+def filter_by_mosaic(records, mosaic_name):
     return [r for r in records if mosaic_name in r.get("patch_id", "")]
 
-
-def filter_worst_patches(records: list[dict], n: int) -> list[dict]:
-    """Load inference results and return the n worst-performing patches."""
+def filter_worst_patches(records, n):
+    # Load inference results and return the n worst-performing patches
     inference_dir = config.RESULTS_DIR / "inference" / "overlays"
     if not inference_dir.exists():
         logger.warning("No inference results found. Run 3_inference.py first.")
         logger.warning("Falling back to all records.")
         return records[:n]
-
-    # Try to load metrics from inference run
-    # Match records to inference overlay files to find worst patches
+    
     # For now, use a heuristic: patches with low coverage tend to be harder
     sorted_recs = sorted(
         records,
@@ -113,13 +67,7 @@ def filter_worst_patches(records: list[dict], n: int) -> list[dict]:
     )
     return sorted_recs[:n]
 
-
-# ── Subcommands ─────────────────────────────────────────────────────────
-
 def cmd_edit(args):
-    """Open the annotation editor."""
-
-    # ── Bundle mode: collaborator opens a .zip directly ──────────
     if args.bundle:
         bundle_path = Path(args.bundle)
         if not bundle_path.exists():
@@ -144,7 +92,7 @@ def cmd_edit(args):
                         start = i
                         break
                 else:
-                    start = 0  # all done, start from beginning for review
+                    start = 0 
                 logger.info(f"Resuming at patch {start + 1}/{len(records)} "
                             f"({len(corrected_ids)} already corrected)")
 
@@ -155,7 +103,6 @@ def cmd_edit(args):
         )
         editor.launch(start_idx=start)
 
-        # After editor closes, tell user how to send corrections back
         work_dir = masks_dir.parent
         n_modified = len(editor.modified_patches)
         logger.info(f"\nAnnotated {n_modified} patches.")
@@ -167,11 +114,8 @@ def cmd_edit(args):
                         f"--annotator {args.annotator}")
         return
 
-    # ── Normal mode: lead annotator with full repo ───────────────
     all_records = load_all_records()
     logger.info(f"Loaded {len(all_records)} total patches")
-
-    # Filter records based on args
     if args.mosaic:
         records = filter_by_mosaic(all_records, args.mosaic)
         logger.info(f"Filtered to {len(records)} patches from {args.mosaic}")
@@ -182,10 +126,7 @@ def cmd_edit(args):
     else:
         records = filter_by_split(all_records, args.split)
         logger.info(f"Using {len(records)} patches from '{args.split}' split")
-
-    # Apply --unannotated filter (works with any of the above)
     if args.unannotated:
-        # Check both tracker AND corrected masks on disk
         tracker = AnnotationTracker(TRACKER_PATH)
         tracked_ids = set(tracker.data.get("patches", {}).keys())
         disk_ids = set()
@@ -202,7 +143,6 @@ def cmd_edit(args):
         return
 
     CORRECTED_MASKS_DIR.mkdir(parents=True, exist_ok=True)
-
     editor = AnnotationEditor(
         records=records,
         output_dir=CORRECTED_MASKS_DIR,
@@ -216,16 +156,12 @@ def cmd_edit(args):
         tracker.record_annotation(patch_id, args.annotator)
     logger.info(f"Updated tracker: {len(editor.modified_patches)} patches annotated")
 
-
 def cmd_export(args):
-    """Export patches as a shareable bundle."""
     all_records = load_all_records()
-
     if args.mosaic:
         records = filter_by_mosaic(all_records, args.mosaic)
     else:
         records = filter_by_split(all_records, args.split)
-
     if args.unannotated:
         tracker = AnnotationTracker(TRACKER_PATH)
         tracked_ids = set(tracker.data.get("patches", {}).keys())
@@ -237,20 +173,17 @@ def cmd_export(args):
         records = [r for r in records if r.get("patch_id") not in done_ids]
         logger.info(f"Exporting {len(records)} unannotated patches "
                     f"(removed {before - len(records)} already corrected)")
-
     if args.max_patches and len(records) > args.max_patches:
         records = records[:args.max_patches]
         logger.info(f"Capped to {args.max_patches} patches")
-
     if not records:
         logger.info("No patches to export!")
         return
-
+    
     BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
     output = Path(args.output) if args.output else (
         BUNDLES_DIR / f"annotation_bundle_{args.split}.zip"
     )
-
     export_bundle(
         records=records,
         output_path=output,
@@ -259,21 +192,16 @@ def cmd_export(args):
         notes=args.notes or "",
     )
 
-
 def cmd_import(args):
-    """Import corrected masks from a collaborator's bundle."""
     bundle_path = Path(args.bundle)
     if not bundle_path.exists():
         logger.error(f"Bundle not found: {bundle_path}")
         sys.exit(1)
-
     summary = import_bundle(
         bundle_path=bundle_path,
         corrected_masks_dir=CORRECTED_MASKS_DIR,
         merge_strategy=args.strategy,
     )
-
-    # Update tracker only for actually corrected patches
     tracker = AnnotationTracker(TRACKER_PATH)
     meta = list_bundle_contents(bundle_path)
     annotator = meta.get("created_by", "unknown")
@@ -283,19 +211,15 @@ def cmd_import(args):
 
     logger.info(f"Import summary: {json.dumps(summary, indent=2)}")
 
-
 def cmd_import_all(args):
-    """Import all .zip bundles from the annotation_inbox folder."""
     zips = sorted(INBOX_DIR.glob("*.zip"))
     if not zips:
         logger.info(f"No .zip files found in {INBOX_DIR}")
         logger.info("Ask collaborators to drop their bundles there.")
         return
-
     logger.info(f"Found {len(zips)} bundle(s) in inbox")
     imported_dir = INBOX_DIR / "imported"
     imported_dir.mkdir(exist_ok=True)
-
     tracker = AnnotationTracker(TRACKER_PATH)
     total_imported = 0
 
@@ -308,23 +232,18 @@ def cmd_import_all(args):
         )
         total_imported += summary["imported"]
 
-        # Update tracker only for actually corrected patches
         meta = list_bundle_contents(zip_path)
         annotator = meta.get("created_by", "unknown")
         corrected_ids = meta.get("corrected_ids", [])
         for pid in corrected_ids:
             tracker.record_annotation(pid, annotator)
-
-        # Move processed bundle to imported/
         dest = imported_dir / zip_path.name
         zip_path.rename(dest)
         logger.info(f"  Moved → {dest}")
 
     logger.info(f"\nDone. Imported {total_imported} masks from {len(zips)} bundle(s).")
 
-
 def cmd_inspect(args):
-    """Inspect a bundle without importing."""
     bundle_path = Path(args.bundle)
     if not bundle_path.exists():
         logger.error(f"Bundle not found: {bundle_path}")
@@ -333,9 +252,7 @@ def cmd_inspect(args):
     meta = list_bundle_contents(bundle_path)
     print(json.dumps(meta, indent=2))
 
-
 def cmd_repack(args):
-    """Re-pack a working directory into a bundle for return to lead annotator."""
     work_dir = Path(args.work_dir)
     if not work_dir.exists():
         logger.error(f"Working directory not found: {work_dir}")
@@ -352,14 +269,10 @@ def cmd_repack(args):
     )
     logger.info(f"Send this file back to the lead annotator: {output}")
 
-
 def cmd_status(args):
-    """Show annotation progress."""
     all_records = load_all_records()
     tracker = AnnotationTracker(TRACKER_PATH)
     status = tracker.get_status(len(all_records))
-
-    # Check corrected masks on disk
     n_corrected_files = 0
     if CORRECTED_MASKS_DIR.exists():
         n_corrected_files = len(list(CORRECTED_MASKS_DIR.glob("*.png")))
@@ -379,9 +292,6 @@ def cmd_status(args):
             print(f"    {name:20s} : {count} patches")
     print("=" * 50)
 
-
-# ── CLI ─────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(
         description="Step 4: Manual Annotation & Collaboration",
@@ -390,7 +300,7 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ── edit ─────────────────────────────────────────────────────────
+    # editing 
     p_edit = sub.add_parser("edit", help="Open the annotation editor")
     p_edit.add_argument("--bundle", type=str, default=None,
                         help="Open a .zip bundle directly (for collaborators)")
@@ -407,7 +317,7 @@ def main():
     p_edit.add_argument("--start", type=int, default=0,
                         help="Index of first patch to display")
 
-    # ── export ───────────────────────────────────────────────────────
+    # exporting
     p_export = sub.add_parser("export", help="Export patches for collaboration")
     p_export.add_argument("--split", choices=["train", "val", "test", "all"],
                           default="test")
@@ -421,21 +331,19 @@ def main():
     p_export.add_argument("--notes", type=str, default=None,
                           help="Instructions for collaborators")
 
-    # ── import ───────────────────────────────────────────────────────
+    # importing
     p_import = sub.add_parser("import", help="Import corrected masks from bundle")
     p_import.add_argument("--bundle", "-b", type=str, required=True,
                           help="Path to .zip bundle")
     p_import.add_argument("--strategy", choices=["newest", "overwrite", "skip"],
                           default="newest",
                           help="Merge strategy for conflicts (default: newest)")
-
-    # ── import-all ────────────────────────────────────────────────────
     p_import_all = sub.add_parser("import-all",
                                   help="Import all bundles from annotation_inbox/")
     p_import_all.add_argument("--strategy", choices=["newest", "overwrite", "skip"],
                               default="newest")
 
-    # ── repack ───────────────────────────────────────────────────────
+    # repacking
     p_repack = sub.add_parser("repack", help="Re-pack corrections into a bundle")
     p_repack.add_argument("--work-dir", type=str, required=True,
                           help="Working directory created by 'edit --bundle'")
@@ -443,13 +351,12 @@ def main():
                           help="Output .zip path")
     p_repack.add_argument("--annotator", type=str, default="anonymous")
 
-    # ── inspect ──────────────────────────────────────────────────────
+    # inspecting
     p_inspect = sub.add_parser("inspect", help="Inspect bundle contents")
     p_inspect.add_argument("--bundle", "-b", type=str, required=True)
 
-    # ── status ───────────────────────────────────────────────────────
+    # status
     sub.add_parser("status", help="Show annotation progress")
-
     args = parser.parse_args()
 
     commands = {
@@ -462,7 +369,6 @@ def main():
         "status": cmd_status,
     }
     commands[args.command](args)
-
 
 if __name__ == "__main__":
     main()
