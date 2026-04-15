@@ -15,7 +15,7 @@ Two roles:
     Right-click drag   Erase pixels
 
   Navigate
-    + / -              Zoom in / out
+    + / -  or scroll   Zoom in / out
     Arrow keys         Pan
     N / P              Next / previous patch (auto-saves)
 
@@ -28,7 +28,7 @@ Two roles:
   Edit
     Brush slider       Bottom of window. Use 1-3px for small nodules.
     Z / Y              Undo / redo
-    R                  Reset mask to original
+    R                  Reset mask to original (press R again within 2 seconds to confirm reset)
     S                  Save
 
   Overlay colors

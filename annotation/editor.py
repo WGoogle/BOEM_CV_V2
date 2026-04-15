@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from collections import deque
 from pathlib import Path
 
@@ -33,6 +34,8 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button
+
+plt.rcParams["keymap.save"] = []
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +74,10 @@ class AnnotationEditor:
 
         # State
         self.current_idx = 0
-        self.brush_radius = 3
-        self.min_brush = 1
+        self.brush_radius = 1
+        self.min_brush = 0
         self.max_brush = 30
+        self._reset_pending_until = 0.0
         self.show_overlay = True
         self.drawing = False
         self.erase_mode = False
@@ -172,7 +176,7 @@ class AnnotationEditor:
         h, w = self.mask.shape
         value = 0 if erase else 1
         cv2.line(self.mask, (int(x0), int(y0)), (int(x1), int(y1)),
-                 int(value), self.brush_radius * 2)
+                 int(value), max(1, self.brush_radius * 2))
 
     # ── Composite rendering ──────────────────────────────────────────
 
@@ -308,7 +312,7 @@ class AnnotationEditor:
 
         logger.info("Annotation editor launched. Controls:")
         logger.info("  Left-click: paint nodules | Right-click: erase")
-        logger.info("  +/-: zoom in/out | Arrow keys: pan | S: save | N/P: next/prev")
+        logger.info("  +/- or scroll: zoom in/out | Arrow keys: pan | S: save | N/P: next/prev")
         logger.info("  SPACE (hold): peek at raw image underneath overlay")
         logger.info("  C: toggle outline mode (contours only, no fill)")
         logger.info("  O: toggle overlay | [/]: opacity | Ctrl+Z: undo | R: reset")
@@ -338,7 +342,7 @@ class AnnotationEditor:
 
         # Update cursor
         self._cursor_circle.center = (event.xdata, event.ydata)
-        self._cursor_circle.radius = self.brush_radius
+        self._cursor_circle.radius = max(0.5, self.brush_radius)
         self._cursor_circle.set_visible(True)
         color = "red" if self.erase_mode and self.drawing else "yellow"
         self._cursor_circle.set_edgecolor(color)
@@ -378,9 +382,11 @@ class AnnotationEditor:
         elif key == "r":
             self._reset_mask()
         elif key in ("+", "="):
-            self._zoom(zoom_in=True)
+            anchor = (event.xdata, event.ydata) if event.inaxes is self.ax else None
+            self._zoom(zoom_in=True, anchor=anchor)
         elif key in ("-", "_"):
-            self._zoom(zoom_in=False)
+            anchor = (event.xdata, event.ydata) if event.inaxes is self.ax else None
+            self._zoom(zoom_in=False, anchor=anchor)
         elif key == "left":
             self._pan(-1, 0)
         elif key == "right":
@@ -408,8 +414,15 @@ class AnnotationEditor:
             self._refresh()
 
     def _on_scroll(self, event):
-        """Scroll is disabled — use +/- to zoom instead."""
-        pass
+        """Mouse-wheel zoom, anchored at the cursor when over the patch."""
+        if event.button not in ("up", "down"):
+            return
+        zoom_in = event.button == "up"
+        if event.inaxes is self.ax and event.xdata is not None:
+            anchor = (event.xdata, event.ydata)
+        else:
+            anchor = None
+        self._zoom(zoom_in=zoom_in, anchor=anchor)
 
     def _clamp_view(self):
         """Clamp the current view so it never leaves the image bounds."""
@@ -445,31 +458,31 @@ class AnnotationEditor:
         self.ax.set_xlim(xlim)
         self.ax.set_ylim(ylim)
 
-    def _zoom(self, zoom_in: bool = True):
-        """Zoom in/out centered on the current view, clamped to image."""
+    def _zoom(self, zoom_in: bool = True, anchor=None):
+        """Zoom in/out, optionally anchored at a data-coord point."""
         scale = 1 / 1.4 if zoom_in else 1.4
         h, w = self.image.shape[:2]
 
         cur_xlim = self.ax.get_xlim()
         cur_ylim = self.ax.get_ylim()
 
-        # Center of current view
-        cx = (cur_xlim[0] + cur_xlim[1]) / 2
-        cy = (cur_ylim[0] + cur_ylim[1]) / 2
+        new_width = min(max((cur_xlim[1] - cur_xlim[0]) * scale, 4), w)
+        new_height = min(max((cur_ylim[0] - cur_ylim[1]) * scale, 4), h)
 
-        new_width = (cur_xlim[1] - cur_xlim[0]) * scale
-        new_height = (cur_ylim[0] - cur_ylim[1]) * scale  # y inverted
+        if anchor is not None:
+            ax_mouse, ay_mouse = anchor
+            fx = (ax_mouse - cur_xlim[0]) / (cur_xlim[1] - cur_xlim[0])
+            fy = (ay_mouse - cur_ylim[1]) / (cur_ylim[0] - cur_ylim[1])
+            new_x0 = ax_mouse - fx * new_width
+            new_y1 = ay_mouse - fy * new_height
+            self.ax.set_xlim(new_x0, new_x0 + new_width)
+            self.ax.set_ylim(new_y1 + new_height, new_y1)
+        else:
+            cx = (cur_xlim[0] + cur_xlim[1]) / 2
+            cy = (cur_ylim[0] + cur_ylim[1]) / 2
+            self.ax.set_xlim(cx - new_width / 2, cx + new_width / 2)
+            self.ax.set_ylim(cy + new_height / 2, cy - new_height / 2)
 
-        # Don't zoom out past full image
-        new_width = min(new_width, w)
-        new_height = min(new_height, h)
-
-        # Don't zoom in past 1:1 pixel level (4px minimum view)
-        new_width = max(new_width, 4)
-        new_height = max(new_height, 4)
-
-        self.ax.set_xlim(cx - new_width / 2, cx + new_width / 2)
-        self.ax.set_ylim(cy + new_height / 2, cy - new_height / 2)
         self._clamp_view()
         self.fig.canvas.draw_idle()
 
@@ -520,9 +533,18 @@ class AnnotationEditor:
         self._refresh()
 
     def _reset_mask(self):
-        """Reset mask to original proxy label."""
+        """Reset mask to original proxy label (requires double-confirm within 2s)."""
+        now = time.monotonic()
+        if now > self._reset_pending_until:
+            self._reset_pending_until = now + 2.0
+            logger.info("  Reset requested — press R again within 2s to confirm.")
+            self._update_title()
+            self.fig.canvas.draw_idle()
+            return
+        self._reset_pending_until = 0.0
         self._push_undo()
         self.mask = self.original_mask.copy()
+        logger.info("  Mask reset to original.")
         self._refresh()
 
     def _prompt_save_if_modified(self):
