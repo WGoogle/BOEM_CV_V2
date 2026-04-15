@@ -1,6 +1,8 @@
 """
 Step 3 — Inference & Visualisation
-Loads the best checkpoint from Step 2, runs predictions on test patches, and produces visual outputs so you can inspect model performance:
+Loads the best checkpoint from Step 2, runs predictions on test patches, and produces visual outputs so you can inspect model performance
+Check the outputs/results folder, especially the overlays/ subfolder, to see the predictions overlaid on the original seafloor images. 
+The summary_grid.png gives a quick overview of a sample of patches with GT (Ground Truth) and predictions side by side.
 
 Usages:
     python 3_inference.py            # basic run

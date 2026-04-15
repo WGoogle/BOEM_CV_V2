@@ -1,67 +1,19 @@
 """
-annotation.collaborate — Export & Import Annotation Bundles
-============================================================
-Enables multi-user annotation workflows:
-
-  1. Lead annotator runs export_bundle() to create a .zip with
-     selected patches (images + masks + metadata).
-  2. .zip is shared with collaborators (email, Drive, Slack, etc.).
-  3. Collaborators open the bundle with the annotation editor,
-     correct masks, and re-zip.
-  4. Lead annotator runs import_bundle() to merge corrections
-     back into the pipeline.
-
-Bundle format (.zip):
-    bundle_metadata.json          # annotator info, patch list, timestamps
-    patches/
-        <patch_id>/
-            image.png             # original image (for reference)
-            mask.png              # current mask (proxy or corrected)
-            metadata.json         # patch record + annotation history
+The script to allow collaboration between annotators.
 """
 from __future__ import annotations
-
 import json
 import logging
 import shutil
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-
 import cv2
 
 logger = logging.getLogger(__name__)
 
-
-def export_bundle(
-    records: list[dict],
-    output_path: Path | str,
-    corrected_masks_dir: Path | str | None = None,
-    annotator: str = "anonymous",
-    notes: str = "",
-) -> Path:
-    """Package patches into a shareable .zip bundle.
-
-    Parameters
-    ----------
-    records : list[dict]
-        Patch records to include.  Each must have
-        ``patch_id``, ``image_path``, ``mask_path``.
-    output_path : Path
-        Where to write the .zip file.
-    corrected_masks_dir : Path | None
-        If provided, use corrected masks from this directory
-        (falling back to original mask_path if no correction exists).
-    annotator : str
-        Name/ID of the person creating the bundle.
-    notes : str
-        Free-text instructions for collaborators.
-
-    Returns
-    -------
-    Path
-        Path to the created .zip file.
-    """
+def export_bundle(records, output_path, corrected_masks_dir = None, annotator = "anonymous", notes = ""):
+    
     output_path = Path(output_path)
     if not output_path.suffix == ".zip":
         output_path = output_path.with_suffix(".zip")
@@ -91,7 +43,7 @@ def export_bundle(
             if Path(img_path).exists():
                 zf.write(img_path, f"{prefix}/image.png")
 
-            # Mask: prefer corrected, fall back to original
+            # Mask: prefer corrected, failsafe is original
             mask_path = rec["mask_path"]
             if corrected_dir:
                 corrected = corrected_dir / f"{patch_id}.png"
@@ -125,39 +77,14 @@ def export_bundle(
     logger.info(f"  Bundle size: {output_path.stat().st_size / (1024*1024):.1f} MB")
     return output_path
 
+def import_bundle(bundle_path, corrected_masks_dir, merge_strategy = "newest"):
 
-def import_bundle(
-    bundle_path: Path | str,
-    corrected_masks_dir: Path | str,
-    merge_strategy: str = "newest",
-) -> dict:
-    """Import corrected masks from a collaborator's bundle.
-
-    Parameters
-    ----------
-    bundle_path : Path
-        Path to the .zip bundle.
-    corrected_masks_dir : Path
-        Directory to save imported corrected masks.
-    merge_strategy : str
-        How to handle conflicts when a mask already exists:
-        - "newest"    : keep whichever was modified more recently
-        - "overwrite" : always use the imported mask
-        - "skip"      : never overwrite existing corrected masks
-
-    Returns
-    -------
-    dict
-        Summary: imported count, skipped count, bundle metadata.
-    """
     bundle_path = Path(bundle_path)
     corrected_dir = Path(corrected_masks_dir)
     corrected_dir.mkdir(parents=True, exist_ok=True)
-
     imported = 0
     skipped = 0
     conflicts = 0
-
     untouched = 0
 
     with zipfile.ZipFile(bundle_path, "r") as zf:
@@ -167,7 +94,6 @@ def import_bundle(
 
         # Determine which patches were actually corrected
         corrected_set = set(bundle_meta.get("corrected_ids", []))
-
         total = bundle_meta.get("patch_count", 0)
         n_corrected = len(corrected_set)
         logger.info(
@@ -175,8 +101,6 @@ def import_bundle(
             f"({total} patches total, {n_corrected} corrected)"
         )
 
-        # If no corrected_ids in metadata (old format bundle), fall back
-        # to checking mask_source in each patch's metadata
         has_corrected_list = bool(corrected_set)
 
         # Find all mask files in the bundle
@@ -198,7 +122,6 @@ def import_bundle(
                     untouched += 1
                     continue
             else:
-                # Old format: check per-patch metadata
                 meta_entry = f"patches/{patch_id}/metadata.json"
                 if meta_entry in zf.namelist():
                     patch_meta = json.loads(zf.read(meta_entry))
@@ -208,7 +131,6 @@ def import_bundle(
 
             dest_path = corrected_dir / f"{patch_id}.png"
 
-            # Conflict resolution
             if dest_path.exists():
                 if merge_strategy == "skip":
                     skipped += 1
@@ -264,31 +186,8 @@ def import_bundle(
                 f"Skipped: {skipped} | Conflicts resolved: {conflicts}")
     return summary
 
+def open_bundle(bundle_path, work_dir = None):
 
-def open_bundle(
-    bundle_path: Path | str,
-    work_dir: Path | str | None = None,
-) -> tuple[list[dict], Path]:
-    """Extract a bundle into a working directory for annotation.
-
-    Returns records the editor can use (image_path, mask_path, patch_id)
-    and the directory where corrected masks should be saved.
-
-    Parameters
-    ----------
-    bundle_path : Path
-        Path to the .zip bundle.
-    work_dir : Path | None
-        Where to extract.  Defaults to a sibling directory of the bundle
-        named ``<bundle_stem>_work/``.
-
-    Returns
-    -------
-    records : list[dict]
-        Patch records with local image_path and mask_path.
-    masks_dir : Path
-        Directory where corrected masks will be saved (editor output_dir).
-    """
     bundle_path = Path(bundle_path)
     if work_dir is None:
         work_dir = bundle_path.parent / f"{bundle_path.stem}_work"
@@ -334,31 +233,8 @@ def open_bundle(
     logger.info(f"Opened bundle: {len(records)} patches extracted → {work_dir}")
     return records, masks_dir
 
+def repack_bundle(work_dir, output_path, annotator = "anonymous"):
 
-def repack_bundle(
-    work_dir: Path | str,
-    output_path: Path | str,
-    annotator: str = "anonymous",
-) -> Path:
-    """Re-pack a working directory into a bundle .zip for return.
-
-    Merges any corrected masks back into the bundle so the lead
-    annotator can import them.
-
-    Parameters
-    ----------
-    work_dir : Path
-        The working directory created by open_bundle().
-    output_path : Path
-        Where to write the new .zip.
-    annotator : str
-        Name of the person who made corrections.
-
-    Returns
-    -------
-    Path
-        Path to the created .zip file.
-    """
     work_dir = Path(work_dir)
     output_path = Path(output_path)
     if not output_path.suffix == ".zip":
@@ -432,15 +308,9 @@ def repack_bundle(
                 f"{len(untouched_ids)} untouched → {output_path}")
     return output_path
 
+def list_bundle_contents(bundle_path):
+    # Inspect a bundle without extracting it.
 
-def list_bundle_contents(bundle_path: Path | str) -> dict:
-    """Inspect a bundle without extracting it.
-
-    Returns
-    -------
-    dict
-        Bundle metadata + list of contained patch IDs.
-    """
     bundle_path = Path(bundle_path)
     with zipfile.ZipFile(bundle_path, "r") as zf:
         meta = json.loads(zf.read("bundle_metadata.json"))

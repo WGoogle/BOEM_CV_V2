@@ -1,33 +1,13 @@
 """
 annotation.editor — Interactive Mask Annotation GUI
-====================================================
-Matplotlib-based editor for correcting proxy-label masks.
-
-Features:
-  - Left-click  → paint (add nodule pixels)
-  - Right-click → erase (remove false positives)
-  - Scroll      → zoom in/out (essential for small nodules)
-  - Brush size  → adjustable via keyboard (+/-) or slider
-  - Undo/Redo   → Ctrl+Z / Ctrl+Y (up to 50 steps)
-  - Overlay     → toggle mask overlay with 'o'
-  - Opacity     → adjust with '[' and ']'
-  - Save        → 's' or toolbar button
-  - Navigation  → 'n' next patch, 'p' previous patch
-
-Design notes:
-  - Masks are edited at full pixel resolution (256×256 by default).
-  - Small brush sizes (1-3px) allow single-nodule-grain annotation.
-  - All edits are saved to a separate 'corrected_masks/' directory,
-    never overwriting the original proxy labels.
+Reference ANNOTATION_GUIDE.txt for usage instructions.
 """
 from __future__ import annotations
-
 import copy
 import logging
 import time
 from collections import deque
 from pathlib import Path
-
 import cv2
 import numpy as np
 import matplotlib
@@ -39,32 +19,8 @@ plt.rcParams["keymap.save"] = []
 
 logger = logging.getLogger(__name__)
 
-
 class AnnotationEditor:
-    """Interactive mask editor for a list of patch records.
-
-    Parameters
-    ----------
-    records : list[dict]
-        Patch records with ``image_path``, ``mask_path``, ``patch_id``.
-    output_dir : Path
-        Directory to save corrected masks.
-    annotator : str
-        Name/ID of the person annotating (stored in metadata).
-    overlay_alpha : float
-        Initial mask overlay opacity.
-    max_undo : int
-        Maximum undo history depth.
-    """
-
-    def __init__(
-        self,
-        records: list[dict],
-        output_dir: Path,
-        annotator: str = "anonymous",
-        overlay_alpha: float = 0.45,
-        max_undo: int = 50,
-    ) -> None:
+    def __init__(self, records: list[dict], output_dir: Path, annotator: str = "anonymous", overlay_alpha: float = 0.45, max_undo: int = 50):
         self.records = records
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -103,13 +59,10 @@ class AnnotationEditor:
         # Mouse tracking for smooth strokes
         self._last_xy: tuple[int, int] | None = None
 
-    # ── Patch loading ────────────────────────────────────────────────
-
-    def _load_patch(self, idx: int) -> None:
-        """Load image and mask for patch at index idx."""
+    def _load_patch(self, idx: int):
         rec = self.records[idx]
 
-        # Load image (BGR → RGB)
+        # Load image (BGR to RGB)
         img = cv2.imread(rec["image_path"], cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"Image not found: {rec['image_path']}")
@@ -134,8 +87,7 @@ class AnnotationEditor:
         self.redo_stack.clear()
         self._last_xy = None
 
-    def _save_mask(self) -> Path:
-        """Save current mask to corrected_masks directory."""
+    def _save_mask(self):
         rec = self.records[self.current_idx]
         patch_id = rec.get("patch_id", f"patch_{self.current_idx:04d}")
         out_path = self.output_dir / f"{patch_id}.png"
@@ -144,25 +96,21 @@ class AnnotationEditor:
         logger.info(f"  Saved corrected mask → {out_path}")
         return out_path
 
-    # ── Drawing operations ───────────────────────────────────────────
-
-    def _push_undo(self) -> None:
-        """Save current mask state to undo stack."""
+    def _push_undo(self):
         self.undo_stack.append(self.mask.copy())
         self.redo_stack.clear()
 
-    def _undo(self) -> None:
+    def _undo(self):
         if self.undo_stack:
             self.redo_stack.append(self.mask.copy())
             self.mask = self.undo_stack.pop()
 
-    def _redo(self) -> None:
+    def _redo(self):
         if self.redo_stack:
             self.undo_stack.append(self.mask.copy())
             self.mask = self.redo_stack.pop()
 
-    def _paint_at(self, x: int, y: int, erase: bool = False) -> None:
-        """Paint or erase a circle at (x, y) on the mask."""
+    def _paint_at(self, x: int, y: int, erase: bool = False):
         h, w = self.mask.shape
         x, y = int(round(x)), int(round(y))
         if not (0 <= x < w and 0 <= y < h):
@@ -170,18 +118,13 @@ class AnnotationEditor:
         value = 0 if erase else 1
         cv2.circle(self.mask, (x, y), self.brush_radius, int(value), -1)
 
-    def _paint_line(self, x0: int, y0: int, x1: int, y1: int,
-                    erase: bool = False) -> None:
-        """Draw a line between two points for smooth strokes."""
+    def _paint_line(self, x0: int, y0: int, x1: int, y1: int, erase: bool = False):
         h, w = self.mask.shape
         value = 0 if erase else 1
         cv2.line(self.mask, (int(x0), int(y0)), (int(x1), int(y1)),
                  int(value), max(1, self.brush_radius * 2))
 
-    # ── Composite rendering ──────────────────────────────────────────
-
-    def _render_composite(self) -> np.ndarray:
-        """Render image with mask overlay."""
+    def _render_composite(self):
         composite = self.image.copy()
 
         # Peek mode: show raw image, no overlay
@@ -233,16 +176,8 @@ class AnnotationEditor:
             )
         return composite
 
-    # ── Main GUI ─────────────────────────────────────────────────────
-
-    def launch(self, start_idx: int = 0) -> None:
-        """Open the annotation GUI window.
-
-        Parameters
-        ----------
-        start_idx : int
-            Index of the first patch to display.
-        """
+    # Main
+    def launch(self, start_idx: int = 0):
         self.current_idx = start_idx
         self._load_patch(self.current_idx)
 
@@ -261,8 +196,7 @@ class AnnotationEditor:
         )
         self.ax.add_patch(self._cursor_circle)
 
-        # ── Controls ────────────────────────────────────────────────
-
+        # Controls
         # Brush size slider
         ax_brush = plt.axes([0.25, 0.08, 0.50, 0.03])
         self._brush_slider = Slider(
@@ -286,8 +220,6 @@ class AnnotationEditor:
         self._btn_toggle = Button(ax_toggle, "Toggle (O)")
         self._btn_reset = Button(ax_reset, "Reset (R)")
 
-        # Button callbacks — always refocus the main axes afterward
-        # so keyboard shortcuts (arrow keys, etc.) keep working
         def _click_and_refocus(func):
             def wrapper(_event):
                 func()
@@ -302,7 +234,6 @@ class AnnotationEditor:
         self._btn_toggle.on_clicked(_click_and_refocus(self._toggle_overlay))
         self._btn_reset.on_clicked(_click_and_refocus(self._reset_mask))
 
-        # ── Event connections ───────────────────────────────────────
         self.fig.canvas.mpl_connect("button_press_event", self._on_press)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -317,10 +248,7 @@ class AnnotationEditor:
         logger.info("  C: toggle outline mode (contours only, no fill)")
         logger.info("  O: toggle overlay | [/]: opacity | Ctrl+Z: undo | R: reset")
         logger.info("  Brush size: use the slider at the bottom")
-
         plt.show()
-
-    # ── Event handlers ───────────────────────────────────────────────
 
     def _on_press(self, event):
         if event.inaxes != self.ax or event.xdata is None:
@@ -339,8 +267,6 @@ class AnnotationEditor:
     def _on_motion(self, event):
         if event.inaxes != self.ax or event.xdata is None:
             return
-
-        # Update cursor
         self._cursor_circle.center = (event.xdata, event.ydata)
         self._cursor_circle.radius = max(0.5, self.brush_radius)
         self._cursor_circle.set_visible(True)
@@ -425,7 +351,6 @@ class AnnotationEditor:
         self._zoom(zoom_in=zoom_in, anchor=anchor)
 
     def _clamp_view(self):
-        """Clamp the current view so it never leaves the image bounds."""
         h, w = self.image.shape[:2]
         xlim = list(self.ax.get_xlim())
         ylim = list(self.ax.get_ylim())
@@ -459,7 +384,6 @@ class AnnotationEditor:
         self.ax.set_ylim(ylim)
 
     def _zoom(self, zoom_in: bool = True, anchor=None):
-        """Zoom in/out, optionally anchored at a data-coord point."""
         scale = 1 / 1.4 if zoom_in else 1.4
         h, w = self.image.shape[:2]
 
@@ -487,13 +411,12 @@ class AnnotationEditor:
         self.fig.canvas.draw_idle()
 
     def _pan(self, dx: int, dy: int):
-        """Pan the view by a fraction of the current viewport, clamped to image."""
         cur_xlim = self.ax.get_xlim()
         cur_ylim = self.ax.get_ylim()
 
         # Pan by 20% of current view size
         step_x = (cur_xlim[1] - cur_xlim[0]) * 0.2 * dx
-        step_y = (cur_ylim[0] - cur_ylim[1]) * 0.2 * dy  # y inverted
+        step_y = (cur_ylim[0] - cur_ylim[1]) * 0.2 * dy 
 
         self.ax.set_xlim(cur_xlim[0] + step_x, cur_xlim[1] + step_x)
         self.ax.set_ylim(cur_ylim[0] + step_y, cur_ylim[1] + step_y)
@@ -505,8 +428,7 @@ class AnnotationEditor:
         self._cursor_circle.radius = self.brush_radius
         self.fig.canvas.draw_idle()
 
-    # ── Actions ──────────────────────────────────────────────────────
-
+    # Actions
     def _do_save(self):
         self._save_mask()
         self._update_title()
@@ -555,22 +477,15 @@ class AnnotationEditor:
                 logger.info("  Auto-saved modified mask before navigation.")
 
     def _reset_view(self):
-        """Reset zoom to full image."""
         if self.image is not None:
             h, w = self.image.shape[:2]
             self.ax.set_xlim(-0.5, w - 0.5)
             self.ax.set_ylim(h - 0.5, -0.5)
-
-    # ── Display refresh ──────────────────────────────────────────────
-
     def _refresh(self):
-        """Redraw the composite image."""
         self._img_display.set_data(self._render_composite())
         self._update_title()
         self.fig.canvas.draw_idle()
-
-    def _count_corrected(self) -> int:
-        """Count how many patches have a corrected mask on disk."""
+    def _count_corrected(self):
         count = 0
         for rec in self.records:
             pid = rec.get("patch_id", "")
