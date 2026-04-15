@@ -150,11 +150,18 @@ def cmd_edit(args):
     )
     editor.launch(start_idx=args.start)
 
-    # After editor closes, update tracker
+    # After editor closes, update tracker.
+    # Record both modified patches and patches reviewed as-is (navigated past
+    # without edits) so they no longer count as "remaining" in the status.
     tracker = AnnotationTracker(TRACKER_PATH)
-    for patch_id in editor.modified_patches:
+    touched = editor.modified_patches | editor.reviewed_patches
+    for patch_id in touched:
         tracker.record_annotation(patch_id, args.annotator)
-    logger.info(f"Updated tracker: {len(editor.modified_patches)} patches annotated")
+    reviewed_only = len(touched) - len(editor.modified_patches)
+    logger.info(
+        f"Updated tracker: {len(editor.modified_patches)} modified, "
+        f"{reviewed_only} reviewed as-is"
+    )
 
 def cmd_export(args):
     all_records = load_all_records()

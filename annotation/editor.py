@@ -50,6 +50,10 @@ class AnnotationEditor:
         # Track which patches have been modified
         self.modified_patches: set[str] = set()
 
+        # Track which patches have been reviewed (visited and navigated past,
+        # even without corrections — proxy label accepted as-is)
+        self.reviewed_patches: set[str] = set()
+
         # Peek mode: hold Space to see raw image
         self._peeking = False
 
@@ -180,6 +184,8 @@ class AnnotationEditor:
     def launch(self, start_idx: int = 0):
         self.current_idx = start_idx
         self._load_patch(self.current_idx)
+        import matplotlib as _mpl
+        _mpl.rcParams["toolbar"] = "None"
 
         # Create figure
         self.fig, self.ax = plt.subplots(1, 1, figsize=(10, 10))
@@ -434,17 +440,29 @@ class AnnotationEditor:
         self._update_title()
         self.fig.canvas.draw_idle()
 
+    def _mark_current_reviewed(self):
+        rec = self.records[self.current_idx]
+        patch_id = rec.get("patch_id", f"patch_{self.current_idx:04d}")
+        self.reviewed_patches.add(patch_id)
+
     def _go_next(self):
         if self.current_idx < len(self.records) - 1:
             self._prompt_save_if_modified()
+            self._mark_current_reviewed()
             self.current_idx += 1
             self._load_patch(self.current_idx)
             self._reset_view()
             self._refresh()
+        else:
+            self._prompt_save_if_modified()
+            self._mark_current_reviewed()
+            logger.info("  Last patch reached — saving and closing annotation tool.")
+            plt.close(self.fig)
 
     def _go_prev(self):
         if self.current_idx > 0:
             self._prompt_save_if_modified()
+            self._mark_current_reviewed()
             self.current_idx -= 1
             self._load_patch(self.current_idx)
             self._reset_view()
@@ -490,6 +508,8 @@ class AnnotationEditor:
         for rec in self.records:
             pid = rec.get("patch_id", "")
             if pid in self.modified_patches:
+                count += 1
+            elif pid in self.reviewed_patches:
                 count += 1
             elif (self.output_dir / f"{pid}.png").exists():
                 count += 1
