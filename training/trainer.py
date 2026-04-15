@@ -246,14 +246,14 @@ class Trainer:
             history.append(log)
 
             # Checkpoint: always save "last"
-            last_ckpt_path = str(self._save_checkpoint(epoch, val_dice, "last"))
+            last_ckpt_path = str(self._save_checkpoint(epoch, val_dice, "last", None))
 
             # Checkpoint: save "best" if improved
             if val_dice > best_dice:
                 best_dice  = val_dice
                 best_epoch = epoch
                 no_improve = 0
-                best_ckpt_path = str(self._save_checkpoint(epoch, val_dice, "best"))
+                best_ckpt_path = str(self._save_checkpoint(epoch, val_dice, "best", None))
             else:
                 no_improve += 1
 

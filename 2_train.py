@@ -7,6 +7,8 @@ Helpful Shortcuts I use:
     python 2_train.py --batch-size 8      # override batch size (for small GPUs)
 """
 from __future__ import annotations
+import os
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 import argparse
 import json
 import logging
