@@ -5,7 +5,7 @@ End-to-end pipeline for detecting and segmenting polymetallic nodules in seafloo
 ## Setup
 
 ```bash
-git clone <repo>
+git clone https://github.com/WGoogle/BOEM_CV_V2.git
 cd BOEM_CV_V2
 pip install -r requirements.txt
 ```
