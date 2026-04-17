@@ -2,8 +2,8 @@
 Step 1 — Preprocess and Label
 
 Helpful Shortcuts I use: 
-    python 1_preprocess_and_label.py                  # full run, for new data
-    python 1_preprocess_and_label.py --force          # re-process everything, when debugging 
+    python 1_preprocess_and_label.py                  # full run, for new data -- avoids re running already preprocessed ones (old data)
+    python 1_preprocess_and_label.py --force          # re-process everything, when debugging, so no need to delete whole outputs folder :) 
 """
 from __future__ import annotations
 import argparse
