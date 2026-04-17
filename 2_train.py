@@ -3,8 +3,12 @@ Step 2 — Train Nodule Segmentation Model
 
 Helpful Shortcuts I use:
     python 2_train.py                     # train on all preprocessed patches
-    python 2_train.py --epochs 50         # override epoch count
+    python 2_train.py --epochs 50         # override epoch count (I would reccomend at least 90 epochs)
     python 2_train.py --batch-size 8      # override batch size (for small GPUs)
+
+    ALSO a small thing, but sometimes after model finishes, you might not see the terminal prompt again for a bit of time — that's just the final checkpoint 
+    saving and manifest updating steps running, which can take a minute. 
+    So if it looks like the script has "hung" after training completes, just give it a moment before trying to interrupt or run another command.
 """
 from __future__ import annotations
 import os
@@ -148,6 +152,8 @@ def main():
     train_cfg = dict(config.TRAINING)
     if args.epochs is not None:
         train_cfg["num_epochs"] = args.epochs
+        # User explicitly requested N epochs — disable early stopping
+        train_cfg["early_stopping_patience"] = args.epochs
     if args.batch_size is not None:
         train_cfg["batch_size"] = args.batch_size
     logger.info("=" * 70)
@@ -249,7 +255,7 @@ def main():
                                          input_mode=input_mode)
 
     num_workers = train_cfg.get("num_workers", 4)
-    pin_memory  = (device == "cuda")
+    pin_memory  = (device == "cuda")  # MPS and CPU don't support pin_memory
     persistent_workers = num_workers > 0
     prefetch_factor    = 4 if num_workers > 0 else None
 
