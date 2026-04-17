@@ -10,25 +10,23 @@ from torch.amp import GradScaler
 
 logger = logging.getLogger(__name__)
 
-# Metrics 
-def _compute_metrics(logits, targets, threshold):
-    # Compute IoU and Dice from raw logits + binary targets
+# Metrics
+def _accumulate_metric_stats(logits, targets, threshold):
     with torch.no_grad():
         probs = torch.sigmoid(logits)
         preds = (probs > threshold).float()
-        preds_flat   = preds.view(preds.size(0), -1)
-        targets_flat = targets.view(targets.size(0), -1)
+        intersection = (preds * targets).sum()
+        sum_preds    = preds.sum()
+        sum_targets  = targets.sum()
+    return intersection.item(), sum_preds.item(), sum_targets.item()
 
-        intersection = (preds_flat * targets_flat).sum(dim=1)
-        union        = preds_flat.sum(dim=1) + targets_flat.sum(dim=1)
-        sum_preds    = preds_flat.sum(dim=1)
-        sum_targets  = targets_flat.sum(dim=1)
 
-        smooth = 1e-6
-        iou  = (intersection + smooth) / (sum_preds + sum_targets - intersection + smooth)
-        dice = (2 * intersection + smooth) / (union + smooth)
-
-    return {"iou": iou.mean().item(), "dice": dice.mean().item()}
+def _finalize_metrics(intersection, sum_preds, sum_targets):
+    # Compute micro-averaged IoU/Dice from pooled pixel counts.
+    smooth = 1e-6
+    iou  = (intersection + smooth) / (sum_preds + sum_targets - intersection + smooth)
+    dice = (2 * intersection + smooth) / (sum_preds + sum_targets + smooth)
+    return {"iou": iou, "dice": dice}
 
 @dataclass
 class EpochLog:
@@ -56,7 +54,6 @@ class TrainingResult:
 # Trainer 
 class Trainer:
     # Manages the full training loop for a segmentation model.
-
     def __init__(self, model, criterion, train_cfg, checkpoint_dir, device, **_kw):
         self.model = model.to(device)
         self.criterion = criterion
@@ -82,17 +79,20 @@ class Trainer:
 
         self.num_epochs = train_cfg["num_epochs"]
         self.patience   = train_cfg.get("early_stopping_patience", 15)
+        self.min_epochs_before_stop = train_cfg.get("min_epochs_before_stop", 85)
 
-        # Mixed-precision
         self.use_amp = (device == "cuda")
         self.scaler  = GradScaler("cuda", enabled=self.use_amp)
+        # autocast device type: "cuda" or "cpu" (MPS uses cpu path without AMP)
+        self._autocast_device = device if device == "cuda" else "cpu"
 
     def _train_one_epoch(self, loader):
-        """Run one training epoch.  Returns (loss, iou, dice)."""
+        # Run one training epoch.  Returns (loss, iou, dice)
         self.model.train()
         running_loss = 0.0
-        running_iou  = 0.0
-        running_dice = 0.0
+        total_inter = 0.0
+        total_preds = 0.0
+        total_targets = 0.0
         n_batches = 0
 
         for images, masks in loader:
@@ -101,7 +101,7 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast(device_type=self.device, enabled=self.use_amp):
+            with torch.autocast(device_type=self._autocast_device, enabled=self.use_amp):
                 logits = self.model(images)
                 loss   = self.criterion(logits, masks)
 
@@ -109,16 +109,18 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            metrics = _compute_metrics(logits, masks, 0.5)
+            inter, sp, st = _accumulate_metric_stats(logits, masks, 0.5)
             running_loss += loss.item()
-            running_iou  += metrics["iou"]
-            running_dice += metrics["dice"]
+            total_inter   += inter
+            total_preds   += sp
+            total_targets += st
             n_batches += 1
 
+        metrics = _finalize_metrics(total_inter, total_preds, total_targets)
         return (
             running_loss / n_batches,
-            running_iou  / n_batches,
-            running_dice / n_batches,
+            metrics["iou"],
+            metrics["dice"],
         )
 
     @torch.no_grad()
@@ -126,28 +128,31 @@ class Trainer:
         # Run validation.  Returns (loss, iou, dice)
         self.model.eval()
         running_loss = 0.0
-        running_iou  = 0.0
-        running_dice = 0.0
+        total_inter = 0.0
+        total_preds = 0.0
+        total_targets = 0.0
         n_batches = 0
 
         for images, masks in loader:
             images = images.to(self.device, non_blocking=True)
             masks  = masks.to(self.device, non_blocking=True)
 
-            with torch.autocast(device_type=self.device, enabled=self.use_amp):
+            with torch.autocast(device_type=self._autocast_device, enabled=self.use_amp):
                 logits = self.model(images)
                 loss   = self.criterion(logits, masks)
 
-            metrics = _compute_metrics(logits, masks, 0.5)
+            inter, sp, st = _accumulate_metric_stats(logits, masks, 0.5)
             running_loss += loss.item()
-            running_iou  += metrics["iou"]
-            running_dice += metrics["dice"]
+            total_inter   += inter
+            total_preds   += sp
+            total_targets += st
             n_batches += 1
 
+        metrics = _finalize_metrics(total_inter, total_preds, total_targets)
         return (
             running_loss / n_batches,
-            running_iou  / n_batches,
-            running_dice / n_batches,
+            metrics["iou"],
+            metrics["dice"],
         )
 
     # Threshold optimisation 
@@ -160,7 +165,7 @@ class Trainer:
 
         for images, masks in loader:
             images = images.to(self.device, non_blocking=True)
-            with torch.autocast(device_type=self.device, enabled=self.use_amp):
+            with torch.autocast(device_type=self._autocast_device, enabled=self.use_amp):
                 logits = self.model(images)
             all_probs.append(torch.sigmoid(logits).cpu())
             all_targets.append(masks.cpu())
@@ -173,11 +178,11 @@ class Trainer:
 
         for thr in torch.linspace(low, high, steps):
             preds = (probs > thr.item()).float()
-            p = preds.view(preds.size(0), -1)
-            t = targets.view(targets.size(0), -1)
-            intersection = (p * t).sum(dim=1)
-            union = p.sum(dim=1) + t.sum(dim=1)
-            dice = ((2 * intersection + smooth) / (union + smooth)).mean().item()
+            # Micro-averaged Dice: pool pixel counts across all patches so dense patches dominate over empty ones
+            intersection = (preds * targets).sum().item()
+            sum_preds    = preds.sum().item()
+            sum_targets  = targets.sum().item()
+            dice = (2 * intersection + smooth) / (sum_preds + sum_targets + smooth)
             if dice > best_dice:
                 best_dice = dice
                 best_thr = round(thr.item(), 3)
@@ -215,7 +220,6 @@ class Trainer:
 
     # Main training loop
     def fit(self, train_loader, val_loader, *, start_epoch, epoch_callback):
-        # Train the model for up to ``num_epochs`` with early stopping.
 
         best_dice  = 0.0
         best_epoch = 0
@@ -261,8 +265,8 @@ class Trainer:
             if epoch_callback:
                 epoch_callback(log)
 
-            # Early stopping
-            if no_improve >= self.patience:
+            # Early stopping (only after minimum epoch threshold)
+            if no_improve >= self.patience and epoch >= self.min_epochs_before_stop:
                 logger.info(
                     f"  Early stopping at epoch {epoch} "
                     f"(no improvement for {self.patience} epochs)"

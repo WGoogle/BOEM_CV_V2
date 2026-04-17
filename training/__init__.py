@@ -15,6 +15,7 @@ from .confident_learning import (
     ConfidentLabelAuditor,
     PatchAuditScore,
     export_audit_queue,
+    export_dice_audit_queue,
     load_model_from_checkpoint,
 )
 
@@ -34,5 +35,6 @@ __all__ = [
     "ConfidentLabelAuditor",
     "PatchAuditScore",
     "export_audit_queue",
+    "export_dice_audit_queue",
     "load_model_from_checkpoint",
 ]

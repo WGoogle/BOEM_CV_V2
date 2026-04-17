@@ -1,164 +1,53 @@
 """
 training.confident_learning — Label-Quality Auditor
-======================================================
-Confident-Learning-inspired label audit for proxy-labelled segmentation
-masks (inspired by Northcutt et al., *Confident Learning: Estimating
-Uncertainty in Dataset Labels*, JAIR 2021).
+Confident-Learning-inspired label audit for proxy-labelled segmentation masks 
+(Inspired by Northcutt et al., "Confident Learning: Estimating Uncertainty in Dataset Labels, JAIR 2021")
 
-Purpose
--------
-Your proxy labels (top-hat × LCR pipeline from Step 1) are noisy. Manual
-correction is expensive. Instead of correcting patches uniformly, this
-module ranks proxy-labelled patches by *where the model disagrees most*
-with the proxy label, so your annotation budget goes to the patches
-that will actually move the needle.
-
-Workflow
---------
-1. Train a first-pass model on the current proxy + manual labels
-   (``python 2_train.py``).
-2. Run ``python 5_audit_labels.py`` to score every proxy-labelled patch
-   against the trained model. Patches already in
-   ``CORRECTED_MASKS_DIR`` are skipped — they're treated as ground
-   truth.
-3. The auditor writes the top-K disagreements into
-   ``ANNOTATION_INBOX`` as ``(image, proxy_overlay, model_overlay,
-   disagreement_heatmap)`` quads, plus an ``audit_queue.csv`` that
-   drives the manual correction queue.
-4. Correct that batch with your existing annotation tool; corrected
-   masks land in ``CORRECTED_MASKS_DIR``; the dataset loader
-   automatically prefers them at the next training run
-   (``training/dataset.py`` already does this via
-   ``corrected_masks_dir``).
-5. Re-train, re-audit, repeat. This is the active-learning loop
-   Northcutt et al. formalise.
-
-Scoring
--------
-For each patch, with model probability map ``p`` ∈ [0,1] and proxy
-mask ``y`` ∈ {0,1}::
-
-    confident_fp_frac = mean( y == 1  AND  p < low_thresh )
-        → fraction of proxy-positive pixels the model confidently calls
-          background. High value ⇒ proxy FP contamination (sediment /
-          divots labelled as nodules).
-
-    confident_fn_frac = mean( y == 0  AND  p > high_thresh )
-        → fraction of proxy-negative pixels the model confidently calls
-          nodule. High value ⇒ proxy FN omissions (missed nodules).
-
-    dice_disagreement = 1 − Dice( y,  p > 0.5 )
-        → overall region mismatch.
-
-    combined_score    = w_fp · confident_fp_frac
-                      + w_fn · confident_fn_frac
-                      + w_dd · dice_disagreement
-
-Default weights are **FP-biased** (``w_fp=0.6, w_fn=0.3, w_dd=0.1``) to
-match the precision-biased training loss — auditing effort goes to
-proxy FP contamination first, because that's the failure mode the
-training loss and the downstream density metric care about.
-
-Thresholds
-----------
-``low_thresh`` and ``high_thresh`` default to 0.15 and 0.85 (fixed).
-For a more rigorous cleanlab-style calibration, pass
-``adaptive_thresholds=True``; the auditor then runs a first pass to
-compute per-class mean probabilities (Northcutt's self-confidence
-thresholds) and rescores. Two-pass is slower but matches the JAIR 2021
-formulation more closely.
+Use Audit Pipeline.txt file to see how to use this. 
+Essentially, allows us to rank proxy-labelled patches by model/proxy disagreement, 
+then export the worst offenders to the annotation inbox for manual review and correction.
+Breaks bottleneck of having to manually annotate every single patch, rather just the worst ones where the model disagrees with the proxy.
 """
 from __future__ import annotations
-
 import csv
 import json
 import logging
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Iterable
-
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-
 from .dataset import NoduleSegmentationDataset, get_val_augmentations
 
 logger = logging.getLogger(__name__)
 
-
-# ── Per-patch scoring record ────────────────────────────────────────────
-
 @dataclass
 class PatchAuditScore:
-    """All per-patch audit statistics for one proxy-labelled patch."""
-
     patch_id: str
     image_path: str
     mask_path: str
     # Aggregate statistics
-    mean_prob: float              # model's mean predicted probability over patch
-    proxy_coverage: float         # fraction of pixels labelled positive in proxy
-    pred_coverage: float          # fraction of pixels model predicts positive (>0.5)
+    mean_prob: float              
+    proxy_coverage: float   
+    pred_coverage: float      
     # Confident-learning disagreement scores
-    confident_fp_frac: float      # proxy positive ∧ model confidently negative
-    confident_fn_frac: float      # proxy negative ∧ model confidently positive
-    dice_disagreement: float      # 1 − Dice(proxy, pred)
-    combined_score: float         # weighted rank signal
-    # For downstream class-conditional threshold refinement
+    confident_fp_frac: float      
+    confident_fn_frac: float      
+    dice_disagreement: float  
+    combined_score: float        
+    missed_pixels: int = 0     
     sum_prob_where_y0: float = 0.0
     count_y0:          float = 0.0
     sum_prob_where_y1: float = 0.0
     count_y1:          float = 0.0
 
-
-# ── Auditor ─────────────────────────────────────────────────────────────
-
 class ConfidentLabelAuditor:
-    """Score proxy-labelled patches by model/proxy disagreement.
-
-    Parameters
-    ----------
-    model : nn.Module
-        Trained segmentation model returning raw logits of shape
-        ``(B, 1, H, W)``. Will be set to ``eval()`` internally.
-    device : str
-        ``"cuda"``, ``"mps"``, or ``"cpu"``.
-    low_thresh : float
-        Probability below which the model is considered "confidently
-        negative". Default 0.15.
-    high_thresh : float
-        Probability above which the model is considered "confidently
-        positive". Default 0.85.
-    w_fp, w_fn, w_dd : float
-        Weights for confident_fp_frac, confident_fn_frac, and
-        dice_disagreement in the combined rank signal. Defaults are
-        FP-biased (0.6 / 0.3 / 0.1) to match the training loss.
-    adaptive_thresholds : bool
-        If True, run a first pass to compute per-class mean predicted
-        probabilities (cleanlab-style self-confidence thresholds), then
-        rescore in a second pass using those as ``low_thresh`` /
-        ``high_thresh``. Defaults to False for speed.
-    batch_size, num_workers : int
-        DataLoader settings for the forward pass.
-    """
-
-    def __init__(
-        self,
-        model,
-        device = "cuda",
-        *,
-        low_thresh = 0.15,
-        high_thresh = 0.85,
-        w_fp = 0.6,
-        w_fn = 0.3,
-        w_dd = 0.1,
-        adaptive_thresholds = False,
-        batch_size = 16,
-        num_workers = 4,
-        input_mode = "rgb",
-    ):
+    def __init__(self, model, device = "cuda", *, low_thresh = 0.15, high_thresh = 0.85, w_fp = 0.6, w_fn = 0.3, w_dd = 0.1, adaptive_thresholds = False, batch_size = 16,
+        num_workers = 4, input_mode = "rgb"):
+        
         self.model = model.to(device).eval()
         self.device = device
         self.low_thresh  = low_thresh
@@ -169,26 +58,10 @@ class ConfidentLabelAuditor:
         self.adaptive_thresholds = adaptive_thresholds
         self.batch_size  = batch_size
         self.num_workers = num_workers
-        # Must match the input_mode the loaded checkpoint was trained with,
-        # otherwise the model sees statistically-foreign channels and the
-        # disagreement ranking is garbage.
+        # Must match the input_mode (we use engineered mode, and while we initalize with rgb, dont worry it got changed to engineered downstream)
         self.input_mode = input_mode
 
-    # ── Main entry point ────────────────────────────────────────────
-
-    def score(
-        self,
-        records,
-        corrected_masks_dir = None,
-    ):
-        """Score all proxy-labelled patches in ``records``.
-
-        Records whose ``patch_id`` already has a corrected mask are
-        **excluded** — they're treated as ground truth.
-
-        Returns a list of :class:`PatchAuditScore` sorted in descending
-        order of ``combined_score`` (worst disagreement first).
-        """
+    def score(self, records, corrected_masks_dir = None, save_pred_masks_dir = None):
         audit_records = self._filter_uncorrected(records, corrected_masks_dir)
         if not audit_records:
             logger.warning("  No proxy-only patches to audit (all corrected).")
@@ -199,7 +72,7 @@ class ConfidentLabelAuditor:
             f"(skipped {len(records) - len(audit_records)} already corrected)"
         )
 
-        scores = self._single_pass(audit_records)
+        scores = self._single_pass(audit_records, save_pred_masks_dir=save_pred_masks_dir)
 
         if self.adaptive_thresholds:
             low, high = self._compute_adaptive_thresholds(scores)
@@ -208,15 +81,13 @@ class ConfidentLabelAuditor:
                 f"(overriding fixed {self.low_thresh}/{self.high_thresh})"
             )
             self.low_thresh, self.high_thresh = low, high
-            scores = self._single_pass(audit_records)  # rescore with adapted thresholds
+            scores = self._single_pass(audit_records, save_pred_masks_dir=save_pred_masks_dir)
 
-        scores.sort(key=lambda s: s.combined_score, reverse=True)
+        scores.sort(key=lambda s: s.confident_fp_frac, reverse=True)
         return scores
 
-    # ── Single forward pass over the dataset ────────────────────────
-
     @torch.no_grad()
-    def _single_pass(self, records):
+    def _single_pass(self, records, *, save_pred_masks_dir=None):
         """Forward every patch once and compute disagreement stats."""
         dataset = NoduleSegmentationDataset(
             records,
@@ -232,6 +103,10 @@ class ConfidentLabelAuditor:
             pin_memory=(self.device == "cuda"),
         )
 
+        if save_pred_masks_dir is not None:
+            save_pred_masks_dir = Path(save_pred_masks_dir)
+            save_pred_masks_dir.mkdir(parents=True, exist_ok=True)
+
         scores: list[PatchAuditScore] = []
         idx = 0
         use_amp = (self.device == "cuda")
@@ -242,7 +117,15 @@ class ConfidentLabelAuditor:
 
             with torch.autocast(device_type=self.device, enabled=use_amp):
                 logits = self.model(images)
-            probs = torch.sigmoid(logits.float())  # upcast out of AMP for stats
+            probs = torch.sigmoid(logits.float())  
+
+            # Save predicted masks if requested
+            if save_pred_masks_dir is not None:
+                pred_hard = (probs.squeeze(1) > 0.5).cpu().numpy().astype(np.uint8) * 255
+                for i in range(pred_hard.shape[0]):
+                    rec = records[idx + i]
+                    pid = rec.get("patch_id", Path(rec["image_path"]).stem)
+                    cv2.imwrite(str(save_pred_masks_dir / f"{pid}.png"), pred_hard[i])
 
             batch_scores = self._score_batch(probs, masks, records[idx : idx + images.size(0)])
             scores.extend(batch_scores)
@@ -250,36 +133,34 @@ class ConfidentLabelAuditor:
 
         return scores
 
-    def _score_batch(
-        self,
-        probs,
-        targets,
-        batch_records,
-    ):
-        """Compute per-patch audit scores for one batch."""
-        # Shapes: probs (B,1,H,W), targets (B,1,H,W)
-        p = probs.squeeze(1)                 # (B, H, W)
-        y = targets.squeeze(1)               # (B, H, W)  binary float
+    def _score_batch(self, probs, targets, batch_records):
+        p = probs.squeeze(1)                 
+        y = targets.squeeze(1)       
 
         n_pixels = p.shape[-1] * p.shape[-2]
 
         # Confident disagreement masks
-        confident_fp = (y > 0.5) & (p < self.low_thresh)   # proxy pos, model strong neg
-        confident_fn = (y < 0.5) & (p > self.high_thresh)  # proxy neg, model strong pos
+        confident_fp = (y > 0.5) & (p < self.low_thresh)  
+        confident_fn = (y < 0.5) & (p > self.high_thresh) 
 
         # Dice (hard prediction at 0.5)
         pred_hard = (p > 0.5).float()
+        y_bin = (y > 0.5).float()
+        missed_pixels = (pred_hard != y_bin).float().sum(dim=(1, 2)) 
         intersection = (pred_hard * y).sum(dim=(1, 2))
         denom        = pred_hard.sum(dim=(1, 2)) + y.sum(dim=(1, 2))
         dice         = (2.0 * intersection + 1e-6) / (denom + 1e-6)
         dice_disagreement = 1.0 - dice
 
-        # Per-patch stats
         mean_prob       = p.mean(dim=(1, 2))
         proxy_coverage  = y.mean(dim=(1, 2))
         pred_coverage   = pred_hard.mean(dim=(1, 2))
         cf_fp_frac      = confident_fp.float().mean(dim=(1, 2))
         cf_fn_frac      = confident_fn.float().mean(dim=(1, 2))
+
+        min_coverage = 0.001  
+        both_empty = (proxy_coverage < min_coverage) & (pred_coverage < min_coverage)
+        dice_disagreement = torch.where(both_empty, torch.zeros_like(dice_disagreement), dice_disagreement)
 
         # Class-conditional sum/count for adaptive threshold pass
         y_bool = y > 0.5
@@ -307,6 +188,7 @@ class ConfidentLabelAuditor:
                 confident_fn_frac = float(cf_fn_frac[i]),
                 dice_disagreement = float(dice_disagreement[i]),
                 combined_score    = float(combined[i]),
+                missed_pixels     = int(missed_pixels[i].item()),
                 sum_prob_where_y0 = float(sum_p_y0[i]),
                 count_y0          = float(cnt_y0[i]),
                 sum_prob_where_y1 = float(sum_p_y1[i]),
@@ -314,20 +196,8 @@ class ConfidentLabelAuditor:
             ))
         return out
 
-    def _compute_adaptive_thresholds(
-        self,
-        scores,
-    ):
-        """Northcutt-style self-confidence thresholds.
-
-        t_0 = mean model-probability over all pixels labelled 0 in the proxy.
-        t_1 = mean model-probability over all pixels labelled 1 in the proxy.
-
-        These are class-conditional expected probabilities. We use them
-        as the low/high confident-disagreement thresholds: a pixel with
-        ``y=1`` but ``p < t_1`` is below the *expected* confidence for
-        that class, i.e. the model thinks the proxy label is wrong.
-        """
+    def _compute_adaptive_thresholds(self, scores):
+  
         sum0 = sum(s.sum_prob_where_y0 for s in scores)
         cnt0 = sum(s.count_y0          for s in scores)
         sum1 = sum(s.sum_prob_where_y1 for s in scores)
@@ -335,24 +205,16 @@ class ConfidentLabelAuditor:
 
         t0 = (sum0 / cnt0) if cnt0 > 0 else self.low_thresh
         t1 = (sum1 / cnt1) if cnt1 > 0 else self.high_thresh
-        # t0 is the mean prob on proxy-negative pixels → use as low_thresh
-        # (model says "confidently negative" if p < t0).
-        # t1 is the mean prob on proxy-positive pixels → use as high_thresh
-        # (model says "confidently positive" if p > t1). For FP detection we
-        # want p < t1 on proxy-positive pixels, so t1 is the upper gate.
-        # Guard pathological values.
         low  = max(1e-3, min(t0, 0.5))
         high = min(1 - 1e-3, max(t1, 0.5))
         return float(low), float(high)
-
-    # ── Already-corrected patch filter ──────────────────────────────
 
     @staticmethod
     def _filter_uncorrected(
         records,
         corrected_masks_dir,
     ):
-        """Drop records whose patch_id already has a corrected mask."""
+        # Drop records whose patch_id already has a corrected mask
         if corrected_masks_dir is None:
             return list(records)
         cdir = Path(corrected_masks_dir)
@@ -361,30 +223,10 @@ class ConfidentLabelAuditor:
         corrected_ids = {p.stem for p in cdir.glob("*.png")}
         return [r for r in records if r.get("patch_id", "") not in corrected_ids]
 
+def export_audit_queue(scores, output_dir, top_k = 200, save_visualizations = True):
 
-# ── Export to annotation inbox ──────────────────────────────────────────
-
-def export_audit_queue(
-    scores,
-    output_dir,
-    top_k = 200,
-    save_visualizations = True,
-):
-    """Write the top-K disagreements to the annotation inbox.
-
-    Produces:
-      - ``audit_queue.csv``  — one row per queued patch, sorted by
-        combined_score (worst first), with all audit stats.
-      - ``audit_queue.json`` — same data in JSON for programmatic use.
-      - ``visualizations/<patch_id>/`` (if ``save_visualizations``) —
-        image, proxy overlay, disagreement heatmap, and a side-by-side
-        panel for the annotator to eyeball.
-
-    Returns the CSV path.
-    """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-
     queued = scores if top_k is None else scores[:top_k]
 
     # CSV
@@ -393,7 +235,8 @@ def export_audit_queue(
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "rank", "patch_id", "combined_score",
+                "rank", "patch_id", "missed_pixels",
+                "combined_score",
                 "confident_fp_frac", "confident_fn_frac",
                 "dice_disagreement", "proxy_coverage",
                 "pred_coverage", "mean_prob",
@@ -405,6 +248,7 @@ def export_audit_queue(
             writer.writerow({
                 "rank":              rank,
                 "patch_id":          s.patch_id,
+                "missed_pixels":     s.missed_pixels,
                 "combined_score":    round(s.combined_score, 6),
                 "confident_fp_frac": round(s.confident_fp_frac, 6),
                 "confident_fn_frac": round(s.confident_fn_frac, 6),
@@ -427,20 +271,84 @@ def export_audit_queue(
     logger.info(f"  Audit queue written: {csv_path}  ({len(queued)} patches)")
     return csv_path
 
+def export_dice_audit_queue(metrics, output_dir, top_k = 200, save_visualizations = True, pred_masks_dir = None):
 
-def _render_audit_visualizations(
-    scores,
-    out_dir,
-):
-    """Save a side-by-side (image | proxy overlay | disagreement) panel
-    for each queued patch. This is the annotator's at-a-glance view.
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    queued = metrics if top_k is None else metrics[:top_k]
 
-    Note: this renders from saved proxy masks only — no model
-    probabilities are re-run. The disagreement heatmap shows the
-    proxy-only outline, and the annotator refers to the CSV to see
-    whether the failure mode is confident_fp (proxy over-labels) or
-    confident_fn (proxy misses).
-    """
+    csv_path = out / "audit_queue.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "rank", "patch_id", "dice", "iou", "asd", "nsd",
+                "image_path", "mask_path",
+            ],
+        )
+        writer.writeheader()
+        for rank, m in enumerate(queued, start=1):
+            writer.writerow({
+                "rank":       rank,
+                "patch_id":   m["patch_id"],
+                "dice":       round(m["dice"], 6),
+                "iou":        round(m["iou"], 6),
+                "asd":        None if m.get("asd") is None else round(m["asd"], 4),
+                "nsd":        None if m.get("nsd") is None else round(m["nsd"], 6),
+                "image_path": m["image_path"],
+                "mask_path":  m["mask_path"],
+            })
+
+    json_path = out / "audit_queue.json"
+    with open(json_path, "w") as f:
+        json.dump(queued, f, indent=2)
+
+    if save_visualizations:
+        _render_dice_audit_visualizations(queued, out / "visualizations", pred_masks_dir=pred_masks_dir)
+
+    logger.info(f"  Audit queue written: {csv_path}  ({len(queued)} patches)")
+    return csv_path
+
+def _render_dice_audit_visualizations(metrics, out_dir, *, pred_masks_dir=None):
+    # Two-panel viz per patch: proxy contour overlay (left) | model prediction contour overlay (right).
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pred_dir = Path(pred_masks_dir) if pred_masks_dir is not None else None
+
+    for m in metrics:
+        image = cv2.imread(m["image_path"], cv2.IMREAD_COLOR)
+        mask  = cv2.imread(m["mask_path"],  cv2.IMREAD_GRAYSCALE)
+        if image is None or mask is None:
+            logger.warning(f"  skipping viz for {m['patch_id']}: missing files")
+            continue
+
+        h, w = image.shape[:2]
+
+        # Left panel — proxy label as red contour on the raw image
+        proxy_panel = image.copy()
+        proxy_bin = (mask > 127).astype(np.uint8)
+        proxy_contours, _ = cv2.findContours(proxy_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(proxy_panel, proxy_contours, -1, (0, 0, 255), 1)
+
+        # Right panel — model prediction as cyan contour on the raw image
+        pred_panel = image.copy()
+        if pred_dir is not None:
+            pred_path = pred_dir / f"{m['patch_id']}.png"
+            pred_img = cv2.imread(str(pred_path), cv2.IMREAD_GRAYSCALE) if pred_path.exists() else None
+            if pred_img is not None:
+                pred_bin = (pred_img > 127).astype(np.uint8)
+                pred_contours, _ = cv2.findContours(pred_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(pred_panel, pred_contours, -1, (255, 255, 0), 1)
+
+        panel = np.concatenate([proxy_panel, pred_panel], axis=1)
+
+        label = f"{m['patch_id']}  dice={m['dice']:.3f}  iou={m['iou']:.3f}  proxy=red  pred=cyan"
+        cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.imwrite(str(out_dir / f"{m['patch_id']}.png"), panel)
+
+
+def _render_audit_visualizations(scores, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for s in scores:
@@ -480,20 +388,7 @@ def _render_audit_visualizations(
 
         cv2.imwrite(str(out_dir / f"{s.patch_id}.png"), panel)
 
-
-# ── Convenience loader for checkpoints ──────────────────────────────────
-
-def load_model_from_checkpoint(
-    checkpoint_path,
-    model_cfg,
-    device,
-    patch_size = None,
-):
-    """Rebuild a model from a config preset and load its weights.
-
-    Separate from ``training.model.build_model`` so callers can use the
-    auditor without importing config directly.
-    """
+def load_model_from_checkpoint(checkpoint_path, model_cfg, device, patch_size = None):
     from .model import build_model  # local import to avoid circular
 
     model = build_model(model_cfg, patch_size=patch_size)
