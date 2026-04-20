@@ -2,18 +2,23 @@
 Step 3 — Inference & Visualisation
 Loads the best checkpoint from Step 2, runs predictions on test patches, and produces visual outputs so you can inspect model performance
 Check the outputs/results folder, especially the overlays/ subfolder, to see the predictions overlaid on the original seafloor images. 
-The summary_grid.png gives a quick overview of a sample of patches with GT (Ground Truth) and predictions side by side.
 
 Usages:
-    python 3_inference.py            # basic run
+    python 3_inference.py       
 """
 from __future__ import annotations
 import json
 import logging
+import os
+import shutil
 import sys
+from pathlib import Path
+
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 import cv2
 import numpy as np
 import torch
+from scipy.ndimage import distance_transform_edt, binary_erosion
 from torch.utils.data import DataLoader
 import config
 from training.model import build_model
@@ -31,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 INFERENCE_DIR = config.RESULTS_DIR / "inference"
 OVERLAYS_DIR  = INFERENCE_DIR / "overlays"
-GRIDS_DIR     = INFERENCE_DIR / "grids"
 
 def load_model(checkpoint_path, device):
     # Load model from checkpoint, set to eval mode.
@@ -74,8 +78,7 @@ def load_raw_rgb(rec):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 def make_contour_overlay(image_rgb, gt_mask, pred_mask):
-    # Draw GT and prediction as thin contours on top of the raw image so the
-    # seafloor stays visible. Yellow = ground truth, cyan = prediction.
+    # Draw GT and prediction as thin contours on top of the raw image so the seafloor stays visible. Yellow = ground truth, cyan = prediction.
     overlay = image_rgb.copy()
     gt_u8   = (gt_mask   > 0.5).astype(np.uint8) * 255
     pred_u8 = (pred_mask > 0.5).astype(np.uint8) * 255
@@ -90,20 +93,81 @@ def make_contour_overlay(image_rgb, gt_mask, pred_mask):
 def predict_batch(model, images, device, threshold):
     with torch.no_grad():
         images = images.to(device)
-        with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
+        _autocast_device = "cuda" if device == "cuda" else "cpu"
+        with torch.autocast(device_type=_autocast_device, enabled=(device == "cuda")):
             logits = model(images)
             probs = torch.sigmoid(logits).cpu().numpy()[:, 0]
     return (probs > threshold).astype(np.float32), probs
 
-# Metrics of all patches 
-def compute_all_metrics(model, records, device, threshold, input_mode = "rgb"):
+# Boundary-aware metrics (HD95, ASD, NSD)
+def _surface_distances(pred_mask, gt_mask):
+    """Compute symmetric surface distances between two binary masks.
+    Returns (pred→gt distances, gt→pred distances) for all boundary pixels.
+    Returns (None, None) if either mask is empty.
+    """
+    pred_bool = pred_mask > 0.5
+    gt_bool = gt_mask > 0.5
+
+    if not pred_bool.any() or not gt_bool.any():
+        return None, None
+
+    # Extract boundaries via erosion
+    pred_boundary = pred_bool ^ binary_erosion(pred_bool)
+    gt_boundary = gt_bool ^ binary_erosion(gt_bool)
+
+    # Handle single-pixel masks where erosion removes everything
+    if not pred_boundary.any():
+        pred_boundary = pred_bool
+    if not gt_boundary.any():
+        gt_boundary = gt_bool
+
+    # Distance transform of the complement
+    dt_gt = distance_transform_edt(~gt_bool)
+    dt_pred = distance_transform_edt(~pred_bool)
+
+    # Surface distances
+    pred_to_gt = dt_gt[pred_boundary]
+    gt_to_pred = dt_pred[gt_boundary]
+
+    return pred_to_gt, gt_to_pred
+
+
+def _compute_boundary_metrics(pred_mask, gt_mask, nsd_tolerance=2.0):
+    """Compute HD95, ASD, and NSD for a single pred/gt pair.
+    nsd_tolerance: pixel distance threshold for NSD (default 2px).
+    Returns dict with hd95, asd, nsd (or NaN if a mask is empty).
+    """
+    pred_to_gt, gt_to_pred = _surface_distances(pred_mask, gt_mask)
+
+    if pred_to_gt is None:
+        return {"asd": float("nan"), "nsd": float("nan")}
+
+    all_distances = np.concatenate([pred_to_gt, gt_to_pred])
+    asd = float(np.mean(all_distances))
+
+    # Normalized Surface Dice: fraction of boundary pixels within tolerance
+    pred_within = np.sum(pred_to_gt <= nsd_tolerance)
+    gt_within = np.sum(gt_to_pred <= nsd_tolerance)
+    nsd = float((pred_within + gt_within) / (len(pred_to_gt) + len(gt_to_pred)))
+
+    return {"asd": asd, "nsd": nsd}
+
+
+# Metrics of all patches
+def compute_all_metrics(model, records, device, threshold, input_mode = "rgb",
+                        pred_masks_dir = None):
 
     dataset = NoduleSegmentationDataset(
         records, transform=get_val_augmentations(input_mode=input_mode),
         input_mode=input_mode,
+        corrected_masks_dir=config.CORRECTED_MASKS_DIR,
     )
     loader = DataLoader(dataset, batch_size=8, shuffle=False,
                         num_workers=config.TRAINING["num_workers"])
+
+    if pred_masks_dir is not None:
+        pred_masks_dir = Path(pred_masks_dir)
+        pred_masks_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
     patch_idx = 0
@@ -117,29 +181,84 @@ def compute_all_metrics(model, records, device, threshold, input_mode = "rgb"):
             pred_mask = preds_binary[i]
             gt_mask = masks_np[i]
 
-            smooth = 1e-6
-            inter = (pred_mask * gt_mask).sum()
-            dice = (2 * inter + smooth) / (pred_mask.sum() + gt_mask.sum() + smooth)
-            iou = (inter + smooth) / (pred_mask.sum() + gt_mask.sum() - inter + smooth)
+            pred_sum = pred_mask.sum()
+            gt_sum = gt_mask.sum()
+            # True-negative patches (both masks empty) have no object to score —
+            # emit NaN so they're excluded from worst-patch ranking and aggregates.
+            if pred_sum == 0 and gt_sum == 0:
+                dice = float("nan")
+                iou = float("nan")
+            else:
+                smooth = 1e-6
+                inter = (pred_mask * gt_mask).sum()
+                dice = (2 * inter + smooth) / (pred_sum + gt_sum + smooth)
+                iou = (inter + smooth) / (pred_sum + gt_sum - inter + smooth)
+
+            boundary = _compute_boundary_metrics(pred_mask, gt_mask)
 
             patch_id = rec.get("patch_id", f"patch_{patch_idx:04d}")
             results.append({
                 "patch_id": patch_id,
                 "dice": float(dice),
                 "iou": float(iou),
+                "asd": boundary["asd"],
+                "nsd": boundary["nsd"],
+                "image_path": rec["image_path"],
+                "mask_path": rec["mask_path"],
+                "mosaic_id": rec.get("mosaic_id", "unknown"),
             })
+
+            if pred_masks_dir is not None:
+                cv2.imwrite(
+                    str(pred_masks_dir / f"{patch_id}.png"),
+                    (pred_mask * 255).astype(np.uint8),
+                )
+
             patch_idx += 1
 
     logger.info(f"Computed metrics for {len(results)} patches")
+    if pred_masks_dir is not None:
+        logger.info(f"Saved prediction masks → {pred_masks_dir}")
     return results
 
-# Visualizations 
-def generate_overlays(model, records, device, threshold, max_overlays = 50, input_mode = "rgb"):
+
+def save_patch_metrics(results, output_path):
+    # Persist per-patch metrics so downstream audit can rank by DICE
+    # without re-running inference. NaN is not valid JSON, so serialize
+    # as None.
+    def _clean(v):
+        if isinstance(v, float) and np.isnan(v):
+            return None
+        return v
+
+    payload = [{k: _clean(v) for k, v in r.items()} for r in results]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    logger.info(f"Saved per-patch metrics → {output_path}")
+
+# Visualizations
+def generate_overlays(model, records, device, threshold, per_mosaic = 10, input_mode = "rgb", seed = 0):
+    if OVERLAYS_DIR.exists():
+        shutil.rmtree(OVERLAYS_DIR)
     OVERLAYS_DIR.mkdir(parents=True, exist_ok=True)
 
+    rng = np.random.default_rng(seed)
+    by_mosaic: dict[str, list] = {}
+    for rec in records:
+        by_mosaic.setdefault(rec.get("mosaic_id", "unknown"), []).append(rec)
+
+    sampled = []
+    for recs in by_mosaic.values():
+        k = min(per_mosaic, len(recs))
+        picks = rng.choice(len(recs), size=k, replace=False)
+        sampled.extend(recs[i] for i in picks)
+    logger.info(f"Sampled {len(sampled)} patches across {len(by_mosaic)} mosaics for overlays")
+
     dataset = NoduleSegmentationDataset(
-        records, transform=get_val_augmentations(input_mode=input_mode),
+        sampled, transform=get_val_augmentations(input_mode=input_mode),
         input_mode=input_mode,
+        corrected_masks_dir=config.CORRECTED_MASKS_DIR,
     )
     loader = DataLoader(dataset, batch_size=8, shuffle=False,
                         num_workers=config.TRAINING["num_workers"])
@@ -152,10 +271,7 @@ def generate_overlays(model, records, device, threshold, max_overlays = 50, inpu
         masks_np = masks.numpy()[:, 0]
 
         for i in range(images.size(0)):
-            if saved >= max_overlays:
-                break
-
-            rec = records[patch_idx]
+            rec = sampled[patch_idx]
             img_rgb = load_raw_rgb(rec)
             gt_mask = masks_np[i]
             pred_mask = preds_binary[i]
@@ -185,85 +301,47 @@ def generate_overlays(model, records, device, threshold, max_overlays = 50, inpu
             saved += 1
             patch_idx += 1
 
-        if saved >= max_overlays:
-            break
-
     logger.info(f"Saved {saved} overlay images → {OVERLAYS_DIR}")
     return saved
-
-def generate_summary_grid(model, records, device, threshold, n_samples = 16, cols = 4, input_mode = "rgb"):
-    GRIDS_DIR.mkdir(parents=True, exist_ok=True)
-    indices = np.linspace(0, len(records) - 1, min(n_samples, len(records)),
-                          dtype=int)
-    sampled = [records[i] for i in indices]
-
-    dataset = NoduleSegmentationDataset(
-        sampled, transform=get_val_augmentations(input_mode=input_mode),
-        input_mode=input_mode,
-    )
-    loader = DataLoader(dataset, batch_size=min(8, len(sampled)), shuffle=False,
-                        num_workers=config.TRAINING["num_workers"])
-
-    all_images, all_masks = [], []
-    all_preds_binary, all_preds_prob = [], []
-    for images, masks in loader:
-        preds_binary, preds_prob = predict_batch(model, images, device, threshold)
-        all_images.append(images)
-        all_masks.append(masks.numpy()[:, 0])
-        all_preds_binary.append(preds_binary)
-        all_preds_prob.append(preds_prob)
-
-    images = torch.cat(all_images, dim=0)
-    masks_np = np.concatenate(all_masks, axis=0)
-    preds_binary = np.concatenate(all_preds_binary, axis=0)
-
-    cells = []
-    for i in range(len(sampled)):
-        img_rgb = load_raw_rgb(sampled[i])
-        contour_overlay = make_contour_overlay(img_rgb, masks_np[i], preds_binary[i])
-
-        smooth = 1e-6
-        inter = (preds_binary[i] * masks_np[i]).sum()
-        dice = (2 * inter + smooth) / (preds_binary[i].sum() + masks_np[i].sum() + smooth)
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(contour_overlay, f"D:{dice:.2f} GT=Y Pred=C", (3, 12), font, 0.35,
-                    (255, 255, 255), 1)
-        cell = np.vstack([img_rgb.copy(), contour_overlay])
-        cells.append(cell)
-
-    # Arrange in grid
-    rows_list = []
-    for r in range(0, len(cells), cols):
-        row_cells = cells[r:r + cols]
-        while len(row_cells) < cols:
-            row_cells.append(np.zeros_like(cells[0]))
-        rows_list.append(np.hstack(row_cells))
-
-    grid = np.vstack(rows_list)
-    grid_path = GRIDS_DIR / "summary_grid.png"
-    cv2.imwrite(str(grid_path), cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
-    logger.info(f"Summary grid ({len(sampled)} patches) → {grid_path}")
-    return grid_path
 
 def print_metrics_summary(results):
     if not results:
         return
-    dices = [r["dice"] for r in results]
-    ious  = [r["iou"] for r in results]
-    logger.info("=" * 50)
-    logger.info(f"  Patches evaluated : {len(results)}")
-    logger.info(f"  Mean Dice         : {np.mean(dices):.4f}  (std {np.std(dices):.4f})")
-    logger.info(f"  Mean IoU          : {np.mean(ious):.4f}  (std {np.std(ious):.4f})")
-    logger.info(f"  Min  Dice         : {np.min(dices):.4f}")
-    logger.info(f"  Max  Dice         : {np.max(dices):.4f}")
-    logger.info("=" * 50)
+    # Dice/IoU are NaN on true-negative patches (both masks empty) — exclude them.
+    scored = [r for r in results if not np.isnan(r["dice"])]
+    dices = [r["dice"] for r in scored]
+    ious  = [r["iou"] for r in scored]
+
+    # Boundary metrics — filter NaN (empty masks)
+    asds  = [r["asd"]  for r in results if not np.isnan(r["asd"])]
+    nsds  = [r["nsd"]  for r in results if not np.isnan(r["nsd"])]
+
+    logger.info("=" * 60)
+    logger.info(f"  Patches evaluated : {len(results)}  "
+                f"(scored: {len(scored)}, true-neg skipped: {len(results) - len(scored)})")
+    logger.info("-" * 60)
+    logger.info("  Overlap metrics (true-negative patches excluded):")
+    if dices:
+        logger.info(f"    Mean Dice         : {np.mean(dices):.4f}  (std {np.std(dices):.4f})")
+        logger.info(f"    Mean IoU          : {np.mean(ious):.4f}  (std {np.std(ious):.4f})")
+        logger.info(f"    Min / Max Dice    : {np.min(dices):.4f} / {np.max(dices):.4f}")
+    else:
+        logger.info("    (no scored patches — every patch was true-negative)")
+    logger.info("-" * 60)
+    logger.info("  Boundary metrics (tolerant of tight-vs-loose annotations):")
+    if asds:
+        logger.info(f"    Mean ASD   (px)   : {np.mean(asds):.2f}  (std {np.std(asds):.2f})")
+        logger.info(f"    Mean NSD (tol=2px): {np.mean(nsds):.4f}  (std {np.std(nsds):.4f})")
+    else:
+        logger.info("    (no valid boundary metrics — all masks empty)")
+    logger.info("=" * 60)
 
     # Report worst patches for inspection
-    sorted_results = sorted(results, key=lambda r: r["dice"])
+    sorted_results = sorted(scored, key=lambda r: r["dice"])
     logger.info("  Worst 5 patches (lowest Dice):")
     for r in sorted_results[:5]:
-        logger.info(f"    {r['patch_id']}  Dice={r['dice']:.4f}  IoU={r['iou']:.4f}")
+        nsd_str = f"  NSD={r['nsd']:.4f}" if not np.isnan(r["nsd"]) else ""
+        logger.info(f"    {r['patch_id']}  Dice={r['dice']:.4f}  IoU={r['iou']:.4f}{nsd_str}")
 
 def main():
     # Device
@@ -292,20 +370,25 @@ def main():
 
     input_mode = config.MODEL.get("input_mode", "rgb")
 
-    # Compute metrics on ALL patches
+    # Compute metrics on ALL patches, saving per-patch prediction masks so
+    # 5_audit_labels.py can render them in the visualization panels.
+    pred_masks_dir = config.ANNOTATION_INBOX / "pred_masks"
     all_metrics = compute_all_metrics(model, records, device, threshold,
-                                      input_mode=input_mode)
+                                      input_mode=input_mode,
+                                      pred_masks_dir=pred_masks_dir)
+
+    # Persist metrics so 5_audit_labels.py can rank by DICE without re-running
+    metrics_path = INFERENCE_DIR / "patch_metrics.json"
+    save_patch_metrics(all_metrics, metrics_path)
 
     # Generate visual outputs
     generate_overlays(model, records, device, threshold,
-                      input_mode=input_mode)
-    grid_path = generate_summary_grid(model, records, device, threshold,
-                                      input_mode=input_mode)
+                      per_mosaic=10, input_mode=input_mode)
 
     print_metrics_summary(all_metrics)
     logger.info(f"\nOutputs saved to: {INFERENCE_DIR}")
     logger.info(f"  Overlays:      {OVERLAYS_DIR}")
-    logger.info(f"  Summary grid:  {grid_path}")
+    logger.info(f"  Patch metrics: {metrics_path}")
     logger.info("\nNext: open the overlay images to inspect predictions visually.")
 
 if __name__ == "__main__":
