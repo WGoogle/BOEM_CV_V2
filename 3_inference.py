@@ -3,8 +3,7 @@ Step 3 — Inference & Visualisation
 Loads the best checkpoint from Step 2, runs predictions on test patches, and produces visual outputs so you can inspect model performance
 Check the outputs/results folder, especially the overlays/ subfolder, to see the predictions overlaid on the original seafloor images. 
 
-Usages:
-    python 3_inference.py       
+    Run python 3_inference.py       
 """
 from __future__ import annotations
 import json
@@ -99,12 +98,8 @@ def predict_batch(model, images, device, threshold):
             probs = torch.sigmoid(logits).cpu().numpy()[:, 0]
     return (probs > threshold).astype(np.float32), probs
 
-# Boundary-aware metrics (HD95, ASD, NSD)
+# Boundary-aware metrics (ASD, NSD)
 def _surface_distances(pred_mask, gt_mask):
-    """Compute symmetric surface distances between two binary masks.
-    Returns (pred→gt distances, gt→pred distances) for all boundary pixels.
-    Returns (None, None) if either mask is empty.
-    """
     pred_bool = pred_mask > 0.5
     gt_bool = gt_mask > 0.5
 
@@ -133,10 +128,6 @@ def _surface_distances(pred_mask, gt_mask):
 
 
 def _compute_boundary_metrics(pred_mask, gt_mask, nsd_tolerance=2.0):
-    """Compute HD95, ASD, and NSD for a single pred/gt pair.
-    nsd_tolerance: pixel distance threshold for NSD (default 2px).
-    Returns dict with hd95, asd, nsd (or NaN if a mask is empty).
-    """
     pred_to_gt, gt_to_pred = _surface_distances(pred_mask, gt_mask)
 
     if pred_to_gt is None:
@@ -151,7 +142,6 @@ def _compute_boundary_metrics(pred_mask, gt_mask, nsd_tolerance=2.0):
     nsd = float((pred_within + gt_within) / (len(pred_to_gt) + len(gt_to_pred)))
 
     return {"asd": asd, "nsd": nsd}
-
 
 # Metrics of all patches
 def compute_all_metrics(model, records, device, threshold, input_mode = "rgb",
@@ -183,16 +173,12 @@ def compute_all_metrics(model, records, device, threshold, input_mode = "rgb",
 
             pred_sum = pred_mask.sum()
             gt_sum = gt_mask.sum()
-            # True-negative patches (both masks empty) have no object to score —
-            # emit NaN so they're excluded from worst-patch ranking and aggregates.
             if pred_sum == 0 and gt_sum == 0:
                 dice = float("nan")
-                iou = float("nan")
             else:
                 smooth = 1e-6
                 inter = (pred_mask * gt_mask).sum()
                 dice = (2 * inter + smooth) / (pred_sum + gt_sum + smooth)
-                iou = (inter + smooth) / (pred_sum + gt_sum - inter + smooth)
 
             boundary = _compute_boundary_metrics(pred_mask, gt_mask)
 
@@ -200,7 +186,6 @@ def compute_all_metrics(model, records, device, threshold, input_mode = "rgb",
             results.append({
                 "patch_id": patch_id,
                 "dice": float(dice),
-                "iou": float(iou),
                 "asd": boundary["asd"],
                 "nsd": boundary["nsd"],
                 "image_path": rec["image_path"],
@@ -223,9 +208,6 @@ def compute_all_metrics(model, records, device, threshold, input_mode = "rgb",
 
 
 def save_patch_metrics(results, output_path):
-    # Persist per-patch metrics so downstream audit can rank by DICE
-    # without re-running inference. NaN is not valid JSON, so serialize
-    # as None.
     def _clean(v):
         if isinstance(v, float) and np.isnan(v):
             return None
@@ -307,10 +289,7 @@ def generate_overlays(model, records, device, threshold, per_mosaic = 10, input_
 def print_metrics_summary(results):
     if not results:
         return
-    # Dice/IoU are NaN on true-negative patches (both masks empty) — exclude them.
     scored = [r for r in results if not np.isnan(r["dice"])]
-    dices = [r["dice"] for r in scored]
-    ious  = [r["iou"] for r in scored]
 
     # Boundary metrics — filter NaN (empty masks)
     asds  = [r["asd"]  for r in results if not np.isnan(r["asd"])]
@@ -319,14 +298,6 @@ def print_metrics_summary(results):
     logger.info("=" * 60)
     logger.info(f"  Patches evaluated : {len(results)}  "
                 f"(scored: {len(scored)}, true-neg skipped: {len(results) - len(scored)})")
-    logger.info("-" * 60)
-    logger.info("  Overlap metrics (true-negative patches excluded):")
-    if dices:
-        logger.info(f"    Mean Dice         : {np.mean(dices):.4f}  (std {np.std(dices):.4f})")
-        logger.info(f"    Mean IoU          : {np.mean(ious):.4f}  (std {np.std(ious):.4f})")
-        logger.info(f"    Min / Max Dice    : {np.min(dices):.4f} / {np.max(dices):.4f}")
-    else:
-        logger.info("    (no scored patches — every patch was true-negative)")
     logger.info("-" * 60)
     logger.info("  Boundary metrics (tolerant of tight-vs-loose annotations):")
     if asds:
@@ -341,7 +312,7 @@ def print_metrics_summary(results):
     logger.info("  Worst 5 patches (lowest Dice):")
     for r in sorted_results[:5]:
         nsd_str = f"  NSD={r['nsd']:.4f}" if not np.isnan(r["nsd"]) else ""
-        logger.info(f"    {r['patch_id']}  Dice={r['dice']:.4f}  IoU={r['iou']:.4f}{nsd_str}")
+        logger.info(f"    {r['patch_id']}  Dice={r['dice']:.4f}{nsd_str}")
 
 def main():
     # Device
@@ -370,8 +341,6 @@ def main():
 
     input_mode = config.MODEL.get("input_mode", "rgb")
 
-    # Compute metrics on ALL patches, saving per-patch prediction masks so
-    # 5_audit_labels.py can render them in the visualization panels.
     pred_masks_dir = config.ANNOTATION_INBOX / "pred_masks"
     all_metrics = compute_all_metrics(model, records, device, threshold,
                                       input_mode=input_mode,

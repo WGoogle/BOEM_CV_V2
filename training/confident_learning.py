@@ -282,7 +282,7 @@ def export_dice_audit_queue(metrics, output_dir, top_k = 200, save_visualization
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "rank", "patch_id", "dice", "iou", "asd", "nsd",
+                "rank", "patch_id", "dice", "asd", "nsd",
                 "image_path", "mask_path",
             ],
         )
@@ -292,7 +292,6 @@ def export_dice_audit_queue(metrics, output_dir, top_k = 200, save_visualization
                 "rank":       rank,
                 "patch_id":   m["patch_id"],
                 "dice":       round(m["dice"], 6),
-                "iou":        round(m["iou"], 6),
                 "asd":        None if m.get("asd") is None else round(m["asd"], 4),
                 "nsd":        None if m.get("nsd") is None else round(m["nsd"], 6),
                 "image_path": m["image_path"],
@@ -341,7 +340,7 @@ def _render_dice_audit_visualizations(metrics, out_dir, *, pred_masks_dir=None):
 
         panel = np.concatenate([proxy_panel, pred_panel], axis=1)
 
-        label = f"{m['patch_id']}  dice={m['dice']:.3f}  iou={m['iou']:.3f}  proxy=red  pred=cyan"
+        label = f"{m['patch_id']}  dice={m['dice']:.3f}  proxy=red  pred=cyan"
         cv2.putText(panel, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX,
                     0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -377,7 +376,6 @@ def _render_audit_visualizations(scores, out_dir):
         panel[:, w:2*w]    = overlay
         panel[:, 2*w:3*w]  = blended
 
-        # Label text
         label = (
             f"{s.patch_id}  score={s.combined_score:.3f}  "
             f"fp={s.confident_fp_frac:.3f}  fn={s.confident_fn_frac:.3f}  "

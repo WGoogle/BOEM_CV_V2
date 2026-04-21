@@ -1,19 +1,13 @@
 """
-Step 2 — Train Nodule Segmentation Model
+Step 2 — Train Nodule Segmentation Model                   
 
-Helpful Shortcuts I use:
-    python 2_train.py                     # train on all preprocessed patches
-    python 2_train.py --epochs 50         # override epoch count (I would reccomend at least 90 epochs)
-    python 2_train.py --batch-size 8      # override batch size (for small GPUs)
-
-    ALSO a small thing, but sometimes after model finishes, you might not see the terminal prompt again for a bit of time — that's just the final checkpoint 
+    A small thing, but sometimes after model finishes, you might not see the terminal prompt again for a bit of time — that's just the final checkpoint 
     saving and manifest updating steps running, which can take a minute. 
     So if it looks like the script has "hung" after training completes, just give it a moment before trying to interrupt or run another command.
 """
 from __future__ import annotations
 import os
-os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
-import argparse
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1" # not needed but avoids confusion
 import json
 import logging
 import sys
@@ -104,7 +98,6 @@ def _make_epoch_callback(history_path):
             f"  Epoch {log.epoch:3d}  │  "
             f"loss {log.train_loss:.4f} / {log.val_loss:.4f}  │  "
             f"dice {log.train_dice:.4f} / {log.val_dice:.4f}  │  "
-            f"iou {log.train_iou:.4f} / {log.val_iou:.4f}  │  "
             f"lr {log.lr:.2e}"
         )
         history.append({
@@ -113,8 +106,6 @@ def _make_epoch_callback(history_path):
             "val_loss":   round(log.val_loss, 6),
             "train_dice": round(log.train_dice, 6),
             "val_dice":   round(log.val_dice, 6),
-            "train_iou":  round(log.train_iou, 6),
-            "val_iou":    round(log.val_iou, 6),
             "lr":         log.lr,
         })
         with open(history_path, "w") as f:
@@ -123,18 +114,6 @@ def _make_epoch_callback(history_path):
     return callback
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Step 2: Train U-Net segmentation model on preprocessed patches",
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=None,
-        help="Override number of training epochs",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=None,
-        help="Override batch size",
-    )
-    args = parser.parse_args()
     _setup_logging()
 
     # Device selection
@@ -150,12 +129,6 @@ def main():
         device = "cpu"
         logger.info("  Device: CPU (training will be slow)")
     train_cfg = dict(config.TRAINING)
-    if args.epochs is not None:
-        train_cfg["num_epochs"] = args.epochs
-        # User explicitly requested N epochs — disable early stopping
-        train_cfg["early_stopping_patience"] = args.epochs
-    if args.batch_size is not None:
-        train_cfg["batch_size"] = args.batch_size
     logger.info("=" * 70)
     logger.info("BOEM CV  —  Step 2: Train Segmentation Model")
     logger.info("=" * 70)
@@ -200,7 +173,7 @@ def main():
     input_mode = config.MODEL.get("input_mode", "rgb")
     logger.info(f"  Input mode      : {input_mode}")
 
-    # Compute normalization stats (auto-cached; recomputes when patch count changes)
+    # Compute normalization stats 
     norm_stats = get_normalization_stats(
         input_mode, records=records, cache_dir=config.CHECKPOINTS_DIR,
     )
@@ -214,7 +187,7 @@ def main():
     )
     val_transform = get_val_augmentations(input_mode=input_mode, norm_stats=norm_stats)
 
-    # Use manually corrected masks when available (from Step annotation phase)
+    # Use manually corrected masks when available 
     corrected_dir = str(config.CORRECTED_MASKS_DIR) if config.CORRECTED_MASKS_DIR.exists() else None
     if corrected_dir:
         n_corrected = len(list(config.CORRECTED_MASKS_DIR.glob("*.png")))
@@ -322,10 +295,9 @@ def main():
     logger.info("Starting training ...")
     logger.info(
         f"  {'Epoch':>7}  │  {'Train Loss / Val Loss':^23}  │  "
-        f"{'Train Dice / Val Dice':^23}  │  "
-        f"{'Train IoU / Val IoU':^23}  │  LR"
+        f"{'Train Dice / Val Dice':^23}  │  LR"
     )
-    logger.info("  " + "─" * 100)
+    logger.info("  " + "─" * 80)
     history_path = config.CHECKPOINTS_DIR / "training_history.json"
     epoch_callback = _make_epoch_callback(history_path)
 
@@ -344,10 +316,10 @@ def main():
     best_ckpt = Path(result.best_checkpoint_path)
     if best_ckpt.exists():
         trainer.load_checkpoint(best_ckpt)
-    test_loss, test_iou, test_dice = trainer._validate(test_loader)
+    test_loss, test_dice = trainer._validate(test_loader)
     logger.info(
         f"  Test loss: {test_loss:.4f}  │  "
-        f"Test Dice: {test_dice:.4f}  │  Test IoU: {test_iou:.4f}"
+        f"Test Dice: {test_dice:.4f}"
     )
 
     # Threshold optimisation — sweep val set to find best operating point
@@ -386,7 +358,6 @@ def main():
         "test_metrics": {
             "loss":  round(test_loss, 6),
             "dice":  round(test_dice, 6),
-            "iou":   round(test_iou, 6),
         },
         "best_checkpoint":      result.best_checkpoint_path,
         "last_checkpoint":      result.last_checkpoint_path,
@@ -405,7 +376,6 @@ def main():
     logger.info(f"  Best epoch        : {result.best_epoch}")
     logger.info(f"  Best val Dice     : {result.best_val_dice:.4f}")
     logger.info(f"  Test Dice         : {test_dice:.4f}")
-    logger.info(f"  Test IoU          : {test_iou:.4f}")
     logger.info(f"  Best threshold    : {best_threshold:.3f}")
     logger.info(f"  Total time        : {elapsed:.1f}s")
     logger.info(f"  Best checkpoint   : {result.best_checkpoint_path}")

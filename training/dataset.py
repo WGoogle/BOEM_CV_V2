@@ -290,12 +290,15 @@ class CopyPasteAugmentation:
             px = int(np.random.randint(0, W - w + 1))
             py = int(np.random.randint(0, H - h + 1))
 
-            # Update image
-            mask3 = src_crop_cc[:, :, None]  # (h, w, 1)
+            # Update image — feather alpha to avoid teaching the model to detect paste seams
+            alpha = cv2.GaussianBlur(
+                src_crop_cc.astype(np.float32), ksize=(0, 0), sigmaX=1.5,
+            )[:, :, None]
             roi_img = out_bgr[py:py + h, px:px + w]
-            roi_img[:] = roi_img * (1 - mask3) + src_crop * mask3
+            blended = roi_img.astype(np.float32) * (1 - alpha) + src_crop.astype(np.float32) * alpha
+            roi_img[:] = np.clip(blended, 0, 255).astype(roi_img.dtype)
 
-            # Update mask
+            # Update mask — keep hard edges for crisp supervision
             roi_mask = out_mask[py:py + h, px:px + w]
             np.maximum(roi_mask, src_crop_cc.astype(np.float32), out=roi_mask)
             n_pasted += 1

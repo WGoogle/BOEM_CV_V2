@@ -22,11 +22,10 @@ def _accumulate_metric_stats(logits, targets, threshold):
 
 
 def _finalize_metrics(intersection, sum_preds, sum_targets):
-    # Compute micro-averaged IoU/Dice from pooled pixel counts.
+    # Compute micro-averaged Dice from pooled pixel counts.
     smooth = 1e-6
-    iou  = (intersection + smooth) / (sum_preds + sum_targets - intersection + smooth)
     dice = (2 * intersection + smooth) / (sum_preds + sum_targets + smooth)
-    return {"iou": iou, "dice": dice}
+    return {"dice": dice}
 
 @dataclass
 class EpochLog:
@@ -34,9 +33,7 @@ class EpochLog:
     epoch: int
     train_loss: float
     val_loss: float
-    train_iou: float
     train_dice: float
-    val_iou: float
     val_dice: float
     lr: float
 
@@ -87,7 +84,7 @@ class Trainer:
         self._autocast_device = device if device == "cuda" else "cpu"
 
     def _train_one_epoch(self, loader):
-        # Run one training epoch.  Returns (loss, iou, dice)
+        # Run one training epoch.  Returns (loss, dice)
         self.model.train()
         running_loss = 0.0
         total_inter = 0.0
@@ -119,13 +116,12 @@ class Trainer:
         metrics = _finalize_metrics(total_inter, total_preds, total_targets)
         return (
             running_loss / n_batches,
-            metrics["iou"],
             metrics["dice"],
         )
 
     @torch.no_grad()
     def _validate(self, loader):
-        # Run validation.  Returns (loss, iou, dice)
+        # Run validation.  Returns (loss, dice)
         self.model.eval()
         running_loss = 0.0
         total_inter = 0.0
@@ -151,11 +147,10 @@ class Trainer:
         metrics = _finalize_metrics(total_inter, total_preds, total_targets)
         return (
             running_loss / n_batches,
-            metrics["iou"],
             metrics["dice"],
         )
 
-    # Threshold optimisation 
+    # Threshold optimisation
     @torch.no_grad()
     def find_best_threshold(self, loader, low, high, steps):
         # Sweep thresholds on a loader and return (best_threshold, best_dice).
@@ -230,10 +225,10 @@ class Trainer:
 
         for epoch in range(start_epoch, self.num_epochs):
             # Train
-            train_loss, train_iou, train_dice = self._train_one_epoch(train_loader)
+            train_loss, train_dice = self._train_one_epoch(train_loader)
 
             # Validate
-            val_loss, val_iou, val_dice = self._validate(val_loader)
+            val_loss, val_dice = self._validate(val_loader)
 
             # Scheduler step (tracks val Dice)
             self.scheduler.step(val_dice)
@@ -243,8 +238,8 @@ class Trainer:
             log = EpochLog(
                 epoch=epoch,
                 train_loss=train_loss, val_loss=val_loss,
-                train_iou=train_iou, train_dice=train_dice,
-                val_iou=val_iou, val_dice=val_dice,
+                train_dice=train_dice,
+                val_dice=val_dice,
                 lr=current_lr,
             )
             history.append(log)
