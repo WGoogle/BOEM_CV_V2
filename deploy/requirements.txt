@@ -1,0 +1,10 @@
+# Minimal runtime deps for deploy/predict.py
+# Tested with Python 3.10+
+
+torch>=2.0
+segmentation-models-pytorch>=0.5
+opencv-python>=4.8
+numpy>=1.24
+
+# For >2 GB TIF mosaics that OpenCV can't decode
+tifffile>=2023.0
