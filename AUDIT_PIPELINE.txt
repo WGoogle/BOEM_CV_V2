@@ -1,0 +1,61 @@
+================================================================================
+  AUDIT PIPELINE GUIDE
+================================================================================
+
+  Default run (top 150 worst-DICE patches, skips already-corrected) -- reccomend if you only want to audit non-manual labelled patches:
+
+       python 5_audit_labels.py
+
+  Audit a different number of patches:
+
+       python 5_audit_labels.py --top-k 100
+
+  Re-audit all patches including already-corrected ones
+  (useful for catching human annotation errors):
+
+       python 5_audit_labels.py --include-corrected --top-k 150
+
+  True-negative patches (both GT and prediction empty -> DICE undefined)
+  are filtered out automatically; there is nothing to audit on them.
+
+--------------------------------------------------------------------------------
+  WHAT GETS WRITTEN
+--------------------------------------------------------------------------------
+
+  outputs/annotation_inbox/
+    audit_queue.csv          One row per queued patch, sorted worst-DICE first.
+                             Columns: rank, patch_id, dice, asd, nsd,
+                             image_path, mask_path.
+    audit_queue.json         Same data, JSON form.
+    visualizations/<patch_id>.png
+                             Two-panel side-by-side: proxy label (red contour)
+                             on the left, model prediction (cyan contour) on
+                             the right. Prediction panel only populated if
+                             outputs/annotation_inbox/pred_masks/ exists.
+    audit_manifest.json      One entry per audit run (timestamp, metrics file,
+                             total_scored, top_k, ranking, queue_csv path).
+
+--------------------------------------------------------------------------------
+  CORRECTING THE QUEUED PATCHES
+--------------------------------------------------------------------------------
+
+  The audit queue feeds into the same annotation tool as the normal workflow
+  (autosave + auto-resume). Once you leave a patch, you cannot go back to it
+  after exiting the tool — the tool treats it as done.
+
+  Edit in place:
+
+       python 4_annotate.py edit --audit-queue --annotator Brian
+
+--------------------------------------------------------------------------------
+  RETRAIN LOOP
+--------------------------------------------------------------------------------
+
+  After corrected masks land in outputs/corrected_masks/:
+
+       python 2_train.py          # picks up corrected masks over proxy masks
+       python 3_inference.py      # regenerate patch_metrics.json
+       python 5_audit_labels.py   # fresh queue against improved model
+
+  Expect the worst-DICE values and the top-K mean DICE to rise as the model
+  improves. audit_manifest.json records every run so you can track progress.

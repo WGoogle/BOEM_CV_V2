@@ -226,13 +226,7 @@ def cmd_edit(args):
 
 def cmd_export(args):
     all_records = load_all_records()
-    if args.audit_queue is not None:
-        queue_path = Path(args.audit_queue) if args.audit_queue else (
-            INBOX_DIR / "audit_queue.csv"
-        )  # empty string -> default path
-        records = load_audit_queue(queue_path, all_records)
-        logger.info(f"Exporting {len(records)} patches from audit queue: {queue_path}")
-    elif args.mosaic:
+    if args.mosaic:
         records = filter_by_mosaic(all_records, args.mosaic)
     else:
         records = filter_by_split(all_records, args.split)
@@ -402,11 +396,6 @@ def main():
                           default="test")
     p_export.add_argument("--mosaic", type=str, default=None)
     p_export.add_argument("--unannotated", action="store_true")
-    p_export.add_argument("--audit-queue", nargs="?", const="", default=None,
-                          metavar="CSV",
-                          help="Export patches from an audit_queue.csv. "
-                               "With no value, uses "
-                               "outputs/annotation_inbox/audit_queue.csv.")
     p_export.add_argument("--max-patches", type=int, default=None,
                           help="Limit number of patches in bundle")
     p_export.add_argument("--output", "-o", type=str, default=None,

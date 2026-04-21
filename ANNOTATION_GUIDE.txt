@@ -26,7 +26,7 @@ Two roles:
     [ / ]              Decrease / increase overlay opacity
 
   Edit
-    Brush slider       Bottom of window. Use 1-3px for small nodules.
+    Brush slider       Bottom of window. Use 0-2px for small nodules.
     Z / Y              Undo / redo
     R                  Reset mask to original (press R again within 2 seconds to confirm reset)
     S                  Save
@@ -42,7 +42,7 @@ Two roles:
 
   1. Export a batch per collaborator (split by mosaic to avoid overlap):
 
-       python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 --output batch_for_kailash.zip --annotator Brian --notes "Kailash: D1 Node3 patches"
+       python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 --output batch_for_Thang.zip --annotator Brian --notes "Thang: D1 Node3 patches"
 
   2. Send the .zip (Slack / Drive / email).
 
@@ -58,7 +58,7 @@ Two roles:
 
        python 4_annotate.py status
 
-  6. Export the next round of unannotated patches:
+  6. Export the next round of unannotated patches, if needed:
 
        python 4_annotate.py export --unannotated --output round2.zip --annotator Brian
 
@@ -68,9 +68,7 @@ Two roles:
 
   Lead Annotator (Brian) can also annotate directly (no bundle):
 
-       python 4_annotate.py edit --split test --annotator Brian
-       python 4_annotate.py edit --worst 20 --annotator Brian
-       python 4_annotate.py edit --mosaic CameraMosaic_Node6_CAM_L1 --unannotated --annotator Brian
+       python 4_annotate.py edit --mosaic CameraMosaic_Node6_CAM_L1 --annotator Brian
 
   Tip for Lead Annotator:
   When you are distributing out the zip files, ensure you do it by mosaic, so assign each person one mosaic, this helps avoid any overlap in annotations.
@@ -137,7 +135,7 @@ Two roles:
   ── Brian (lead, after both return their zips) ───────────────────────────
 
     # Drop corrected_by_Kailash.zip and corrected_by_Thang.zip into:
-    #   outputs/annotation_inbox/
+    #   outputs/annotation_inbox/ (DO NOT PUT INTO THE IMPORTED SUBFOLDER)
 
     python 4_annotate.py import-all
     python 4_annotate.py status
@@ -157,6 +155,7 @@ Two roles:
     --mosaic NAME                  Filter to one mosaic
     --worst N                      N worst-performing patches
     --unannotated                  Skip already-corrected patches
+    --audit-queue [CSV]            Load patches from audit_queue.csv produced by 5_audit_labels.py (see AUDIT_PIPELINE.txt)
     --bundle FILE.zip              Open a collaborator bundle
     --annotator NAME               Your name (required for tracking)
     --start N                      Start at patch index N
