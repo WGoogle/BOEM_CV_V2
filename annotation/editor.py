@@ -20,13 +20,15 @@ plt.rcParams["keymap.save"] = []
 logger = logging.getLogger(__name__)
 
 class AnnotationEditor:
-    def __init__(self, records: list[dict], output_dir: Path, annotator: str = "anonymous", overlay_alpha: float = 0.45, max_undo: int = 50):
+    def __init__(self, records: list[dict], output_dir: Path, annotator: str = "anonymous", overlay_alpha: float = 0.45, max_undo: int = 50, pred_masks_dir: Path | None = None, show_progress: bool = True):
         self.records = records
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.annotator = annotator
         self.overlay_alpha = overlay_alpha
         self.max_undo = max_undo
+        self.pred_masks_dir = Path(pred_masks_dir) if pred_masks_dir is not None else None
+        self.show_progress = show_progress
 
         # State
         self.current_idx = 0
@@ -180,6 +182,49 @@ class AnnotationEditor:
             )
         return composite
 
+    def _render_pred_overlay(self):
+        if self.pred_masks_dir is None:
+            return None
+        rec = self.records[self.current_idx]
+        patch_id = rec.get("patch_id", f"patch_{self.current_idx:04d}")
+        pred_path = self.pred_masks_dir / f"{patch_id}.png"
+        if not pred_path.exists():
+            return None
+        pred_mask = cv2.imread(str(pred_path), cv2.IMREAD_GRAYSCALE)
+        if pred_mask is None:
+            return None
+        pred_bin = (pred_mask > 127).astype(np.uint8)
+
+        # Build overlay: image + prediction contours in magenta + filled tint
+        composite = self.image.copy()
+        pred_bool = pred_bin > 0
+        overlay_color = np.zeros_like(composite)
+        overlay_color[pred_bool] = [255, 0, 255]  # magenta fill
+        composite = np.where(
+            pred_bool[..., None],
+            ((1 - 0.35) * composite + 0.35 * overlay_color).astype(np.uint8),
+            composite,
+        )
+        # Draw contours on top
+        contours, _ = cv2.findContours(pred_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(composite, contours, -1, (255, 0, 255), 1)
+        return composite
+
+    def _load_pred_panel(self):
+        if self.ax_pred is None:
+            return
+        pred_overlay = self._render_pred_overlay()
+        if pred_overlay is not None:
+            if self._pred_display is None:
+                self._pred_display = self.ax_pred.imshow(pred_overlay)
+                self.ax_pred.axis("off")
+            else:
+                self._pred_display.set_data(pred_overlay)
+            self.ax_pred.set_title("Model prediction (magenta)", fontsize=9)
+            self.ax_pred.set_visible(True)
+        else:
+            self.ax_pred.set_visible(False)
+
     # Main
     def launch(self, start_idx: int = 0):
         self.current_idx = start_idx
@@ -187,12 +232,25 @@ class AnnotationEditor:
         import matplotlib as _mpl
         _mpl.rcParams["toolbar"] = "None"
 
-        # Create figure
-        self.fig, self.ax = plt.subplots(1, 1, figsize=(10, 10))
-        plt.subplots_adjust(bottom=0.18, top=0.93)
+        # Determine layout: side-by-side if we have prediction masks
+        has_pred = self.pred_masks_dir is not None
+        if has_pred:
+            self.fig, (self.ax, self.ax_pred) = plt.subplots(
+                1, 2, figsize=(24, 13),
+            )
+            self._pred_display = None
+            plt.subplots_adjust(bottom=0.18, top=0.93, wspace=0.06)
+        else:
+            self.fig, self.ax = plt.subplots(1, 1, figsize=(10, 10))
+            self.ax_pred = None
+            self._pred_display = None
+            plt.subplots_adjust(bottom=0.18, top=0.93)
 
         # Initial display
         self._img_display = self.ax.imshow(self._render_composite())
+        self.ax.axis("off")
+        if has_pred:
+            self._load_pred_panel()
         self._update_title()
 
         # Brush cursor (circle)
@@ -452,6 +510,7 @@ class AnnotationEditor:
             self.current_idx += 1
             self._load_patch(self.current_idx)
             self._reset_view()
+            self._load_pred_panel()
             self._refresh()
         else:
             self._prompt_save_if_modified()
@@ -466,6 +525,7 @@ class AnnotationEditor:
             self.current_idx -= 1
             self._load_patch(self.current_idx)
             self._reset_view()
+            self._load_pred_panel()
             self._refresh()
 
     def _toggle_overlay(self):
@@ -521,12 +581,16 @@ class AnnotationEditor:
         modified = " [MODIFIED]" if not np.array_equal(self.mask, self.original_mask) else ""
         saved = " [SAVED]" if patch_id in self.modified_patches else ""
         n_pixels = int(self.mask.sum()) if self.mask is not None else 0
-        done = self._count_corrected()
         total = len(self.records)
-        remaining = total - done
+        if self.show_progress:
+            done = self._count_corrected()
+            remaining = total - done
+            progress = f"  |  Done: {done}  Remaining: {remaining}"
+        else:
+            progress = ""
         self.ax.set_title(
             f"[{self.current_idx + 1}/{total}] {patch_id}"
-            f"  |  Done: {done}  Remaining: {remaining}"
+            f"{progress}"
             f"  |  mask={n_pixels}px"
             f"  |  alpha={self.overlay_alpha:.2f}{modified}{saved}",
             fontsize=10,

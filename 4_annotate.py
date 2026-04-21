@@ -4,10 +4,12 @@ Reference ANNOATIONS.txt for detailed instructions.
 """
 from __future__ import annotations
 import argparse
+import csv
 import json
 import logging
 import sys
 from pathlib import Path
+import cv2
 import numpy as np
 import config
 from annotation.editor import AnnotationEditor
@@ -52,20 +54,66 @@ def filter_by_split(records, split):
 def filter_by_mosaic(records, mosaic_name):
     return [r for r in records if mosaic_name in r.get("patch_id", "")]
 
+def load_audit_queue(csv_path, all_records):
+    # Return records whose patch_id is in audit_queue.csv, ordered by rank.
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        logger.error(f"Audit queue CSV not found: {csv_path}")
+        logger.error("Run `python 5_audit_labels.py` first.")
+        sys.exit(1)
+
+    by_id = {r.get("patch_id"): r for r in all_records}
+    ordered = []
+    missing = []
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            pid = row["patch_id"]
+            rec = by_id.get(pid)
+            if rec is None:
+                missing.append(pid)
+            else:
+                ordered.append(rec)
+    if missing:
+        logger.warning(
+            f"{len(missing)} audit patch_ids not found in patch manifests "
+            f"(first few: {missing[:3]})"
+        )
+    return ordered
+
 def filter_worst_patches(records, n):
-    # Load inference results and return the n worst-performing patches
-    inference_dir = config.RESULTS_DIR / "inference" / "overlays"
-    if not inference_dir.exists():
-        logger.warning("No inference results found. Run 3_inference.py first.")
-        logger.warning("Falling back to all records.")
+    pred_masks_dir = config.OUTPUT_DIR / "annotation_inbox" / "pred_masks"
+    if not pred_masks_dir.exists():
+        logger.warning(
+            "No predicted masks found. Run 5_audit_labels.py first to "
+            "generate model predictions."
+        )
+        logger.warning("Falling back to all records (unranked).")
         return records[:n]
-    
-    # For now, use a heuristic: patches with low coverage tend to be harder
-    sorted_recs = sorted(
-        records,
-        key=lambda r: r.get("label_stats", {}).get("coverage_pct", 0),
-    )
-    return sorted_recs[:n]
+
+    scored: list[tuple[int, dict]] = []  # (missed_pixels, record)
+    for rec in records:
+        patch_id = rec.get("patch_id", "")
+        pred_path = pred_masks_dir / f"{patch_id}.png"
+        gt_path = Path(rec["mask_path"])
+
+        if not pred_path.exists() or not gt_path.exists():
+            scored.append((0, rec))
+            continue
+
+        gt_mask = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+        pred_mask = cv2.imread(str(pred_path), cv2.IMREAD_GRAYSCALE)
+        if gt_mask is None or pred_mask is None:
+            scored.append((0, rec))
+            continue
+
+        gt_bin = (gt_mask > 127).astype(np.uint8)
+        pred_bin = (pred_mask > 127).astype(np.uint8)
+        missed_pixels = int(np.sum(gt_bin != pred_bin))
+        scored.append((missed_pixels, rec))
+
+    # Sort descending: most disagreement pixels first
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [rec for _, rec in scored[:n]]
 
 def cmd_edit(args):
     if args.bundle:
@@ -116,7 +164,21 @@ def cmd_edit(args):
 
     all_records = load_all_records()
     logger.info(f"Loaded {len(all_records)} total patches")
-    if args.mosaic:
+    pred_masks_dir = None
+    if args.audit_queue is not None:
+        queue_path = Path(args.audit_queue) if args.audit_queue else (
+            INBOX_DIR / "audit_queue.csv"
+        )  
+        records = load_audit_queue(queue_path, all_records)
+        logger.info(f"Loaded {len(records)} patches from audit queue: {queue_path}")
+        candidate = queue_path.parent / "pred_masks"
+        if candidate.exists():
+            pred_masks_dir = candidate
+            logger.info(f"Model prediction masks found: {pred_masks_dir}")
+        else:
+            logger.info("No pred_masks/ folder found next to audit queue — "
+                        "re-run 5_audit_labels.py to generate them.")
+    elif args.mosaic:
         records = filter_by_mosaic(all_records, args.mosaic)
         logger.info(f"Filtered to {len(records)} patches from {args.mosaic}")
     elif args.worst:
@@ -147,12 +209,11 @@ def cmd_edit(args):
         records=records,
         output_dir=CORRECTED_MASKS_DIR,
         annotator=args.annotator,
+        pred_masks_dir=pred_masks_dir,
+        show_progress=args.audit_queue is None,
     )
     editor.launch(start_idx=args.start)
 
-    # After editor closes, update tracker.
-    # Record both modified patches and patches reviewed as-is (navigated past
-    # without edits) so they no longer count as "remaining" in the status.
     tracker = AnnotationTracker(TRACKER_PATH)
     touched = editor.modified_patches | editor.reviewed_patches
     for patch_id in touched:
@@ -165,7 +226,13 @@ def cmd_edit(args):
 
 def cmd_export(args):
     all_records = load_all_records()
-    if args.mosaic:
+    if args.audit_queue is not None:
+        queue_path = Path(args.audit_queue) if args.audit_queue else (
+            INBOX_DIR / "audit_queue.csv"
+        )  # empty string -> default path
+        records = load_audit_queue(queue_path, all_records)
+        logger.info(f"Exporting {len(records)} patches from audit queue: {queue_path}")
+    elif args.mosaic:
         records = filter_by_mosaic(all_records, args.mosaic)
     else:
         records = filter_by_split(all_records, args.split)
@@ -319,6 +386,11 @@ def main():
                         help="Select N worst-performing patches")
     p_edit.add_argument("--unannotated", action="store_true",
                         help="Only show patches not yet annotated")
+    p_edit.add_argument("--audit-queue", nargs="?", const="", default=None,
+                        metavar="CSV",
+                        help="Load patches from an audit_queue.csv produced by "
+                             "5_audit_labels.py. With no value, uses "
+                             "outputs/annotation_inbox/audit_queue.csv.")
     p_edit.add_argument("--annotator", type=str, default="anonymous",
                         help="Your name/ID for provenance tracking")
     p_edit.add_argument("--start", type=int, default=0,
@@ -330,6 +402,11 @@ def main():
                           default="test")
     p_export.add_argument("--mosaic", type=str, default=None)
     p_export.add_argument("--unannotated", action="store_true")
+    p_export.add_argument("--audit-queue", nargs="?", const="", default=None,
+                          metavar="CSV",
+                          help="Export patches from an audit_queue.csv. "
+                               "With no value, uses "
+                               "outputs/annotation_inbox/audit_queue.csv.")
     p_export.add_argument("--max-patches", type=int, default=None,
                           help="Limit number of patches in bundle")
     p_export.add_argument("--output", "-o", type=str, default=None,

@@ -154,22 +154,6 @@ def import_bundle(bundle_path, corrected_masks_dir, merge_strategy = "newest"):
             mask_data = zf.read(mask_entry)
             dest_path.write_bytes(mask_data)
 
-            # Update metadata: append import record
-            meta_entry = f"patches/{patch_id}/metadata.json"
-            if meta_entry in zf.namelist():
-                patch_meta = json.loads(zf.read(meta_entry))
-                history = patch_meta.get("annotation_history", [])
-                history.append({
-                    "action": "imported",
-                    "from_bundle": bundle_path.name,
-                    "from_annotator": collaborator,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "merge_strategy": merge_strategy,
-                })
-                meta_dest = corrected_dir / f"{patch_id}_meta.json"
-                with open(meta_dest, "w") as f:
-                    json.dump(patch_meta, f, indent=2)
-
             imported += 1
 
     summary = {
