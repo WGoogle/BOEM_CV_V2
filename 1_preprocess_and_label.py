@@ -183,9 +183,7 @@ def process_mosaic(mosaic_path, manifest, *, force = False):
 
         img_path = mosaic_patches_img_dir / f"{pid}.png"
         msk_path = mosaic_patches_msk_dir / f"{pid}.png"
-        # Save raw BGR crop as the training image; mask is the proxy label
-        # derived from the preprocessed version.
-        cv2.imwrite(str(img_path), patch_bgr)
+        cv2.imwrite(str(img_path), preprocessed)
         cv2.imwrite(str(msk_path), proxy_mask)
 
         preprocessed_patches.append(preprocessed)
