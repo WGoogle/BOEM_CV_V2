@@ -1,9 +1,10 @@
 """
 Step 1 — Preprocess and Label
 
-Helpful Shortcuts I use: 
+Helpful Shortcuts I use:
     python 1_preprocess_and_label.py                  # full run, for new data -- avoids re running already preprocessed ones (old data)
-    python 1_preprocess_and_label.py --force          # re-process everything, when debugging, so no need to delete whole outputs folder :) 
+    python 1_preprocess_and_label.py --force          # re-process everything, when debugging, so no need to delete whole outputs folder :)
+
 """
 from __future__ import annotations
 import argparse
@@ -141,10 +142,10 @@ def process_mosaic(mosaic_path, manifest, *, force = False):
     mosaic_log_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-patch processing
-    patch_records = []
-    preprocessed_patches: list[np.ndarray] = []   
+    patch_records = []          # raw BGR crops paired with preprocessed proxy masks
+    preprocessed_patches: list[np.ndarray] = []
     total_nodules = 0
-    valid_idx = 0 
+    valid_idx = 0
 
     # Pick a random subset of patches to log step-by-step images for
     import random
@@ -182,20 +183,22 @@ def process_mosaic(mosaic_path, manifest, *, force = False):
 
         img_path = mosaic_patches_img_dir / f"{pid}.png"
         msk_path = mosaic_patches_msk_dir / f"{pid}.png"
-        cv2.imwrite(str(img_path), preprocessed)
+        # Save raw BGR crop as the training image; mask is the proxy label
+        # derived from the preprocessed version.
+        cv2.imwrite(str(img_path), patch_bgr)
         cv2.imwrite(str(msk_path), proxy_mask)
 
         preprocessed_patches.append(preprocessed)
         patch_records.append({
-            "patch_id":         pid,
-            "image_path":       str(img_path),
-            "mask_path":        str(msk_path),
-            "grid_row":         info.row,
-            "grid_col":         info.col,
-            "origin_y":         info.y,
-            "origin_x":         info.x,
-            "tuned_params":     params.as_dict(),
-            "label_stats":      label_stats,
+            "patch_id":     pid,
+            "image_path":   str(img_path),
+            "mask_path":    str(msk_path),
+            "grid_row":     info.row,
+            "grid_col":     info.col,
+            "origin_y":     info.y,
+            "origin_x":     info.x,
+            "tuned_params": params.as_dict(),
+            "label_stats":  label_stats,
         })
 
         # Progress tick
@@ -260,7 +263,7 @@ def process_mosaic(mosaic_path, manifest, *, force = False):
         f"(coverage {100.0 * covered.mean():.1f}%; rejected tiles filled from raw)"
     )
 
-    # Manifest stuff 
+    # Manifest stuff
     patch_manifest_path = config.PATCHES_DIR / key / "patch_manifest.json"
     with open(patch_manifest_path, "w") as f:
         json.dump(patch_records, f, indent=2, default=str)

@@ -10,6 +10,7 @@ import os
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1" # not needed but avoids confusion
 import json
 import logging
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -71,9 +72,9 @@ def _save_manifest(manifest):
         json.dump(manifest, f, indent=2, default=str)
 
 # Data Loading
-def _collect_patch_records():
+def _collect_patch_records(patches_dir):
     records = []
-    for manifest_file in sorted(config.PATCHES_DIR.glob("*/patch_manifest.json")):
+    for manifest_file in sorted(patches_dir.glob("*/patch_manifest.json")):
         with open(manifest_file) as f:
             mosaic_records = json.load(f)
         valid = [
@@ -143,12 +144,14 @@ def main():
     logger.info(f"  Device          : {device}")
 
     # Collect patches from Step 1
+    patches_dir = config.PATCHES_DIR
     logger.info("─" * 70)
     logger.info("Loading patch records from Step 1 ...")
-    records = _collect_patch_records()
+    logger.info(f"  Patches dir     : {patches_dir}")
+    records = _collect_patch_records(patches_dir)
     if not records:
         logger.error(
-            "No patch records found.  Run Step 1 first:\n"
+            f"No patch records found in {patches_dir}.  Run Step 1 first:\n"
             "  python 1_preprocess_and_label.py"
         )
         sys.exit(1)
@@ -173,7 +176,6 @@ def main():
     input_mode = config.MODEL.get("input_mode", "rgb")
     logger.info(f"  Input mode      : {input_mode}")
 
-    # Compute normalization stats 
     norm_stats = get_normalization_stats(
         input_mode, records=records, cache_dir=config.CHECKPOINTS_DIR,
     )
@@ -339,12 +341,23 @@ def main():
     )
     logger.info(f"  Re-saved best checkpoint with best_threshold={best_threshold:.3f}")
 
+    # Promote best checkpoint to deploy/ so predict.py always sees the latest model.
+    best_ckpt_path = Path(result.best_checkpoint_path)
+    deploy_ckpt_dir = Path(__file__).parent / "deploy" / "checkpoints"
+    deploy_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(best_ckpt_path, deploy_ckpt_dir / "checkpoint_best.pt")
+    norm_src = best_ckpt_path.parent / "engineered_norm_stats.json"
+    if norm_src.exists():
+        shutil.copy2(norm_src, deploy_ckpt_dir / "engineered_norm_stats.json")
+    logger.info(f"  Promoted checkpoint to {deploy_ckpt_dir}")
+
     # Update pipeline manifest
     manifest = _load_manifest()
     manifest.setdefault("training", {}).update({
         "model":                config.MODEL,
         "training_config":      train_cfg,
         "device":               device,
+        "patches_dir":          str(patches_dir),
         "total_patches":        len(records),
         "split": {
             "train": len(train_recs),

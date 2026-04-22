@@ -50,11 +50,13 @@ def get_normalization_stats(input_mode, records=None, cache_dir=None):
         return IMAGENET_MEAN, IMAGENET_STD
     if cache_dir is None:
         try:
-            import config as _cfg 
+            import config as _cfg
             cache_dir = _cfg.CHECKPOINTS_DIR
         except Exception:
             cache_dir = None
-    cache_file = Path(cache_dir) / "engineered_norm_stats.json" if cache_dir else None
+    cache_file = (
+        Path(cache_dir) / "engineered_norm_stats.json" if cache_dir is not None else None
+    )
 
     # Try to load from cache
     if cache_file is not None and cache_file.exists():
@@ -91,12 +93,12 @@ def get_normalization_stats(input_mode, records=None, cache_dir=None):
     mean, std = compute_channel_stats(records, "engineered")
     _norm_logger.info("  Engineered mean=%s  std=%s", mean, std)
 
-    # Write cache
     if cache_file is not None:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"mean": list(mean), "std": list(std),
+                   "num_patches": len(records)}
         with open(cache_file, "w") as f:
-            _json.dump({"mean": list(mean), "std": list(std),
-                        "num_patches": len(records)}, f, indent=2)
+            _json.dump(payload, f, indent=2)
         _norm_logger.info("  Cached → %s", cache_file)
 
     return mean, std

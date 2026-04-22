@@ -333,8 +333,16 @@ def main():
 
     # Load model — also picks up the trainer's per-checkpoint threshold
     model, best_threshold = load_model(ckpt_path, device)
-    threshold = best_threshold if best_threshold is not None else config.INFERENCE["probability_threshold"]
-    logger.info(f"  Using threshold={threshold:.2f}")
+    override = config.INFERENCE.get("threshold_override")
+    if override is not None:
+        threshold = float(override)
+        logger.info(f"  Using threshold={threshold:.2f} (hardcoded override from config)")
+    elif best_threshold is not None:
+        threshold = best_threshold
+        logger.info(f"  Using threshold={threshold:.2f} (adaptive, from checkpoint)")
+    else:
+        threshold = config.INFERENCE["probability_threshold"]
+        logger.info(f"  Using threshold={threshold:.2f} (config default)")
 
     records = collect_all_records()
     logger.info(f"Running inference on {len(records)} patches (threshold={threshold})")
