@@ -1,9 +1,6 @@
 """
 Extract spatial resolution from GeoTIFF metadata
 
-Reads the ModelTransformationTag (tag 34264) or ModelPixelScaleTag (tag 33550) from a TIFF file 
-and computes meters_per_pixel using the embedded coordinate reference system.
-
 Fail safe is a hardcoded value for meters_per_pixel of .05 
 """
 from __future__ import annotations
@@ -41,6 +38,66 @@ def extract_meters_per_pixel(filepath, fallback):
         f"{filepath.name}: no geo resolution tags found — using fallback ({fallback})"
     )
     return fallback
+
+def extract_geo_metadata(filepath, fallback_mpp):
+    # Return a dict with meters_per_pixel, lat/lon origin, and CRS type.
+    # Values are None when the corresponding tag is absent.
+    filepath = Path(filepath)
+    result = {
+        "meters_per_pixel": fallback_mpp,
+        "mpp_source": "fallback",
+        "latitude": None,
+        "longitude": None,
+        "crs_type": None,
+    }
+    if filepath.suffix.lower() not in (".tif", ".tiff"):
+        return result
+
+    try:
+        tags = _read_tiff_tags(filepath)
+    except Exception as exc:
+        logger.warning(f"{filepath.name}: failed to read TIFF tags — {exc}")
+        return result
+
+    result["crs_type"] = "geographic" if _is_geographic_crs(tags) else "projected"
+
+    lat = _get_latitude(tags)
+    lon = _get_longitude(tags)
+    if lat is not None:
+        result["latitude"] = lat
+    if lon is not None:
+        result["longitude"] = lon
+
+    if 34264 in tags:
+        mpp = _mpp_from_transformation_tag(tags, filepath.name)
+        if mpp is not None:
+            result["meters_per_pixel"] = mpp
+            result["mpp_source"] = "ModelTransformationTag"
+            return result
+    if 33550 in tags:
+        mpp = _mpp_from_pixel_scale_tag(tags, filepath.name)
+        if mpp is not None:
+            result["meters_per_pixel"] = mpp
+            result["mpp_source"] = "ModelPixelScaleTag"
+            return result
+    return result
+
+def _get_longitude(tags):
+    # From ModelTransformationTag: tx = matrix[3]
+    if 34264 in tags:
+        doubles = _unpack_doubles(tags[34264], 16)
+        lon = doubles[3]
+        if -180 <= lon <= 180:
+            return lon
+    # From ModelTiepointTag (33922): doubles[3] is X (lon)
+    if 33922 in tags:
+        bo, dtype, count, data = tags[33922]
+        if count >= 6:
+            doubles = _unpack_doubles(tags[33922], 6)
+            lon = doubles[3]
+            if -180 <= lon <= 180:
+                return lon
+    return None
 
 # TIFF type sizes (bytes per element)
 _TYPE_SIZE = {

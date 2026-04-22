@@ -10,13 +10,20 @@ import numpy as np
 import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
+from patcher import MosaicPatcher
 
+_PATCHER_DEFAULTS = {
+    "min_std":             0.0,
+    "min_mean":            0.0,
+    "max_black_fraction":  0.999,
+    "max_noise":           float("inf"),
+}
+
+#Below values only used as failsafe, can ignore.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
-
 ENGINEERED_MEAN = (0.4121, 0.0428, 0.0357)
 ENGINEERED_STD  = (0.0685, 0.0820, 0.1501)
-
 _LCR_BG_SIGMA = 30.0 
 
 def get_normalization_stats(input_mode, checkpoint_dir=None):
@@ -132,14 +139,6 @@ def gaussian_importance_map(patch_size, sigma_scale = 0.125):
     g2d = np.clip(g2d, 1e-3, 1.0)
     return g2d.astype(np.float32)
 
-def _grid_positions(length, patch_size, stride):
-    if length <= patch_size:
-        return [0]
-    positions = list(range(0, length - patch_size + 1, stride))
-    if positions[-1] + patch_size < length:
-        positions.append(length - patch_size)
-    return sorted(set(positions))
-
 def _to_normalized_tensor(bgr_window, input_mode, norm_stats=None):
     image = prepare_image(bgr_window, input_mode).astype(np.float32) / 255.0
     if norm_stats is None:
@@ -154,23 +153,12 @@ def _to_normalized_tensor(bgr_window, input_mode, norm_stats=None):
 def _forward(model, batch):
     return torch.sigmoid(model(batch))
 
-@torch.no_grad()
-def _tta_forward(model, batch):
-    """4-way dihedral flip averaging. Each flip is its own inverse."""
-    p  = _forward(model, batch)
-    p += torch.flip(_forward(model, torch.flip(batch, dims=[-1])), dims=[-1])
-    p += torch.flip(_forward(model, torch.flip(batch, dims=[-2])), dims=[-2])
-    p += torch.flip(_forward(model, torch.flip(batch, dims=[-1, -2])), dims=[-1, -2])
-    return p / 4.0
-
-def _batched_windows(coords_iter, mosaic_bgr, patch_size, input_mode, batch_size,
-    device, norm_stats=None):
+def _batched_valid_windows(coords_iter, input_mode, batch_size, device, norm_stats=None):
 
     coords_buf: list[tuple[int, int]] = []
     tensors_buf: list[torch.Tensor] = []
-    for (y, x) in coords_iter:
-        window = mosaic_bgr[y:y + patch_size, x:x + patch_size]
-        t = _to_normalized_tensor(window, input_mode, norm_stats=norm_stats)
+    for (y, x, patch_bgr) in coords_iter:
+        t = _to_normalized_tensor(patch_bgr, input_mode, norm_stats=norm_stats)
         coords_buf.append((y, x))
         tensors_buf.append(t)
         if len(tensors_buf) == batch_size:
@@ -181,7 +169,7 @@ def _batched_windows(coords_iter, mosaic_bgr, patch_size, input_mode, batch_size
 
 @torch.no_grad()
 def sliding_window_inference(model, mosaic_bgr, *, patch_size, overlap,
-    input_mode = "engineered", device = "cpu", batch_size = 8, use_tta = True,
+    input_mode = "engineered", device = "cpu", batch_size = 8,
     use_amp = None, progress = True, norm_stats = None):
 
     if mosaic_bgr.ndim != 3 or mosaic_bgr.shape[2] != 3:
@@ -190,25 +178,22 @@ def sliding_window_inference(model, mosaic_bgr, *, patch_size, overlap,
         )
 
     H, W = mosaic_bgr.shape[:2]
-    stride = max(1, patch_size - overlap)
 
-    pad_h = max(0, patch_size - H)
-    pad_w = max(0, patch_size - W)
-    if pad_h or pad_w:
-        mosaic_bgr = cv2.copyMakeBorder(
-            mosaic_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101
-        )
+    patcher = MosaicPatcher(
+        patch_size=patch_size,
+        overlap=overlap,
+        **_PATCHER_DEFAULTS,
+    )
+    patches, infos = patcher.extract_patches(mosaic_bgr)
 
-    Hp, Wp = mosaic_bgr.shape[:2]
-    y_starts = _grid_positions(Hp, patch_size, stride)
-    x_starts = _grid_positions(Wp, patch_size, stride)
-    n_windows = len(y_starts) * len(x_starts)
+    n_valid = len(patches)
+    n_total = len(infos)
 
     importance = gaussian_importance_map(patch_size)
     importance_t = torch.from_numpy(importance).to(device)
 
-    accum  = torch.zeros((Hp, Wp), dtype=torch.float32, device=device)
-    weight = torch.zeros((Hp, Wp), dtype=torch.float32, device=device)
+    accum  = torch.zeros((H, W), dtype=torch.float32, device=device)
+    weight = torch.zeros((H, W), dtype=torch.float32, device=device)
 
     if use_amp is None:
         use_amp = (device == "cuda")
@@ -216,35 +201,42 @@ def sliding_window_inference(model, mosaic_bgr, *, patch_size, overlap,
 
     if progress:
         print(
-            f"  Sliding-window: {n_windows} windows  "
-            f"(grid {len(y_starts)}x{len(x_starts)}, ps={patch_size}, "
-            f"overlap={overlap}, tta={use_tta})"
+            f"  Sliding-window: {n_valid}/{n_total} windows passed quality gate  "
+            f"(ps={patch_size}, overlap={overlap})"
         )
 
-    coords_iter = ((y, x) for y in y_starts for x in x_starts)
+    if n_valid == 0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    valid_infos = [inf for inf in infos if inf.is_valid]
+    coords_iter = (
+        (inf.y, inf.x, patches[i]) for i, inf in enumerate(valid_infos)
+    )
 
     done = 0
     with amp_ctx:
-        for batch_coords, batch_tensor in _batched_windows(
-            coords_iter, mosaic_bgr, patch_size,
-            input_mode, batch_size, device, norm_stats=norm_stats,
+        for batch_coords, batch_tensor in _batched_valid_windows(
+            coords_iter, input_mode, batch_size, device, norm_stats=norm_stats,
         ):
-            probs = _tta_forward(model, batch_tensor) if use_tta else _forward(model, batch_tensor)
+            probs = _forward(model, batch_tensor)
             probs = probs.squeeze(1)        # (B, ps, ps)
 
             weighted = probs * importance_t
             for (y, x), wp in zip(batch_coords, weighted):
-                accum [y:y + patch_size, x:x + patch_size] += wp
-                weight[y:y + patch_size, x:x + patch_size] += importance_t
+                ph = min(patch_size, H - y)
+                pw = min(patch_size, W - x)
+                accum [y:y + ph, x:x + pw] += wp[:ph, :pw]
+                weight[y:y + ph, x:x + pw] += importance_t[:ph, :pw]
 
             done += len(batch_coords)
-            if progress and (done % max(1, batch_size * 10) == 0 or done == n_windows):
-                print(f"    {done}/{n_windows} windows")
+            if progress and (done % max(1, batch_size * 10) == 0 or done == n_valid):
+                print(f"    {done}/{n_valid} windows")
 
     weight.clamp_(min=1e-6)
     full = (accum / weight).clamp(0.0, 1.0).cpu().numpy()
-    if pad_h or pad_w:
-        full = full[:H, :W]
+    # Zero out regions never covered by a valid patch
+    covered = (weight > 1e-6).cpu().numpy()
+    full[~covered] = 0.0
     return full.astype(np.float32)
 
 class _NullCtx:

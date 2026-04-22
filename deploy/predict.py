@@ -1,35 +1,29 @@
 """
 predict.py — End-to-end nodule segmentation on raw seafloor mosaics.
-
-One-click pipeline:
-    raw mosaic  ->  preprocess  ->  model inference  ->  binary mask
-                                                    ->  coverage %
-                                                    ->  nodule density (per m^2)
-
-Default:  `python predict.py`  scans ./input/, processes every mosaic found,
-and writes outputs to ./predictions/.
 """
 from __future__ import annotations
+import os
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 import argparse
 import json
 import sys
 from pathlib import Path
-
 import cv2
+cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
 import numpy as np
 import torch
-
 from inference import (
     get_normalization_stats,
     load_model,
+    load_mosaic,
     load_model_config,
     sliding_window_inference,
 )
-from preprocess import preprocess_mosaic
+from geo_resolution import extract_geo_metadata
 from metrics import compute_metrics, format_metrics_report, seafloor_mask_from_raw
 
 _IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-
+FALLBACK_METERS_PER_PIXEL = 0.005
 
 def _pick_device(requested):
     if requested != "auto":
@@ -39,7 +33,6 @@ def _pick_device(requested):
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
-
 
 def _gather_inputs(input_path):
     if input_path.is_file():
@@ -51,20 +44,6 @@ def _gather_inputs(input_path):
         )
     raise FileNotFoundError(f"Input not found: {input_path}")
 
-
-def _save_overlay(out_path, base_bgr, binary_mask, alpha=0.35):
-    # Cyan tint on nodule pixels so you can eyeball-check against the seafloor.
-    color = np.zeros_like(base_bgr)
-    color[:, :, 0] = 255  # B
-    color[:, :, 1] = 255  # G
-    bool_mask = binary_mask > 0
-    overlay = base_bgr.copy()
-    overlay[bool_mask] = (
-        (1.0 - alpha) * base_bgr[bool_mask] + alpha * color[bool_mask]
-    ).astype(np.uint8)
-    cv2.imwrite(str(out_path), overlay)
-
-
 def _save_outline_overlay(out_path, base_bgr, binary_mask, thickness=1):
     overlay = base_bgr.copy()
     contours, _ = cv2.findContours(
@@ -73,7 +52,6 @@ def _save_outline_overlay(out_path, base_bgr, binary_mask, thickness=1):
     )
     cv2.drawContours(overlay, contours, -1, (255, 255, 0), thickness)
     cv2.imwrite(str(out_path), overlay)
-
 
 def parse_args():
     here = Path(__file__).resolve().parent
@@ -106,15 +84,11 @@ def parse_args():
         help="Compute device. Default: auto-detect.",
     )
     p.add_argument(
-        "--skip-preprocess", action="store_true",
-        help="Treat inputs as ALREADY preprocessed. Skips the Step-1 filter chain.",
-    )
-    p.add_argument(
-        "--save-preprocessed", action="store_true",
-        help="Also write the intermediate preprocessed mosaic to predictions/.",
+        "--save-prob-map", action="store_true",
+        help="Also write the raw sigmoid probability map as a heatmap "
+             "({name}_probmap.png). Safe to delete later.",
     )
     return p.parse_args()
-
 
 def main():
     args = parse_args()
@@ -174,27 +148,21 @@ def main():
         name = mosaic_path.stem
         print(f"\n[{i}/{len(inputs)}] {mosaic_path.name}")
 
-        # 1) Preprocess (or skip if the caller already did it)
-        if args.skip_preprocess:
-            from inference import load_mosaic
-            preprocessed_bgr = load_mosaic(mosaic_path)
-            raw_bgr = preprocessed_bgr
-            # No reliable m/px when skipping the preprocess loader; try TIFF tags.
-            from preprocessing.geo_resolution import extract_meters_per_pixel
-            from preprocess import FALLBACK_METERS_PER_PIXEL
-            mpp = extract_meters_per_pixel(mosaic_path, fallback=FALLBACK_METERS_PER_PIXEL)
-            print(f"  (skip-preprocess) shape={preprocessed_bgr.shape}")
-        else:
-            print("  preprocessing...")
-            preprocessed_bgr, raw_bgr, mpp = preprocess_mosaic(mosaic_path)
-            print(f"  preprocessed shape={preprocessed_bgr.shape}")
+        # 1) Load raw mosaic
+        raw_bgr = load_mosaic(mosaic_path)
+        geo = extract_geo_metadata(mosaic_path, fallback_mpp=FALLBACK_METERS_PER_PIXEL)
+        mpp = geo["meters_per_pixel"]
+        print(f"  shape={raw_bgr.shape}")
 
-        if args.save_preprocessed:
-            cv2.imwrite(str(args.out / f"{name}_preprocessed.png"), preprocessed_bgr)
+        if geo.get("latitude") is not None and geo.get("longitude") is not None:
+            print(
+                f"  geo: lat={geo['latitude']:.6f}, lon={geo['longitude']:.6f}, "
+                f"crs={geo['crs_type']}, mpp_source={geo['mpp_source']}"
+            )
 
         # 2) Model inference
         prob = sliding_window_inference(
-            model, preprocessed_bgr,
+            model, raw_bgr,
             patch_size=patch_size,
             overlap=overlap,
             input_mode=input_mode,
@@ -204,6 +172,12 @@ def main():
 
         # 3) Binarize
         binary = (prob > threshold).astype(np.uint8) * 255
+
+        if args.save_prob_map:
+            prob_u8 = np.clip(prob * 255.0, 0, 255).astype(np.uint8)
+            prob_heat = cv2.applyColorMap(prob_u8, cv2.COLORMAP_INFERNO)
+            cv2.imwrite(str(args.out / f"{name}_probmap.png"), prob_heat)
+            cv2.imwrite(str(args.out / f"{name}_probmap_gray.png"), prob_u8)
 
         # 4) Metrics — restrict to real seafloor pixels (exclude black AUV border)
         seafloor = seafloor_mask_from_raw(raw_bgr)
@@ -216,18 +190,41 @@ def main():
             str(args.out / f"{name}_raw.jpg"), raw_bgr,
             [cv2.IMWRITE_JPEG_QUALITY, 90],
         )
-        _save_overlay(args.out / f"{name}_overlay.png", raw_bgr, binary)
         _save_outline_overlay(args.out / f"{name}_outline.png", raw_bgr, binary)
 
         metrics_path = args.out / f"{name}_metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(
-                {"mosaic": mosaic_path.name, "threshold": threshold, **metrics},
+                {
+                    "mosaic": mosaic_path.name,
+                    "threshold": threshold,
+                    "geo": geo,
+                    **metrics,
+                },
                 f, indent=2,
             )
 
-        print(format_metrics_report(metrics, name))
-        summary_rows.append({"mosaic": mosaic_path.name, "threshold": threshold, **metrics})
+        report = format_metrics_report(metrics, name)
+        txt_path = args.out / f"{name}_metrics.txt"
+        with open(txt_path, "w") as f:
+            f.write(f"Mosaic   : {mosaic_path.name}\n")
+            f.write(f"Threshold: {threshold:.3f}\n")
+            f.write("Geo      :\n")
+            f.write(f"  meters_per_pixel : {geo['meters_per_pixel']:.6f} ({geo['mpp_source']})\n")
+            lat = geo.get("latitude")
+            lon = geo.get("longitude")
+            f.write(f"  latitude         : {lat:.6f}\n" if lat is not None else "  latitude         : n/a\n")
+            f.write(f"  longitude        : {lon:.6f}\n" if lon is not None else "  longitude        : n/a\n")
+            f.write(f"  crs_type         : {geo.get('crs_type') or 'n/a'}\n")
+            f.write(report + "\n")
+
+        print(report)
+        summary_rows.append({
+            "mosaic": mosaic_path.name,
+            "threshold": threshold,
+            "geo": geo,
+            **metrics,
+        })
 
     # Batch summary
     summary_path = args.out / "summary.json"
@@ -238,7 +235,6 @@ def main():
     print(f"Outputs : {args.out.resolve()}")
     print(f"Summary : {summary_path}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

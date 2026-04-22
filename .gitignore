@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+outputs/
+data/
+
+# Deploy package: don't track model weights or input mosaics
+deploy/checkpoints/*.pt
+deploy/input/*
+!deploy/input/.gitkeep
+deploy/predictions/

@@ -1,0 +1,123 @@
+================================================================================
+DOI NODULE SEGMENTATION — HOW TO USE THE DEPLOY PACKAGE
+================================================================================
+
+Drop a RAW seafloor mosaic into input/ and run ONE command:
+
+    python predict.py OR python deploy/predict.py
+
+That's it. However, once you run it view the outline overlay in deploy/predictions folder. If you 
+think it is not covering all the nodules (too high of threshold), can rerun this step with lower threshold.
+
+python deploy/predict.py --threshold 0.01 (This is 1% threshold, the default is whatever the model had maximized DICE with)
+You can change the percentage to whatever, yes even like .000005.
+
+No separate preprocessing step, no chained scripts. You do not need the rest of
+the repo on this machine.
+
+--------------------------------------------------------------------------------
+WHAT'S IN THIS FOLDER
+--------------------------------------------------------------------------------
+
+    deploy/
+    |-- predict.py               Single entry point (raw -> metrics)
+    |-- inference.py             Model loader + sliding-window inference
+    |-- metrics.py               Coverage % + nodule density per m^2
+    |-- model_config.json        Architecture + patch geometry sidecar
+    |-- requirements.txt         Python dependencies
+    |-- HOW_TO_USE.txt           This file
+    |-- checkpoints/
+    |   |-- checkpoint_best.pt           Trained model weights (NOT in repo - see STEP 0)
+    |   |-- engineered_norm_stats.json   Normalization stats
+    |-- input/                   Drop raw mosaics here (empty in repo)
+    |-- predictions/             All outputs land here
+
+--------------------------------------------------------------------------------
+STEP 0 — GET THE MODEL WEIGHTS
+--------------------------------------------------------------------------------
+
+The trained weights file (checkpoint_best.pt, ~280 MB) is too large for GitHub
+and is NOT included in this repo. If you did not train the model yourself,
+download it from the shared Google Drive link below and drop it into
+deploy/checkpoints/:
+
+    Download: https://drive.google.com/REPLACE_WITH_SHARED_LINK
+
+    Then place the file here:
+        deploy/checkpoints/checkpoint_best.pt
+
+(If you trained the model yourself, just copy your best checkpoint into the
+same path and rename it to checkpoint_best.pt.)
+
+The small normalization stats file (engineered_norm_stats.json) IS included
+in the repo — you do not need to download it separately.
+
+--------------------------------------------------------------------------------
+STEP 1 — INSTALL PYTHON DEPENDENCIES (one-time)
+--------------------------------------------------------------------------------
+
+From a terminal in this deploy/ folder:
+
+    python -m venv .venv
+    source .venv/bin/activate          # macOS / Linux
+    .venv\Scripts\activate             # Windows
+
+    pip install -r requirements.txt
+
+A CUDA GPU is optional. The predictor auto-detects CUDA -> MPS (Apple Silicon)
+-> CPU.
+
+--------------------------------------------------------------------------------
+STEP 2 — DROP RAW MOSAIC(S) INTO input/
+--------------------------------------------------------------------------------
+
+Accepted formats: .png .jpg .jpeg .tif .tiff .bmp
+Large GeoTIFFs (>2 GB) are loaded via tifffile automatically.
+
+For .tif files the predictor reads the pixel-size from GeoTIFF tags so the
+nodule-density output is in real units (nodules per m^2). If that metadata
+is missing, it falls back to 5 mm/px (BOEM D1 Node3 survey default).
+
+--------------------------------------------------------------------------------
+STEP 3 — RUN THE PREDICTOR
+--------------------------------------------------------------------------------
+
+DO it as mentioned in the first paragraph of this file. 
+
+--------------------------------------------------------------------------------
+STEP 4 — INSPECT THE OUTPUTS
+--------------------------------------------------------------------------------
+
+For each input file (e.g. mosaic.tif), predictions/ will contain:
+
+    mosaic_raw.jpg        Original raw mosaic re-saved as JPG so it's viewable
+                          in VS Code (TIFFs don't preview natively).
+    mosaic_outline.png    Raw mosaic with 1-px cyan outlines around each
+                          predicted nodule.
+    mosaic_metrics.json   Per-mosaic metrics (see below).
+
+Plus a batch-level summary across all mosaics processed:
+
+    summary.json
+
+To reset outputs between runs, delete the entire predictions/ folder —
+predict.py recreates it automatically on the next run.
+
+Each *_metrics.json (and each row of summary.json) contains:
+
+    {
+      "mosaic":                   "CameraMosaic_Node7_CAM_L3.tif",
+      "threshold":                0.50,
+      "coverage_pct":             12.43,    <-- % of seafloor covered by nodules
+      "nodule_count":             8142,     <-- distinct nodules (>= 20 px each)
+      "nodule_pixels":            1284501,
+      "seafloor_pixels":          10334500,
+      "seafloor_area_m2":         258.36,
+      "nodule_area_m2":           32.11,
+      "nodule_density_per_m2":    31.52,    <-- NODULES per m^2
+      "nodule_px_density_per_m2": 4970.9,   <-- nodule PIXELS per m^2
+      "meters_per_pixel":         0.005,
+      "min_nodule_px":            20
+    }
+
+The coverage_pct and nodule_density_per_m2 fields are the headline numbers.

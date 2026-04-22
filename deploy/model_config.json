@@ -1,0 +1,14 @@
+{
+  "_comment": "Sidecar config for the shipped checkpoint. Edit this when you ship a new model — predict.py reads it on every run. Values must match how the model was trained.",
+
+  "architecture":  "Unet",
+  "encoder_name":  "resnet34",
+  "in_channels":   3,
+  "classes":       1,
+
+  "input_mode":    "engineered",
+  "patch_size":    256,
+  "overlap":       128,
+
+  "threshold":     0.5
+}
