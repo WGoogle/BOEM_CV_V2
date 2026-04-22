@@ -38,16 +38,12 @@ STEP 0 — GET THE MODEL WEIGHTS
 
 The trained weights file (checkpoint_best.pt, ~280 MB) is too large for GitHub
 and is NOT included in this repo. If you did not train the model yourself,
-download it from the shared Google Drive link below and drop it into
-deploy/checkpoints/:
-
-    Download: https://drive.google.com/REPLACE_WITH_SHARED_LINK
+download it from whoever actually trained the model.
 
     Then place the file here:
         deploy/checkpoints/checkpoint_best.pt
 
-(If you trained the model yourself, just copy your best checkpoint into the
-same path and rename it to checkpoint_best.pt.)
+(If you trained the model yourself, it should automatically alread be there)
 
 The small normalization stats file (engineered_norm_stats.json) IS included
 in the repo — you do not need to download it separately.
