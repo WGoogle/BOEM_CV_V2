@@ -61,6 +61,35 @@ def compute_engineered_channels(
 
     return np.stack([L, sobel_u8, lcr_u8], axis=-1)
 
+def compute_per_image_engineered_stats(bgr, patch_size=512, max_samples=40, seed=0):
+    """Sample non-black patches and return engineered-channel (mean, std) in [0,1]."""
+    if bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise ValueError(f"expected BGR (H,W,3), got shape {bgr.shape}")
+    H, W = bgr.shape[:2]
+    ps = min(patch_size, H, W)
+    rng = np.random.default_rng(seed)
+    samples = []
+    tries = 0
+    target = min(max_samples, max(8, (H * W) // (ps * ps)))
+    while len(samples) < target and tries < target * 20:
+        y = int(rng.integers(0, max(1, H - ps + 1)))
+        x = int(rng.integers(0, max(1, W - ps + 1)))
+        p = bgr[y:y + ps, x:x + ps]
+        tries += 1
+        if p.shape[:2] != (ps, ps):
+            continue
+        if (p.sum(axis=2) < 10).mean() > 0.3:
+            continue
+        samples.append(p)
+    if not samples:
+        samples = [bgr]
+    stack = np.stack(
+        [compute_engineered_channels(p) for p in samples], axis=0
+    ).astype(np.float32) / 255.0
+    mean = tuple(float(stack[..., i].mean()) for i in range(3))
+    std  = tuple(float(max(stack[..., i].std(), 1e-4)) for i in range(3))
+    return mean, std
+
 _VALID_MODES = ("rgb", "engineered")
 
 def prepare_image(bgr, input_mode):

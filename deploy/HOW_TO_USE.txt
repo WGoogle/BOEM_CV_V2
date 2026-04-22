@@ -6,8 +6,8 @@ Drop a RAW seafloor mosaic into input/ and run ONE command:
 
     python predict.py OR python deploy/predict.py
 
-That's it. However, once you run it view the outline overlay in deploy/predictions folder. If you 
-think it is not covering all the nodules (too high of threshold), can rerun this step with lower threshold.
+That's it. Metrics land in deploy/predictions as JSON and TXT. If you
+think it is not covering all the nodules (too high of threshold), rerun with a lower threshold.
 
 python deploy/predict.py --threshold 0.01 (This is 1% threshold, the default is whatever the model had maximized DICE with)
 You can change the percentage to whatever, yes even like .000005.
@@ -67,8 +67,10 @@ A CUDA GPU is optional. The predictor auto-detects CUDA -> MPS (Apple Silicon)
 STEP 2 — DROP RAW MOSAIC(S) INTO input/
 --------------------------------------------------------------------------------
 
-Accepted formats: .png .jpg .jpeg .tif .tiff .bmp
+Accepted formats: .tif .tiff only.
 Large GeoTIFFs (>2 GB) are loaded via tifffile automatically.
+PNG/JPG/BMP screenshots are rejected — the trained model is out-of-distribution
+on display-space captures, so metrics would be meaningless.
 
 For .tif files the predictor reads the pixel-size from GeoTIFF tags so the
 nodule-density output is in real units (nodules per m^2). If that metadata
@@ -86,11 +88,8 @@ STEP 4 — INSPECT THE OUTPUTS
 
 For each input file (e.g. mosaic.tif), predictions/ will contain:
 
-    mosaic_raw.jpg        Original raw mosaic re-saved as JPG so it's viewable
-                          in VS Code (TIFFs don't preview natively).
-    mosaic_outline.png    Raw mosaic with 1-px cyan outlines around each
-                          predicted nodule.
     mosaic_metrics.json   Per-mosaic metrics (see below).
+    mosaic_metrics.txt    Human-readable metrics report.
 
 Plus a batch-level summary across all mosaics processed:
 
@@ -116,4 +115,5 @@ Each *_metrics.json (and each row of summary.json) contains:
       "min_nodule_px":            20
     }
 
+It will also return some geodata, for lat and longitude it is the coordinates of the top left of the mosaic. 
 The coverage_pct and nodule_density_per_m2 fields are the headline numbers.

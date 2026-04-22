@@ -8,8 +8,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-import cv2
-cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
 import numpy as np
 import torch
 from inference import (
@@ -19,11 +17,12 @@ from inference import (
     load_model_config,
     sliding_window_inference,
 )
-from geo_resolution import extract_geo_metadata
+from geo_resolution import compute_corner_coords, extract_geo_metadata
 from metrics import compute_metrics, format_metrics_report, seafloor_mask_from_raw
 
-_IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+_IMG_EXTS = {".tif", ".tiff"}
 FALLBACK_METERS_PER_PIXEL = 0.005
+
 
 def _pick_device(requested):
     if requested != "auto":
@@ -43,15 +42,6 @@ def _gather_inputs(input_path):
             if p.is_file() and p.suffix.lower() in _IMG_EXTS
         )
     raise FileNotFoundError(f"Input not found: {input_path}")
-
-def _save_outline_overlay(out_path, base_bgr, binary_mask, thickness=1):
-    overlay = base_bgr.copy()
-    contours, _ = cv2.findContours(
-        (binary_mask > 0).astype(np.uint8),
-        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-    )
-    cv2.drawContours(overlay, contours, -1, (255, 255, 0), thickness)
-    cv2.imwrite(str(out_path), overlay)
 
 def parse_args():
     here = Path(__file__).resolve().parent
@@ -83,11 +73,6 @@ def parse_args():
         "--device", choices=["auto", "cuda", "mps", "cpu"], default="auto",
         help="Compute device. Default: auto-detect.",
     )
-    p.add_argument(
-        "--save-prob-map", action="store_true",
-        help="Also write the raw sigmoid probability map as a heatmap "
-             "({name}_probmap.png). Safe to delete later.",
-    )
     return p.parse_args()
 
 def main():
@@ -113,7 +98,7 @@ def main():
         return 1
     if not inputs:
         print(f"ERROR: no images found in {args.input}", file=sys.stderr)
-        print("       Drop a .tif/.png mosaic into ./input/ and re-run.", file=sys.stderr)
+        print("       Drop a .tif/.tiff mosaic into ./input/ and re-run.", file=sys.stderr)
         return 1
 
     device = _pick_device(args.device)
@@ -152,13 +137,19 @@ def main():
         raw_bgr = load_mosaic(mosaic_path)
         geo = extract_geo_metadata(mosaic_path, fallback_mpp=FALLBACK_METERS_PER_PIXEL)
         mpp = geo["meters_per_pixel"]
+        H, W = raw_bgr.shape[:2]
+        geo["corners"] = compute_corner_coords(geo, height_px=H, width_px=W)
         print(f"  shape={raw_bgr.shape}")
 
         if geo.get("latitude") is not None and geo.get("longitude") is not None:
             print(
-                f"  geo: lat={geo['latitude']:.6f}, lon={geo['longitude']:.6f}, "
+                f"  geo (top-left): lat={geo['latitude']:.6f}, lon={geo['longitude']:.6f}, "
                 f"crs={geo['crs_type']}, mpp_source={geo['mpp_source']}"
             )
+            for corner_name in ("top_left", "top_right", "bottom_left", "bottom_right"):
+                c = geo["corners"][corner_name]
+                if c["latitude"] is not None:
+                    print(f"    {corner_name:<12}: lat={c['latitude']:.6f}, lon={c['longitude']:.6f}")
 
         # 2) Model inference
         prob = sliding_window_inference(
@@ -173,24 +164,11 @@ def main():
         # 3) Binarize
         binary = (prob > threshold).astype(np.uint8) * 255
 
-        if args.save_prob_map:
-            prob_u8 = np.clip(prob * 255.0, 0, 255).astype(np.uint8)
-            prob_heat = cv2.applyColorMap(prob_u8, cv2.COLORMAP_INFERNO)
-            cv2.imwrite(str(args.out / f"{name}_probmap.png"), prob_heat)
-            cv2.imwrite(str(args.out / f"{name}_probmap_gray.png"), prob_u8)
-
         # 4) Metrics — restrict to real seafloor pixels (exclude black AUV border)
         seafloor = seafloor_mask_from_raw(raw_bgr)
         metrics = compute_metrics(
             binary, meters_per_pixel=mpp, seafloor_mask=seafloor,
         )
-
-        # 5) Outputs
-        cv2.imwrite(
-            str(args.out / f"{name}_raw.jpg"), raw_bgr,
-            [cv2.IMWRITE_JPEG_QUALITY, 90],
-        )
-        _save_outline_overlay(args.out / f"{name}_outline.png", raw_bgr, binary)
 
         metrics_path = args.out / f"{name}_metrics.json"
         with open(metrics_path, "w") as f:
@@ -211,11 +189,14 @@ def main():
             f.write(f"Threshold: {threshold:.3f}\n")
             f.write("Geo      :\n")
             f.write(f"  meters_per_pixel : {geo['meters_per_pixel']:.6f} ({geo['mpp_source']})\n")
-            lat = geo.get("latitude")
-            lon = geo.get("longitude")
-            f.write(f"  latitude         : {lat:.6f}\n" if lat is not None else "  latitude         : n/a\n")
-            f.write(f"  longitude        : {lon:.6f}\n" if lon is not None else "  longitude        : n/a\n")
             f.write(f"  crs_type         : {geo.get('crs_type') or 'n/a'}\n")
+            f.write("  corners (lat, lon):\n")
+            for corner_name in ("top_left", "top_right", "bottom_left", "bottom_right"):
+                c = geo["corners"][corner_name]
+                if c["latitude"] is not None:
+                    f.write(f"    {corner_name:<12} : {c['latitude']:.6f}, {c['longitude']:.6f}\n")
+                else:
+                    f.write(f"    {corner_name:<12} : n/a\n")
             f.write(report + "\n")
 
         print(report)

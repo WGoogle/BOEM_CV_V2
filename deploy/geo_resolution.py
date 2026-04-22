@@ -82,6 +82,57 @@ def extract_geo_metadata(filepath, fallback_mpp):
             return result
     return result
 
+def compute_corner_coords(geo, height_px, width_px):
+    """Return labeled lat/lon for the 4 image corners, or None values if unknown.
+
+    Assumes the mosaic is north-up: the origin lat/lon is the top-left corner,
+    and pixel rows increase southward. Works for both geographic (deg) and
+    projected (metre) CRSs; geographic uses the same 111,320 m/deg approximation
+    used elsewhere in this file.
+    """
+    empty = {
+        "top_left":     {"latitude": None, "longitude": None},
+        "top_right":    {"latitude": None, "longitude": None},
+        "bottom_left":  {"latitude": None, "longitude": None},
+        "bottom_right": {"latitude": None, "longitude": None},
+    }
+
+    lat0 = geo.get("latitude")
+    lon0 = geo.get("longitude")
+    mpp  = geo.get("meters_per_pixel")
+    if lat0 is None or lon0 is None or mpp is None or mpp <= 0:
+        return empty
+
+    width_m  = width_px  * mpp
+    height_m = height_px * mpp
+
+    if geo.get("crs_type") == "geographic":
+        m_per_deg_lat = 111_320.0
+        m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat0))
+        if m_per_deg_lon <= 0:
+            return empty
+        dlat = height_m / m_per_deg_lat
+        dlon = width_m  / m_per_deg_lon
+        top_left     = (lat0,        lon0)
+        top_right    = (lat0,        lon0 + dlon)
+        bottom_left  = (lat0 - dlat, lon0)
+        bottom_right = (lat0 - dlat, lon0 + dlon)
+    else:
+        # Projected CRS — the stored "latitude"/"longitude" are already metres
+        # in that projection; step by width/height in the same units.
+        top_left     = (lat0,            lon0)
+        top_right    = (lat0,            lon0 + width_m)
+        bottom_left  = (lat0 - height_m, lon0)
+        bottom_right = (lat0 - height_m, lon0 + width_m)
+
+    return {
+        "top_left":     {"latitude": top_left[0],     "longitude": top_left[1]},
+        "top_right":    {"latitude": top_right[0],    "longitude": top_right[1]},
+        "bottom_left":  {"latitude": bottom_left[0],  "longitude": bottom_left[1]},
+        "bottom_right": {"latitude": bottom_right[0], "longitude": bottom_right[1]},
+    }
+
+
 def _get_longitude(tags):
     # From ModelTransformationTag: tx = matrix[3]
     if 34264 in tags:
