@@ -63,24 +63,90 @@ Loads `checkpoint_best.pt`, runs predictions on the test split, and writes proba
 
 ### 4. Annotate — [4_annotate.py](4_annotate.py)
 
-Correct proxy labels (or labels flagged by auditing in Step 5). See the [Annotation tool](#annotation-tool) section below.
+Correct proxy labels (or labels flagged by auditing in Step 5). See the [Annotation tool](#annotation-tool) section below and [ANNOTATION_GUIDE.txt](ANNOTATION_GUIDE.txt) for the full guide.
 
 Saved corrections land in `outputs/corrected_masks/` and are picked up automatically on the next retrain.
 
 ### 5. Audit labels — [5_audit_labels.py](5_audit_labels.py)
 
 ```bash
-python 5_audit_labels.py                  # top 50 disagreements, default checkpoint
+python 5_audit_labels.py                    # top 150 worst-DICE patches, skips already-corrected
 python 5_audit_labels.py --top-k 100
-python 5_audit_labels.py --adaptive       # Northcutt-style confident-learning thresholds
-python 5_audit_labels.py --no-viz         # skip visualization rendering
+python 5_audit_labels.py --include-corrected  # re-audit all patches including human-corrected ones
+python 5_audit_labels.py --include-corrected --top-k 150
 ```
 
-Runs confident-learning-style scoring: ranks patches by disagreement between proxy labels and model predictions. The worst-K patches are exported to `outputs/annotation_inbox/` for correction. Patches already in `outputs/corrected_masks/` are skipped.
+Ranks patches by disagreement between proxy labels and model predictions (DICE-based). The worst-K patches are exported to `outputs/annotation_inbox/` for correction. True-negative patches (both ground truth and prediction empty) are filtered out automatically. Patches already in `outputs/corrected_masks/` are skipped unless `--include-corrected` is set.
+
+See [AUDIT_PIPELINE.txt](AUDIT_PIPELINE.txt) for the full guide.
+
+Outputs written to `outputs/annotation_inbox/`:
+- `audit_queue.csv` / `audit_queue.json` — ranked patch list (rank, patch_id, dice, image_path, mask_path)
+- `visualizations/<patch_id>.png` — side-by-side proxy label vs. model prediction
+- `audit_manifest.json` — one entry per audit run for tracking progress over time
 
 ### Loop
 
 After Step 5, run Step 4 to correct the queued patches, then rerun Step 2. Repeat.
+
+---
+
+## Deploy — standalone prediction package
+
+The `deploy/` folder is a self-contained inference package for running the trained model on raw mosaics without the rest of the pipeline.
+
+```bash
+# From the repo root:
+python deploy/predict.py
+
+# From inside deploy/:
+python predict.py
+
+# Adjust detection threshold (default: whatever DICE-optimized value is in model_config.json):
+python deploy/predict.py --threshold 0.3
+```
+
+Drop one or more raw mosaics (`.png`, `.jpg`, `.tif`, `.bmp`) into `deploy/input/` and run the command above. No separate preprocessing step.
+
+**Step 0 — get the model weights.** `checkpoint_best.pt` (~280 MB) is not in the repo. Place it at `deploy/checkpoints/checkpoint_best.pt`. If you trained the model yourself it is already there.
+
+For `.tif` files, pixel size is read from GeoTIFF tags automatically; density output is in real units (nodules/m²). Non-GeoTIFF files fall back to 5 mm/px.
+
+**Outputs** (written to `deploy/predictions/`):
+
+| File | Contents |
+|---|---|
+| `<mosaic>_raw.jpg` | Original mosaic re-saved as JPG for easy preview |
+| `<mosaic>_outline.png` | Raw mosaic with 1-px cyan outlines around each predicted nodule |
+| `<mosaic>_metrics.json` | Per-mosaic metrics (see below) |
+| `summary.json` | Batch-level summary across all processed mosaics |
+
+Each `*_metrics.json` contains:
+
+```json
+{
+  "mosaic":                   "CameraMosaic_Node7_CAM_L3.tif",
+  "threshold":                0.50,
+  "coverage_pct":             12.43,
+  "nodule_count":             8142,
+  "nodule_pixels":            1284501,
+  "seafloor_pixels":          10334500,
+  "seafloor_area_m2":         258.36,
+  "nodule_area_m2":           32.11,
+  "nodule_density_per_m2":    31.52,
+  "nodule_px_density_per_m2": 4970.9,
+  "meters_per_pixel":         0.005,
+  "min_nodule_px":            20
+}
+```
+
+`coverage_pct` and `nodule_density_per_m2` are the headline numbers.
+
+**Deploy dependencies** are lighter than the full pipeline — install from `deploy/requirements.txt`:
+
+```bash
+pip install -r deploy/requirements.txt
+```
 
 ---
 
@@ -89,6 +155,8 @@ After Step 5, run Step 4 to correct the queued patches, then rerun Step 2. Repea
 A GUI for painting/erasing nodule masks on individual patches. Supports two roles:
 - **Lead** — exports batches, imports corrections, retrains.
 - **Collaborator** — receives a `.zip`, edits, sends it back.
+
+See [ANNOTATION_GUIDE.txt](ANNOTATION_GUIDE.txt) for detailed instructions and a worked example.
 
 ### Keybinds
 
@@ -107,7 +175,7 @@ A GUI for painting/erasing nodule masks on individual patches. Supports two role
 | `R` (twice within 2s) | Reset mask to original |
 | `S` | Save |
 
-Brush size slider at the bottom of the window. Use 1–3 px for grain nodules.
+Brush size slider at the bottom of the window. Use 0–2 px for grain nodules.
 
 Overlay colors: **green** = original proxy label, **cyan** = pixels added, **red** = pixels removed.
 
@@ -122,6 +190,9 @@ python 4_annotate.py export --mosaic CameraMosaic_D1_Node3_L8 \
 python 4_annotate.py edit --split test --annotator Brian
 python 4_annotate.py edit --worst 20 --annotator Brian
 python 4_annotate.py edit --mosaic CameraMosaic_Node6_CAM_L1 --unannotated --annotator Brian
+
+# Correct patches flagged by the audit (Step 5)
+python 4_annotate.py edit --audit-queue --annotator Brian
 
 # Drop returned zips into outputs/annotation_inbox/, then:
 python 4_annotate.py import-all
@@ -158,7 +229,7 @@ Autosave is on. Closing the tool commits all annotated patches — you cannot re
 
 | Command | Purpose |
 |---|---|
-| `edit` | Open the editor. Filters: `--split`, `--mosaic`, `--worst N`, `--unannotated`, `--bundle`, `--start N`. Required: `--annotator`. |
+| `edit` | Open the editor. Filters: `--split`, `--mosaic`, `--worst N`, `--unannotated`, `--audit-queue [CSV]`, `--bundle`, `--start N`. Required: `--annotator`. |
 | `export` | Package patches into a `.zip`. Filters: `--split`, `--mosaic`, `--unannotated`, `--max-patches`, `--notes`. Required: `--output`, `--annotator`. |
 | `import` | Import one returned bundle. `--bundle FILE.zip` `--strategy {newest,overwrite,skip}` (default `newest`). |
 | `import-all` | Import every zip in `outputs/annotation_inbox/`; processed zips move to `annotation_inbox/imported/`. |
@@ -180,11 +251,28 @@ outputs/
   proxy_labels/          proxy mask artifacts
   step_by_step_logs/     per-stage debug views
   checkpoints/           model weights, split_info, training_history
-  results/inference/     Step 3 outputs
+  results/inference/     Step 3 outputs (patch_metrics.json, overlays)
   corrected_masks/       human-corrected masks (override proxy labels on train)
-  annotation_inbox/      queued patches for Step 4 / returned zips
+  annotation_inbox/      queued patches for Step 4 / returned zips / audit outputs
   logs/                  per-stage log files
   pipeline_manifest.json stage-by-stage run metadata
+
+deploy/                  standalone prediction package (no pipeline required)
+  predict.py             single entry point: raw mosaic → metrics
+  inference.py           model loader + sliding-window inference
+  metrics.py             coverage % + nodule density per m²
+  geo_resolution.py      reads pixel size from GeoTIFF metadata
+  model_config.json      architecture + patch geometry sidecar
+  requirements.txt       lightweight deps (torch, smp, opencv, tifffile)
+  checkpoints/
+    checkpoint_best.pt           trained weights (not in repo — download separately)
+    engineered_norm_stats.json   normalization stats
+  input/                 drop raw mosaics here
+  predictions/           all outputs land here
+
+annotation/              annotation tool source (editor, tracker, collaborator)
+preprocessing/           filter chain, auto-tuner, patcher, geo resolution
+training/                dataset, model, trainer, splits, confident learning
 ```
 
 ## Configuration
