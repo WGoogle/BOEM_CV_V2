@@ -8,6 +8,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import cv2
 import numpy as np
 import torch
 from inference import (
@@ -163,6 +164,13 @@ def main():
 
         # 3) Binarize
         binary = (prob > threshold).astype(np.uint8) * 255
+
+        # 3b) Overlay PNG — original mosaic with 1px cyan nodule outlines
+        overlay = raw_bgr.copy()
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cv2.drawContours(overlay, contours, -1, (255, 255, 0), 1)  # BGR cyan
+        overlay_path = args.out / f"{name}_overlay.png"
+        cv2.imwrite(str(overlay_path), overlay)
 
         # 4) Metrics — restrict to real seafloor pixels (exclude black AUV border)
         seafloor = seafloor_mask_from_raw(raw_bgr)
