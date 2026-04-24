@@ -1,4 +1,4 @@
-# BOEM CV — Polymetallic Nodule Segmentation
+# U.S. Department of Interior — Polymetallic Nodule Segmentation
 
 A computer-vision pipeline for detecting and segmenting polymetallic nodules in seafloor mosaics. Given a raw GeoTIFF of the seafloor, the trained model outputs a per-pixel nodule mask plus real-world metrics (coverage percentage, nodule count, density per m²).
 
